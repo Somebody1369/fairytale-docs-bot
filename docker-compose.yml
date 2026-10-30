@@ -1,0 +1,21 @@
+services:
+  bot:
+    build: .
+    # Settings come from .env if it exists, otherwise from the shell's environment variables.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env or the environment}
+      GROQ_API_KEY: ${GROQ_API_KEY:?set GROQ_API_KEY in .env or the environment}
+      GROQ_MODELS: ${GROQ_MODELS:-}
+      DRIVE_FOLDER_ID: ${DRIVE_FOLDER_ID:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      ARCHIVE_SYNC_MINUTES: ${ARCHIVE_SYNC_MINUTES:-}
+      TZ_NAME: ${TZ_NAME:-}
+      INVITES_ONLY: ${INVITES_ONLY:-}
+      SET_BOT_PROFILE: ${SET_BOT_PROFILE:-}
+      DB_PATH: /app/data/bot.db
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
