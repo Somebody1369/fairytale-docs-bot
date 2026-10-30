@@ -252,6 +252,26 @@ async def test_second_try_out_of_time_keeps_the_first_answer(store, forest):
     assert llm.deadlines[0] <= started + PICK_SECONDS + 1
 
 
+async def test_willow_answer_without_one_of_its_forest_parts_is_asked_again(store, forest):
+    # Mishka's example: "Де шукати гриби біля верби?" takes the deciduous forest's and the river's guides.
+    add_archive(store, forest, "Грибний путівник біля річки", "Цей путівник для тих, хто живе біля річки. "
+                                                               "Опеньки ростуть на старих вербах.")
+    add_archive(store, forest, "Грибний путівник листяного лісу", "Любі сусіди з листяного лісу! "
+                                                                   "Білі гриби тримаються старих дубів.")
+    llm = FakeLLM({"found": True, "answer": "Опеньки на старих вербах.", "sources": [1]},
+                  {"found": True, "answer": "Біля річки опеньки; у листяному лісі білі під дубами.", "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Де шукати гриби біля верби?", NOW)
+    order = [line for line in llm.prompts[0][1].splitlines() if line.startswith("[")]
+    deciduous = next(i for i, line in enumerate(order, 1) if "листяного" in line)
+    assert 'немає поради для частини "листяний ліс". Якщо в документі [%d]' % deciduous in llm.prompts[1][1]
+    assert "Грибний путівник листяного лісу" in reply.text and "Грибний путівник біля річки" in reply.text
+    # No forest part's advice in the answer (the mitten's own dues): nothing to ask about.
+    add_archive(store, forest, "Членські внески рукавички Під вербою", "Внесок 3 горіхи на місяць.")
+    llm = FakeLLM({"found": True, "answer": "3 горіхи.", "sources": [1]})
+    await Answerer(store, forest, llm, TZ).ask("Скільки внесок під вербою?", NOW)
+    assert len(llm.prompts) == 1
+
+
 def word_guide(sections: list[tuple[str, str]], intro: str = "") -> str:
     """A guide as Word gives it: paragraphs joined by single line breaks, no blank lines."""
     document = docx.Document()
@@ -445,12 +465,15 @@ def test_section_running_over_chunks_keeps_its_place(store, forest):
     assert "Маслюки збирайте" in text
 
 
-def test_part_question_takes_the_sections_of_its_mittens(store, forest):
+def test_part_question_takes_the_parts_own_section_not_its_mittens(store, forest):
+    # Mishka: a mitten's advice does not fit all its neighbours, so it is not the part's advice.
     lines = []
-    for mitten in ["Під дубом", "У ліщині", "На узліссі", "Біля бобрової греблі", "Під вербою", "Під ялиною", "У соснах"]:
+    for mitten in ["Під дубом", "У ліщині", "Під ялиною", "У соснах", "Біля мурашника"]:
         lines += [mitten] + [f"Тут живуть звірі рукавички {mitten}. {FILLER * 3}"] * 3
+    lines += ["У хвойному лісі"] + [f"Порада для всього хвойного лісу. {FILLER * 3}"] * 3
     text = excerpt_of(store, forest, lines, "що робити у хвойному лісі?", [], ["conifer"])
-    assert "рукавички Під ялиною" in text and "рукавички У соснах" in text
+    assert "Порада для всього хвойного лісу" in text
+    assert text.count("рукавички Під ялиною") < 3 and text.count("рукавички У соснах") < 3
 
 
 def test_excerpt_finds_synonyms(store, forest):
@@ -461,29 +484,43 @@ def test_excerpt_finds_synonyms(store, forest):
 
 
 async def test_part_question_about_mitten_advice_asks_which_mitten(store, forest):
-    # Dues are written per mitten. "біля річки" names a forest part, so the river's mittens are offered,
-    # instead of "no such advice".
+    # Dues are written per mitten and the river has none of its own: the river's mittens are offered,
+    # instead of "no such advice", and no mitten's dues are given out as the river's.
     add_archive(store, forest, "Членські внески рукавички Під вербою", "Внесок 3 горіхи на місяць.")
     add_archive(store, forest, "Членські внески рукавички Біля бобрової греблі", "Внесок 2 рибини на місяць.")
     add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць.")
-    llm = FakeLLM({"needs_place": True})
+    llm = FakeLLM()
     reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок біля річки?", NOW)
     assert reply.kind == "need_place" and reply.mittens == ["Під вербою", "Біля бобрової греблі"]
-    assert reply.text == texts.ASK_MITTEN_IN_PART.format(part="біля річки")
-    system, prompt = llm.prompts[0]
-    assert "У питанні названо частину лісу (біля річки)" in system
-    assert "Під вербою" in prompt and "Біля бобрової греблі" in prompt and "4 жолуді" not in prompt
+    assert reply.text == texts.ASK_MITTEN_IN_PART.format(part="біля річки") and llm.prompts == []
 
 
-async def test_part_question_answers_from_the_parts_own_advice_first(store, forest):
+async def test_part_question_answers_only_from_the_parts_own_advice(store, forest):
+    # Mishka: "Поради окремих рукавичок він додає лише коли названо конкретну рукавичку".
     add_archive(store, forest, "Що їсти біля річки", "Ця пам'ятка для мешканців біля річки. Їжте рогіз і очерет.")
     add_archive(store, forest, "Чим поживитись поруч із рукавичкою Під вербою", "Їжте кору верби.")
-    llm = FakeLLM({"found": True, "answer": "Рогіз і очерет; під вербою ще кору.", "sources": [1, 2]})
+    llm = FakeLLM({"found": True, "answer": "Рогіз і очерет.", "sources": [1]})
     reply = await Answerer(store, forest, llm, TZ).ask("Що їсти біля річки?", NOW)
     prompt = llm.prompts[0][1]
-    assert prompt.index("Що їсти біля річки") < prompt.index("Чим поживитись")
-    # The mitten's advice is an exception to the part's: the model is not asked to put it first.
-    assert len(llm.prompts) == 1 and reply.text.index("Що їсти біля річки") < reply.text.index("Чим поживитись")
+    assert "Що їсти біля річки" in prompt and "Чим поживитись" not in prompt and "кору верби" not in prompt
+    assert reply.text.startswith("Рогіз і очерет.") and "Чим поживитись" not in reply.text
+    # With the mitten named, its own advice comes first.
+    llm = FakeLLM({"found": True, "answer": "Кору верби.", "sources": [1]})
+    await Answerer(store, forest, llm, TZ).ask("Що їсти під вербою?", NOW)
+    assert llm.prompts[0][1].index("Чим поживитись") < llm.prompts[0][1].index("Що їсти біля річки")
+
+
+async def test_part_advice_that_does_not_answer_leads_to_its_mittens(store, forest):
+    add_archive(store, forest, "Небезпеки біля річки", "Ця пам'ятка для мешканців біля річки. Внески тут ні до чого: "
+                                                        "не ходіть по тонкому льоду.")
+    add_archive(store, forest, "Членські внески рукавички Під вербою", "Внесок 3 горіхи на місяць.")
+    llm = FakeLLM({"found": False})
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок біля річки?", NOW)
+    assert len(llm.prompts) == 1 and reply.kind == "need_place" and reply.mittens == ["Під вербою", "Біля бобрової греблі"]
+    # Nothing in the mittens either: the honest "not found".
+    llm = FakeLLM({"found": False})
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли біля річки зимують раки?", NOW)
+    assert reply.kind == "not_found"
 
 
 async def test_terminal_ask_works_with_empty_settings(monkeypatch, capsys):
@@ -526,24 +563,8 @@ def test_text_without_blank_lines_is_cut_into_chunks():
     assert split_chunks("Календар сезонів\nУтеплюйте в листопаді.") == ["Календар сезонів\nУтеплюйте в листопаді."]
 
 
-async def test_part_question_answered_with_a_mitten_first_is_asked_again(store, forest):
-    # Rule 3 says a mitten's advice comes first; with a forest part asked it is only an exception.
-    add_archive(store, forest, "Що їсти біля річки", "Ця пам'ятка для мешканців біля річки. Їжте рогіз і очерет.")
-    add_archive(store, forest, "Чим поживитись поруч із рукавичкою Під вербою", "Їжте кору верби.")
-    llm = FakeLLM({"found": True, "answer": "Під вербою кору.", "sources": [2, 1]},
-                  {"found": True, "answer": "Рогіз і очерет; під вербою ще кору.", "sources": [1, 2]})
-    reply = await Answerer(store, forest, llm, TZ).ask("Що їсти біля річки?", NOW)
-    assert "на відміну від правила 3" in llm.prompts[0][0]
-    assert "у питанні названо частину лісу, а документ [2] лише для однієї рукавички" in llm.prompts[1][1]
-    assert reply.text.startswith("Рогіз і очерет")
-    # Only the mitten's advice answers: nothing to put before it.
-    llm = FakeLLM({"found": True, "answer": "Під вербою кору.", "sources": [2]})
-    reply = await Answerer(store, forest, llm, TZ).ask("Що їсти біля річки?", NOW)
-    assert len(llm.prompts) == 1 and reply.kind == "answer"
-
-
 async def test_part_question_keeps_the_whole_forest_advice(store, forest):
-    # Many mittens' documents must not push the part's and the whole forest's own advice out of the prompt.
+    # The part's and the whole forest's advice go in; the mittens' own documents stay out of a part question.
     add_archive(store, forest, "Що їсти біля річки", "Ця пам'ятка для мешканців біля річки. Що їсти: рогіз.")
     add_archive(store, forest, "Що їсти взимку", "Для всіх мешканців лісу. Що їсти взимку: жолуді й горіхи.")
     for mitten in ("Під вербою", "Біля бобрової греблі"):
@@ -553,7 +574,7 @@ async def test_part_question_keeps_the_whole_forest_advice(store, forest):
     llm = FakeLLM({"found": True, "answer": "Рогіз.", "sources": [1]})
     await Answerer(store, forest, llm, TZ).ask("Що їсти біля річки?", NOW)
     prompt = llm.prompts[0][1]
-    assert "Що їсти біля річки" in prompt and "Що їсти взимку" in prompt
+    assert "Що їсти біля річки" in prompt and "Що їсти взимку" in prompt and "Що їсти Під вербою" not in prompt
 
 
 OAK = WINTER_GUIDE.index("Під дубом")

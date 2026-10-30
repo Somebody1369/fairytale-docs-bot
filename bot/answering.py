@@ -8,8 +8,8 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from .llm import LLM, LLMUnavailable
-from .places import PART_NAMES, Forest, resident_homes, residents_from_statute
-from .search import RELATIVE_CUTOFF, Hit, Index, expand, looks_like_heading, split_chunks, tokens
+from .places import PART_NAMES, Forest, Scope, resident_homes, residents_from_statute
+from .search import Hit, Index, expand, looks_like_heading, split_chunks, tokens
 from .storage import Document, Store
 from . import texts
 
@@ -53,9 +53,10 @@ ANSWER_SYSTEM = """Ти бот-помічник звірів лісу. Ти ві
 4. Якщо поради однаково конкретні: документ із Лісового архіву важливіший за документ від звіра. Серед документів архіву, як і серед документів від звірів, важливіший новіший (дата й час у рядку "Звідки"; якщо вони однакові, новіший той, що стоїть у переліку вище).
 5. Якщо питання про час, пору року, день тижня чи "чи вже можна", враховуй сьогоднішню дату. Дні тижня й дати бери лише з наданого календаря (там уже пораховано, наприклад, яка дата перша субота місяця), не обчислюй їх сам. Порівнюй дату події із сьогоднішньою: якщо вона раніше за сьогодні, пиши в минулому часі, що подія вже була, і не вигадуй дату наступної, якщо її немає в документах.
 6. Пиши грамотною українською, ввічливо, просто, доброзичливо й по суті, без казковості та без звертань на кшталт "любий звіре". Якщо звертаєшся до звіра, то на "Ви" (з великої літери): "Вам", "здайте", "зверніться". Відповідь коротка (1-5 речень), але переказуй усі пункти документа, що стосуються питання, нічого з них не пропускай: скільки, коли, кому й куди віддавати чи приносити, чим можна замінити, хто звільнений.
-7. Якщо рукавичка належить до кількох частин лісу і для них є різні поради, наведи обидві й скажи, до якої частини лісу належить кожна.
+7. Якщо рукавичка належить до кількох частин лісу (як "Під вербою": і листяний ліс, і біля річки), їй підходять поради кожної з цих частин: наведи поради всіх її частин лісу, що стосуються питання, навіть якщо вони не суперечать одна одній, і скажи, до якої частини лісу належить кожна. Порада самої рукавички, як і завжди, іде першою.
 8. Не згадуй у тексті відповіді номери документів і не пиши, звідки порада: джерела бот додасть сам.
 9. Якщо в документі є окремі розділи для різних місць, бери розділ для місця з питання. Але рівень розділу той самий, що й у всього документа (рядок "Рівень"): розділ "Під дубом" у путівнику для всього лісу є порадою рівня "увесь ліс", тож документ для рукавички Під дубом або для її частини лісу важливіший за нього.
+10. Місце в питанні ("під дубом", "біля сосон", "біля верби") означає рукавичку з рядка "Місце з питання", а не саме дерево: відповідай усіма порадами, що підходять цій рукавичці, навіть якщо в них це дерево не згадано.
 
 Поверни JSON: {"facts": ["кожен пункт із документів, що стосується питання, окремим рядком: скільки, коли, кому, куди, чим замінити, хто звільнений; на початку рядка номер документа і його рівень, наприклад [2, частина лісу]"], "found": true або false, "answer": "текст відповіді, у якому є всі ці пункти", "sources": [номери документів, з яких узято відповідь, найважливіший перший]}"""
 
@@ -63,20 +64,16 @@ PLACE_UNKNOWN_RULE = """
 
 Місце в питанні не вказано, а серед документів є поради для окремих рукавичок чи частин лісу. Якщо відповідь залежить від того, про яку рукавичку питає звір (для різних рукавичок чи частин лісу поради різні, або відповідь є лише в порадах для окремих місць і для кожного своя), не відповідай, а поверни "needs_place": true. Якщо ж відповідь однакова для всього лісу, або питання про конкретного звіра, який у документах живе в певній рукавичці (наприклад, "коли Ведмідь лягає спати?" чи "де живе Зайчик?"), відповідай як звичайно, назвавши цю рукавичку, і поверни "needs_place": false. Порада для рукавички цього звіра важливіша за загальну. Якщо відповідь є лише для одного місця, відповідай і прямо скажи, для якого місця ця порада."""
 
-PART_RULE = """
-
-У питанні названо частину лісу ({part}), а не рукавичку. Документи для неї та для всього лісу стоять у переліку першими, далі йдуть поради для окремих рукавичок цієї частини лісу ({mittens}). Тут, на відміну від правила 3, порада окремої рукавички не важливіша за пораду частини лісу чи всього лісу, а лише виняток для своєї рукавички, тож не починай відповідь із неї; порада частини лісу, як і раніше, важливіша за пораду всього лісу. Якщо відповідь є в порадах для частини лісу чи всього лісу, відповідай за ними й постав їх першими в "sources", а поради окремих рукавичок, що від них відрізняються, згадай коротко після них, назвавши рукавичку. Але якщо в кожної рукавички цієї частини лісу своя порада, що суперечить загальній (наприклад, різні внески), загальна порада тут нікому не підходить: не відповідай, а поверни "needs_place": true. Так само поверни "needs_place": true, якщо відповідь є лише в порадах для окремих рукавичок і для різних рукавичок вона різна. Якщо вона однакова для всіх рукавичок цієї частини лісу або є лише для однієї з них, відповідай і прямо скажи, для якої рукавички ця порада."""
-
-PART_REMINDER = """
-
-Зверни увагу: у питанні названо частину лісу, а документ [{weaker}] лише для однієї рукавички. Якщо порада [{better}] (рівень "{better_level}") відповідає на питання, відповідай за нею і постав її першою в "sources", а пораду [{weaker}] згадай після неї, назвавши рукавичку. Якщо ж у кожної рукавички своя порада, що суперечить загальній, поверни "needs_place": true."""
-
 PICK_SYSTEM = """Тобі дають питання звіра і перелік назв документів із порадами. Обери до чотирьох документів, у яких найімовірніше є відповідь. Зважай на зміст, а не лише на однакові слова: "що їсти" і "чим поживитись" про те саме, "хто живе" є у статуті. Якщо на тему питання є кілька документів для різних місць або від різних звірів, обери їх усі. Якщо жоден не підходить, поверни порожній список.
 Поверни JSON: {"ids": [номери документів]}"""
 
 LEVEL_REMINDER = """
 
 Зверни увагу: документ [{better}] (рівень "{better_level}") конкретніший за документ [{weaker}] (рівень "{weaker_level}"), навіть якщо в [{weaker}] є розділ про місце з питання. Якщо в [{better}] є відповідь на питання, відповідай за ним і постав його першим у "sources", а [{weaker}] згадай лише додатково, сказавши, що для цього місця діє конкретніша порада."""
+
+PARTS_REMINDER = """
+
+Зверни увагу: рукавичка "{mitten}" належить до кількох частин лісу, і їй підходять поради кожної з них. У відповіді є порада для частини лісу "{cited}", але немає поради для частини "{missing}". Якщо в документі {docs} є щось на тему питання (навіть без дерева, названого в питанні: воно лише вказує на рукавичку), додай це у відповідь, сказавши, що це порада для частини лісу "{missing}", і додай номер документа в "sources"."""
 
 RESIDENT_NOTE = " (місце визначено за звіром {name}, який тут живе; якщо порада однакова для всього лісу, на рукавичці не наголошуй)"
 
@@ -196,48 +193,37 @@ class Answerer:
             allowed = lambda doc: any(self.forest.applies(doc.scope, mitten=m) for m in mittens)
             docs = await self._docs_for_place(question, allowed, deadline)
         elif parts:
+            # Mishka: a forest part asked gets the part's own advice and the whole forest's. A mitten's
+            # advice does not fit all its neighbours, so it comes only when the mitten itself is named.
             allowed = lambda doc: any(self.forest.applies(doc.scope, part=p) for p in parts)
-            docs = await self._docs_for_parts(question, parts, allowed, deadline)
+            docs = await self._docs_for_place(question, allowed, deadline)
         else:
             allowed = None
             docs = await self._docs_without_place(question, deadline)
-        if not docs:
-            return Reply("not_found", texts.NOT_FOUND)
-        place_rule = ""
-        if not allowed and any(doc.scope.kind != "forest" for doc in docs):
-            place_rule = PLACE_UNKNOWN_RULE
-        elif parts and not all(allowed(doc) for doc in docs):
-            place_rule = PART_RULE.format(part=self._place_note([], parts),
-                                          mittens=", ".join(self.forest.mittens_in(parts)))
-        reply = await self._answer(question, docs, mittens, parts, now, place_rule, resident, allowed, deadline)
-        if reply.kind == "need_place" and parts:
-            # "Скільки внесок біля річки?": the dues differ by mitten, so offer the mittens of that part.
+        if docs:
+            place_rule = PLACE_UNKNOWN_RULE if not allowed and any(doc.scope.kind != "forest" for doc in docs) else ""
+            reply = await self._answer(question, docs, mittens, parts, now, place_rule, resident, allowed, deadline)
+        else:
+            reply = Reply("not_found", texts.NOT_FOUND)
+        if parts and reply.kind == "not_found" and self._mittens_know(question, parts):
+            # "Скільки внесок біля річки?": the part has no such advice, its mittens have their own dues.
             return Reply("need_place", texts.ASK_MITTEN_IN_PART.format(part=self._place_note([], parts)),
                          self.forest.mittens_in(parts))
         return reply
 
-    async def _docs_for_place(self, question: str, allowed, deadline: float, first=None) -> list[Document]:
+    async def _docs_for_place(self, question: str, allowed, deadline: float) -> list[Document]:
         """Keyword matches level by level, plus what the model picks by title: "що їсти" finds
-        "Чим поживитись поруч із рукавичкою" that shares no word with the question.
-        `first(doc)`: these keyword matches go before the others when the prompt is full, and the others
-        come only when they match well."""
+        "Чим поживитись поруч із рукавичкою" that shares no word with the question."""
         hits = self.index.search(self.forest.strip_places(question), allowed, limit=60, cutoff=0)
-        if first and hits:
-            hits = [hit for hit in hits if first(hit.doc) or hit.score >= RELATIVE_CUTOFF * hits[0].score]
         candidates = [doc for doc in self.index.documents if allowed(doc)]
         picked = await self._pick_by_title(question, candidates, deadline)
-        found = best_per_level(hits)
-        if first:
-            found = sorted(found, key=lambda doc: not first(doc))
-        return merge(picked, found, limit=MAX_DOCS)
+        return merge(picked, best_per_level(hits), limit=MAX_DOCS)
 
-    async def _docs_for_parts(self, question: str, parts: list[str], allowed, deadline: float) -> list[Document]:
-        """A forest part named: its own and the whole forest's advice, and also the advice of its mittens.
-        Dues or duties are written per mitten, so "скільки внесок біля річки?" finds them and the bot asks
-        which mitten, instead of saying there is no such advice."""
+    def _mittens_know(self, question: str, parts: list[str]) -> bool:
+        """Whether the advice of the asked part's mittens matches the question, so asking which mitten helps."""
         mittens = set(self.forest.mittens_in(parts))
-        in_parts = lambda doc: allowed(doc) or (doc.scope.kind == "mitten" and doc.scope.value in mittens)
-        return await self._docs_for_place(question, in_parts, deadline, first=allowed)
+        theirs = lambda doc: doc.scope.kind == "mitten" and doc.scope.value in mittens
+        return bool(self.index.search(self.forest.strip_places(question), theirs, limit=1))
 
     async def _docs_without_place(self, question: str, deadline: float) -> list[Document]:
         """No place named: the best whole-forest advice plus the best advice for particular places.
@@ -280,11 +266,9 @@ class Answerer:
         self, question: str, docs: list[Document], mittens: list[str], parts: list[str], now: datetime,
         place_rule: str = "", resident: str | None = None, allowed=None, deadline: float | None = None,
     ) -> Reply:
-        """`allowed(doc)`: advice for the asked place. With a forest part asked, its mittens' advice
-        also comes, but only as exceptions, after the part's own advice."""
-        own = allowed or (lambda doc: True)
-        # The asked place's own advice first; most specific first, archive before animals, newer before older.
-        docs = sorted(docs, key=lambda d: (not own(d), -d.scope.level, not d.from_archive, -d.modified_at.timestamp()))
+        """`allowed`: the documents were chosen for a place named in the question."""
+        # Most specific first, archive before animals, newer before older.
+        docs = sorted(docs, key=lambda d: (-d.scope.level, not d.from_archive, -d.modified_at.timestamp()))
         place = self._place_note(mittens, parts) + (RESIDENT_NOTE.format(name=resident) if resident else "")
         # Thinking longer and the calendar cost Groq tokens (the free tier allows about 8000 a minute),
         # so only questions about dates and time get them.
@@ -292,14 +276,17 @@ class Answerer:
         reasoning, budget = ("medium", 2000) if about_time else ("low", 1500)
         size = self._excerpt_size(docs)
         blocks = [self._doc_block(i, doc, question, mittens, parts, size) for i, doc in enumerate(docs, 1)]
+        # "Де шукати гриби біля верби?" is about mushrooms for the mitten, not about willow trees.
+        topic = re.sub(r"\s+", " ", self.forest.strip_places(question)).strip(" ?.!,") if mittens or parts else ""
         prompt = (
             f"{calendar_note(now, self.tz, full=about_time)}\n\n"
             f"Питання звіра: {question}\n"
-            f"Місце з питання: {place}\n\n"
-            "Документи:\n\n" + "\n\n".join(blocks)
+            f"Місце з питання: {place}\n"
+            + (f"Тема питання без місця: {topic}\n" if topic else "")
+            + "\nДокументи:\n\n" + "\n\n".join(blocks)
         )
         system = ANSWER_SYSTEM + place_rule
-        asked_sources = asked_level = False
+        asked_sources = asked_level = asked_parts = False
         earlier = None  # an answer with sources, kept while the model is asked to put the levels right
         while True:
             try:
@@ -324,8 +311,7 @@ class Answerer:
                 continue
             # A section about the asked mitten inside a whole-forest guide tempts the model to put the
             # guide first, though a cited document for the mitten's forest part is more specific.
-            # A mitten's advice in a question about its forest part is an exception, not the answer.
-            better = next((doc for doc in sources[1:] if doc.scope.level > sources[0].scope.level and own(doc)), None)
+            better = next((doc for doc in sources[1:] if doc.scope.level > sources[0].scope.level), None)
             # With no place asked, PLACE_UNKNOWN_RULE alone decides between the whole forest and asking.
             if better and allowed and not asked_level:
                 asked_level, earlier = True, (answer, sources)
@@ -334,12 +320,17 @@ class Answerer:
                     weaker=docs.index(sources[0]) + 1, weaker_level=LEVEL_NAMES[sources[0].scope.kind],
                 )
                 continue
-            # The reverse with a forest part asked: one mitten's advice first, though the part's own was cited.
-            own_cited = next((doc for doc in sources if own(doc)), None)
-            if own_cited and not own(sources[0]) and not asked_level:
-                asked_level, earlier = True, (answer, sources)
-                prompt += PART_REMINDER.format(better=docs.index(own_cited) + 1, weaker=docs.index(sources[0]) + 1,
-                                               better_level=LEVEL_NAMES[own_cited.scope.kind])
+            # Mishka: "для «Під вербою» підходять поради і листяного лісу, і річки". When the answer took one
+            # part's advice on the topic and left the other part's document out, the model is asked once more.
+            missing = [] if asked_parts else self._missing_parts(mittens, docs, sources)
+            if missing:
+                asked_parts, earlier = True, (answer, sources)
+                cited = {doc.scope.value for doc in sources if doc.scope.kind == "part"}
+                prompt += PARTS_REMINDER.format(
+                    mitten=mittens[0], cited=", ".join(PART_NAMES[p] for p in sorted(cited)),
+                    missing=", ".join(PART_NAMES[doc.scope.value] for doc in missing),
+                    docs=", ".join(f"[{docs.index(doc) + 1}]" for doc in missing),
+                )
                 continue
             break
 
@@ -348,6 +339,21 @@ class Answerer:
         else:
             cite = "Джерела:\n" + "\n".join("- " + source_line(doc, self.tz) for doc in sources)
         return Reply("answer", f"{answer}\n\n{cite}")
+
+    def _missing_parts(self, mittens: list[str], docs: list[Document], sources: list[Document]) -> list[Document]:
+        """For a mitten in several forest parts, with one part's advice cited: the best document of each
+        of its other parts that was given to the model but left out of the answer."""
+        if len(mittens) != 1:
+            return []
+        cited = {doc.scope.value for doc in sources if doc.scope.kind == "part"}
+        if not cited:
+            return []  # the answer needs no forest part's advice at all, e.g. the mitten's own dues
+        missing = []
+        for part in sorted(self.forest.mitten_parts.get(mittens[0], frozenset()) - cited):
+            doc = next((doc for doc in docs if doc.scope == Scope("part", part)), None)
+            if doc:
+                missing.append(doc)
+        return missing
 
     @staticmethod
     def _sources(numbers, docs: list[Document]) -> list[Document]:
@@ -413,10 +419,8 @@ class Answerer:
             named_mittens, named_parts = set(self.forest.detect_mittens(text)), set(self.forest.detect_parts(text))
             if not named_mittens and not named_parts:
                 return None
-            # With a forest part asked, the sections about its mittens count too.
-            of_part = named_parts & asked_parts or not mittens and any(
-                self.forest.mitten_parts.get(m, frozenset()) & asked_parts for m in named_mittens)
-            return 2 if named_mittens & set(mittens) else 1 if of_part else 0
+            # With a forest part asked, a section about one of its mittens is not the part's advice.
+            return 2 if named_mittens & set(mittens) else 1 if named_parts & asked_parts else 0
 
         def opens_section(line: str, previous: str) -> bool:
             """A short heading with a place ("Під дубом", "Біля річки:"), or a paragraph that begins with one

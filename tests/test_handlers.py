@@ -523,7 +523,6 @@ async def test_question_naming_a_forest_part_offers_its_mittens(setup):
     dispatcher, bot, telegram, llm, store = setup
     add_archive(store, dispatcher["app"].forest, "Членські внески рукавички Під вербою", "Внесок 3 горіхи на місяць.")
     add_archive(store, dispatcher["app"].forest, "Членські внески рукавички Біля бобрової греблі", "Внесок 2 рибини.")
-    llm.answers.append({"needs_place": True})
     await dispatcher.feed_update(bot, message(text="Скільки внесок біля річки?"))
     assert "Оберіть, будь ласка, рукавичку (біля річки)" in telegram.sent[-1].text
     options = dict(buttons(telegram.sent[-1]))
