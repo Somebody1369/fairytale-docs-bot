@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<title>Довідник лісу</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #e9e7e1; }
+  svg { display: block; }
+</style>
+</head>
+<body>
+<svg id="avatar" xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640">
+  <defs>
+    <!-- Birch bark like the "Лісовий архів" scans: off-white, darker worn edges -->
+    <radialGradient id="bark" cx="50%" cy="48%" r="70%">
+      <stop offset="0%" stop-color="#f1efea"/>
+      <stop offset="62%" stop-color="#e6e3dc"/>
+      <stop offset="100%" stop-color="#bdb6aa"/>
+    </radialGradient>
+    <filter id="rough" x="-20%" y="-20%" width="140%" height="140%">
+      <feTurbulence type="fractalNoise" baseFrequency="0.035" numOctaves="3" seed="7"/>
+      <feDisplacementMap in="SourceGraphic" scale="22"/>
+      <feGaussianBlur stdDeviation="1.6"/>
+    </filter>
+    <filter id="grain">
+      <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="3"/>
+      <feColorMatrix type="saturate" values="0"/>
+      <feComponentTransfer><feFuncA type="table" tableValues="0 0.07"/></feComponentTransfer>
+      <feComposite in2="SourceGraphic" operator="in"/>
+    </filter>
+    <filter id="soft" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="6" stdDeviation="7" flood-color="#3b2f25" flood-opacity="0.28"/>
+    </filter>
+    <pattern id="knit" width="18" height="14" patternUnits="userSpaceOnUse">
+      <path d="M0 10 L4.5 3 L9 10 L13.5 3 L18 10" fill="none" stroke="#b03a2e" stroke-width="3" stroke-linejoin="round"/>
+    </pattern>
+  </defs>
+
+  <rect width="640" height="640" fill="url(#bark)"/>
+  <!-- brown bark patches -->
+  <g filter="url(#rough)" fill="#a98a6c" opacity="0.55">
+    <ellipse cx="120" cy="96" rx="78" ry="20"/>
+    <ellipse cx="520" cy="150" rx="64" ry="16"/>
+    <ellipse cx="470" cy="548" rx="96" ry="22"/>
+    <ellipse cx="96" cy="470" rx="54" ry="15"/>
+    <ellipse cx="560" cy="380" rx="40" ry="12"/>
+  </g>
+  <!-- dark horizontal lenticels, drawn by the script below -->
+  <g id="lenticels" fill="#2f2b27"></g>
+  <rect width="640" height="640" fill="#fff" filter="url(#grain)"/>
+
+  <!-- a page of advice -->
+  <g transform="rotate(-7 372 292)" filter="url(#soft)">
+    <path d="M 262 142 L 438 142 L 484 188 L 484 442 L 262 442 Z"
+          fill="#f7f4ec" stroke="#2e2a26" stroke-width="7" stroke-linejoin="round"/>
+    <path d="M 438 142 L 438 188 L 484 188" fill="#e3ddd0" stroke="#2e2a26" stroke-width="6" stroke-linejoin="round"/>
+    <g stroke="#3b3631" stroke-linecap="round">
+      <line x1="292" y1="186" x2="404" y2="186" stroke-width="11"/>
+      <line x1="292" y1="232" x2="452" y2="232" stroke-width="7"/>
+      <line x1="292" y1="264" x2="446" y2="264" stroke-width="7"/>
+      <line x1="292" y1="296" x2="456" y2="296" stroke-width="7"/>
+      <line x1="292" y1="328" x2="420" y2="328" stroke-width="7"/>
+      <line x1="292" y1="360" x2="450" y2="360" stroke-width="7"/>
+      <line x1="292" y1="392" x2="396" y2="392" stroke-width="7"/>
+    </g>
+  </g>
+
+  <!-- an oak leaf, as in the oak grove around "Під дубом" -->
+  <defs>
+    <linearGradient id="autumn" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#dba14a"/>
+      <stop offset="100%" stop-color="#b8692b"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(232 392) rotate(-38) scale(1.12)" filter="url(#soft)">
+    <path d="M 0 -132
+             C 22 -132 46 -118 40 -100 C 36 -88 18 -86 20 -78
+             C 34 -84 70 -74 64 -50 C 60 -34 30 -34 30 -24
+             C 48 -30 82 -14 74 10 C 68 30 36 24 34 34
+             C 50 34 74 52 62 72 C 52 88 28 82 22 92
+             C 30 100 22 116 6 118
+             L 4 152 L -4 152 L -6 118
+             C -22 116 -30 100 -22 92 C -28 82 -52 88 -62 72
+             C -74 52 -50 34 -34 34 C -36 24 -68 30 -74 10
+             C -82 -14 -48 -30 -30 -24 C -30 -34 -60 -34 -64 -50
+             C -70 -74 -34 -84 -20 -78 C -18 -86 -36 -88 -40 -100
+             C -46 -118 -22 -132 0 -132 Z"
+          fill="url(#autumn)" stroke="#2e2a26" stroke-width="5.5" stroke-linejoin="round"/>
+    <g stroke="#6d3f1c" stroke-width="3.5" stroke-linecap="round" fill="none">
+      <path d="M 0 -118 L 0 118"/>
+      <path d="M 0 -64 L 44 -86 M 0 -64 L -44 -86"/>
+      <path d="M 0 -14 L 56 -40 M 0 -14 L -56 -40"/>
+      <path d="M 0 36 L 58 6 M 0 36 L -58 6"/>
+      <path d="M 0 78 L 48 60 M 0 78 L -48 60"/>
+    </g>
+  </g>
+</svg>
+<script>
+  // Lenticels: short dark dashes like on the bark of the archive scans (seeded, so every render is the same)
+  let seed = 42;
+  const rand = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const group = document.getElementById("lenticels");
+  for (let i = 0; i < 70; i++) {
+    const x = rand() * 640, y = rand() * 640;
+    const dx = x - 335, dy = y - 320;
+    if (Math.abs(dx) < 205 && Math.abs(dy) < 215) continue; // keep the picture clean
+    const w = 10 + rand() * 46, h = 2 + rand() * 3.5;
+    const dash = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    dash.setAttribute("x", x); dash.setAttribute("y", y);
+    dash.setAttribute("width", w); dash.setAttribute("height", h);
+    dash.setAttribute("rx", h / 2);
+    dash.setAttribute("opacity", (0.45 + rand() * 0.45).toFixed(2));
+    group.appendChild(dash);
+  }
+</script>
+</body>
+</html>
