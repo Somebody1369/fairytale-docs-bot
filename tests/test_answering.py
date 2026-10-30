@@ -11,6 +11,7 @@ from bot.answering import DOC_CHARS, PICK_SECONDS, PROMPT_DOC_CHARS, QUESTION_SE
 from bot.extract import extract_text
 from bot.llm import LLMUnavailable
 from bot.places import CONIFER, Scope
+from bot.storage import Store
 
 from .conftest import NOW, FakeLLM, add_animal, add_archive
 
@@ -270,6 +271,147 @@ async def test_willow_answer_without_one_of_its_forest_parts_is_asked_again(stor
     llm = FakeLLM({"found": True, "answer": "3 горіхи.", "sources": [1]})
     await Answerer(store, forest, llm, TZ).ask("Скільки внесок під вербою?", NOW)
     assert len(llm.prompts) == 1
+
+
+DUES_FACTS = ["[1, рукавичка] Внесок 4 жолуді з дорослого звіра на місяць, здавати до 10 числа.",
+              "[1, рукавичка] Внески віддають Кабанові в кошик біля входу.",
+              "[1, рукавичка] Замість 4 жолудів можна віддати 2 лісові горіхи."]
+
+
+async def test_answer_without_its_own_facts_is_asked_again(store, forest):
+    # The customer's example: the model listed "Кабанові в кошик" and the nuts, then left them out of the answer.
+    add_archive(store, forest, "Членські внески рукавички Під дубом",
+                "Внесок 4 жолуді з дорослого звіра на місяць, до 10 числа. Віддавати Кабанові в кошик біля входу. "
+                "Замість 4 жолудів можна віддати 2 лісові горіхи.")
+    short = {"facts": DUES_FACTS, "found": True, "sources": [1],
+             "answer": "Внесок 4 жолуді з дорослого звіра на місяць, до 10 числа."}
+    full = dict(short, answer="Внесок 4 жолуді з дорослого звіра на місяць, до 10 числа, Кабанові в кошик біля входу; "
+                              "замість жолудів можна 2 лісові горіхи.")
+    llm = FakeLLM(short, full)
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом і до якого числа?", NOW)
+    reminder = llm.prompts[1][1]
+    assert '"Внески віддають Кабанові в кошик біля входу."' in reminder and "2 лісові горіхи" in reminder
+    assert "4 жолуді з дорослого звіра на місяць, здавати" not in reminder.split("пункти, яких немає")[1]
+    assert reply.text.startswith(full["answer"])
+    # A full answer in other words is not asked again; with no time for the second try the first one holds.
+    llm = FakeLLM(dict(short, answer="Дорослий звір платить 4 жолуді щомісяця до 10 числа, у кошик Кабанові біля "
+                                     "входу; можна віддати 2 лісові горіхи замість жолудів."))
+    await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert len(llm.prompts) == 1
+    llm = FakeLLM(short, LLMUnavailable("no time left"))
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert reply.kind == "answer" and reply.text.startswith(short["answer"])
+
+
+async def test_a_fact_of_several_sentences_is_checked_sentence_by_sentence(store, forest):
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць до 10 числа. "
+                                                                       "Віддавати Кабанові в кошик біля входу.")
+    merged = ["[1, рукавичка] Внесок 4 жолуді на місяць, здавати до 10 числа. Внески віддають Кабанові в кошик біля входу."]
+    llm = FakeLLM({"facts": merged, "found": True, "sources": [1], "answer": "4 жолуді на місяць до 10 числа."},
+                  {"facts": merged, "found": True, "sources": [1],
+                   "answer": "4 жолуді на місяць до 10 числа, Кабанові в кошик біля входу."})
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert '"Внески віддають Кабанові в кошик біля входу."' in llm.prompts[1][1] and "Кабанові" in reply.text
+
+
+async def test_animal_advice_put_before_the_archive_for_the_same_place_is_asked_again(store, forest):
+    # Decided with the customer (20:46): for the same place the archive wins, though the animal's advice is newer.
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць.")
+    add_animal(store, "Нові внески", "Для рукавички Під дубом: внесок тепер 5 жолудів.", Scope("mitten", "Під дубом"),
+               name="Білочка")
+    llm = FakeLLM({"found": True, "answer": "5 жолудів на місяць.", "sources": [2, 1]},
+                  {"found": True, "answer": "4 жолуді на місяць.", "other": "Білочка пише про 5 жолудів, але тут діє "
+                                                                            "архів.", "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert "з документа звіра [2], а документ Лісового архіву [1]" in llm.prompts[1][1]
+    assert reply.text.startswith("4 жолуді на місяць.\n\nБілочка пише")
+    assert reply.text.index("Лісовий архів") < reply.text.index("автор: Білочка")
+    # The archive document not even cited, and document numbers in the text: still asked, and the numbers go.
+    llm = FakeLLM({"found": True, "answer": "5 жолудів на місяць [2].", "sources": [2]},
+                  {"found": True, "answer": "4 жолуді на місяць [1].", "other": "Документ [2] пише про 5.",
+                   "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert len(llm.prompts) == 2 and reply.text.startswith("4 жолуді на місяць.\n\nДокумент пише про 5.")
+
+
+async def test_animal_advice_first_with_an_archive_document_on_another_topic_is_not_asked_again(forest):
+    store = Store(":memory:")
+    add_archive(store, forest, "Небезпеки поруч із рукавичкою Під дубом", "Яма за 30 кроків на північ.")
+    add_animal(store, "Пожежа", "Пожежа: збираємося під дубом.", Scope("mitten", "Під дубом"))
+    # The model picking by title brings the mitten's dangers document into the prompt too.
+    llm = FakeLLM({"found": True, "answer": "Збирайтеся під дубом.", "sources": [2]}, picks=[{"ids": [1]}])
+    reply = await Answerer(store, forest, llm, TZ).ask("Що робити при пожежі під дубом?", NOW)
+    assert '"Пожежа"' in llm.prompts[0][1].split("[2] ")[1].splitlines()[0]
+    assert len(llm.prompts) == 1 and reply.text.startswith("Збирайтеся під дубом.") and "автор: Зайчик" in reply.text
+
+
+async def test_numbers_decide_and_may_be_written_as_words(store, forest):
+    add_archive(store, forest, "Членські внески рукавички Під дубом",
+                "Внесок 4 жолуді з дорослого звіра на місяць, до 10 числа. Віддавати Кабанові в кошик біля входу. "
+                "Замість 4 жолудів можна віддати 2 лісові горіхи.")
+    question = "Скільки внесок під дубом і до якого числа?"
+    # The nuts dropped, though the words of that point are all in the answer: still asked about.
+    no_nuts = {"facts": DUES_FACTS, "found": True, "sources": [1], "answer": "Внесок 4 жолуді з дорослого звіра на "
+               "місяць, до 10 числа; віддавайте його Кабанові в кошик біля входу, можна й жолудями замість горіхів."}
+    llm = FakeLLM(no_nuts, dict(no_nuts, answer=no_nuts["answer"] + " Замість 4 жолудів — 2 лісові горіхи."))
+    await Answerer(store, forest, llm, TZ).ask(question, NOW)
+    assert len(llm.prompts) == 2 and '"Замість 4 жолудів можна віддати 2 лісові горіхи."' in llm.prompts[1][1]
+    # Numbers in words, the day as "десятого", the question's words not repeated: complete, no second call.
+    llm = FakeLLM({"facts": DUES_FACTS, "found": True, "sources": [1], "answer": "Чотири жолуді з дорослого звіра "
+                   "щомісяця, до десятого числа, Кабанові в кошик біля входу; або два лісові горіхи замість жолудів."})
+    await Answerer(store, forest, llm, TZ).ask(question, NOW)
+    assert len(llm.prompts) == 1
+
+
+async def test_second_try_that_loses_the_answer_keeps_the_first(store, forest):
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць, Кабанові в кошик.")
+    short = {"facts": DUES_FACTS, "found": True, "sources": [1], "answer": "4 жолуді на місяць."}
+    for lost in ({"found": False}, {"found": True, "answer": "", "sources": [1]}):
+        llm = FakeLLM(short, lost)
+        reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+        assert len(llm.prompts) == 2 and reply.kind == "answer" and reply.text.startswith("4 жолуді на місяць.")
+    assert 'а пункт поради, що тут поступається конкретнішій чи архіву, — коротко в "other"' in llm.prompts[1][1]
+
+
+async def test_stub_or_repeated_other_is_left_out_and_document_numbers_go(store, forest):
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць.")
+    for stub in ("Немає.", "-", "null", "Немає іншої поради.", "4 жолуді на місяць.", ["", ""]):
+        llm = FakeLLM({"found": True, "answer": "4 жолуді на місяць.", "other": stub, "sources": [1]})
+        reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+        assert reply.text.split("\n\n")[1].startswith("Джерело:"), stub
+    llm = FakeLLM({"found": True, "answer": "Як сказано у документі [1], 4 жолуді на місяць [1, рукавичка] з 2026 [2026].",
+                   "sources": [1]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert reply.text.startswith("Як сказано, 4 жолуді на місяць з 2026 [2026].")
+
+
+async def test_facts_of_documents_the_answer_does_not_cite_are_not_required(store, forest):
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць.")
+    add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Рукавички утеплюють у листопаді.")
+    llm = FakeLLM({"facts": ["[1, рукавичка] Внесок 4 жолуді на місяць.",
+                             "[2, увесь ліс] Рукавички утеплюють у листопаді."],
+                   "found": True, "answer": "4 жолуді на місяць.", "sources": [1]})
+    await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert len(llm.prompts) == 1
+
+
+async def test_advice_that_gives_way_stands_in_its_own_paragraph(store, forest):
+    # The fire example agreed with the customer: the mitten's own gathering place, the memo's only as a note.
+    add_archive(store, forest, "Що робити при пожежі",
+                "Ця пам'ятка для всіх мешканців лісу. Довгий безперервний крик означає пожежу. "
+                "Усі збираються біля бобрової греблі.")
+    add_animal(store, "Пожежа Під дубом", "При пожежі мешканці рукавички Під дубом збираються під дубом, біля дупла Сови.",
+               Scope("mitten", "Під дубом"), name="Їжачок")
+    other = ("загальна пам'ятка для всього лісу радить збиратися біля бобрової греблі, але для рукавички Під дубом "
+             "діє конкретніша порада.")
+    llm = FakeLLM({"found": True, "answer": "При пожежі збирайтеся під дубом, біля дупла Сови. Сигнал пожежі — довгий "
+                                            "безперервний крик.", "other": other, "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Що робити при пожежі під дубом?", NOW)
+    answer, note, cite = reply.text.split("\n\n")
+    assert "бобрової" not in answer and note == other[0].upper() + other[1:]
+    assert cite.startswith("Джерела:") and "автор: Їжачок" in cite and '"Що робити при пожежі"' in cite
+    system = llm.prompts[0][0]
+    assert 'коротко перекажи її в полі "other"' in system and '"other":' in system
 
 
 def word_guide(sections: list[tuple[str, str]], intro: str = "") -> str:

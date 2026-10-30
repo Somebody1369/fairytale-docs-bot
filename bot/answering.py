@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from .llm import LLM, LLMUnavailable
 from .places import PART_NAMES, Forest, Scope, resident_homes, residents_from_statute
-from .search import Hit, Index, expand, looks_like_heading, split_chunks, tokens
+from .search import COMMON_STEMS, STOPWORDS, Hit, Index, expand, looks_like_heading, split_chunks, tokens
 from .storage import Document, Store
 from . import texts
 
@@ -49,16 +49,16 @@ ANSWER_SYSTEM = """Ти бот-помічник звірів лісу. Ти ві
 Правила:
 1. Бери інформацію тільки з наданих документів. Нічого не вигадуй і не додавай від себе: жодних дат, умов чи уточнень, яких немає в тексті документів.
 2. Якщо в документах немає відповіді на питання, поверни "found": false.
-3. Конкретніша порада важливіша за загальну: рівень "рукавичка" важливіший за "частина лісу", а "частина лісу" важливіша за "увесь ліс". Рівень документа написано в рядку "Рівень", і місця, названі в тексті документа, його не змінюють. Якщо в документі для рукавички є хоч щось на тему питання, починай відповідь із нього. Якщо поради суперечать, відповідай за конкретнішою. Загальнішу можна коротко згадати додатково, чітко сказавши, що для цього місця діє конкретніша.
-4. Якщо поради однаково конкретні: документ із Лісового архіву важливіший за документ від звіра. Серед документів архіву, як і серед документів від звірів, важливіший новіший (дата й час у рядку "Звідки"; якщо вони однакові, новіший той, що стоїть у переліку вище).
+3. Конкретніша порада важливіша за загальну: рівень "рукавичка" важливіший за "частина лісу", а "частина лісу" важливіша за "увесь ліс". Рівень документа написано в рядку "Рівень", і місця, названі в тексті документа, його не змінюють. Якщо в документі для рукавички є хоч щось на тему питання, починай відповідь із нього. Якщо поради суперечать, у "answer" пиши лише конкретнішу, а із загальнішої тільки те, що їй не суперечить. Загальнішу пораду, що радить інакше, не змішуй із відповіддю: коротко перекажи її в полі "other", скажи там, для кого вона і що тут діє конкретніша, і додай її документ у "sources" (наприклад: "Загальна пам'ятка для всього лісу радить збиратися біля бобрової греблі, але для рукавички Під дубом діє конкретніша порада.").
+4. Якщо поради однаково конкретні: документ із Лісового архіву важливіший за документ від звіра. Серед документів архіву, як і серед документів від звірів, важливіший новіший (дата й час у рядку "Звідки"; якщо вони однакові, новіший той, що стоїть у переліку вище). Пораду, що поступилася й радить інакше, коротко перекажи в полі "other", як у правилі 3, і додай її документ у "sources".
 5. Якщо питання про час, пору року, день тижня чи "чи вже можна", враховуй сьогоднішню дату. Дні тижня й дати бери лише з наданого календаря (там уже пораховано, наприклад, яка дата перша субота місяця), не обчислюй їх сам. Порівнюй дату події із сьогоднішньою: якщо вона раніше за сьогодні, пиши в минулому часі, що подія вже була, і не вигадуй дату наступної, якщо її немає в документах.
 6. Пиши грамотною українською, ввічливо, просто, доброзичливо й по суті, без казковості та без звертань на кшталт "любий звіре". Якщо звертаєшся до звіра, то на "Ви" (з великої літери): "Вам", "здайте", "зверніться". Відповідь коротка (1-5 речень), але переказуй усі пункти документа, що стосуються питання, нічого з них не пропускай: скільки, коли, кому й куди віддавати чи приносити, чим можна замінити, хто звільнений.
 7. Якщо рукавичка належить до кількох частин лісу (як "Під вербою": і листяний ліс, і біля річки), їй підходять поради кожної з цих частин: наведи поради всіх її частин лісу, що стосуються питання, навіть якщо вони не суперечать одна одній, і скажи, до якої частини лісу належить кожна. Порада самої рукавички, як і завжди, іде першою.
-8. Не згадуй у тексті відповіді номери документів і не пиши, звідки порада: джерела бот додасть сам.
+8. Не згадуй в "answer" та "other" номери й назви документів: джерела бот додасть сам.
 9. Якщо в документі є окремі розділи для різних місць, бери розділ для місця з питання. Але рівень розділу той самий, що й у всього документа (рядок "Рівень"): розділ "Під дубом" у путівнику для всього лісу є порадою рівня "увесь ліс", тож документ для рукавички Під дубом або для її частини лісу важливіший за нього.
 10. Місце в питанні ("під дубом", "біля сосон", "біля верби") означає рукавичку з рядка "Місце з питання", а не саме дерево: відповідай усіма порадами, що підходять цій рукавичці, навіть якщо в них це дерево не згадано.
 
-Поверни JSON: {"facts": ["кожен пункт із документів, що стосується питання, окремим рядком: скільки, коли, кому, куди, чим замінити, хто звільнений; на початку рядка номер документа і його рівень, наприклад [2, частина лісу]"], "found": true або false, "answer": "текст відповіді, у якому є всі ці пункти", "sources": [номери документів, з яких узято відповідь, найважливіший перший]}"""
+Поверни JSON: {"facts": ["кожен пункт документів, з яких відповідаєш, на тему питання, окремим рядком, навіть якщо про нього прямо не питали (на \"скільки внесок\" це й кому та куди віддавати, і чим можна замінити): скільки, коли, кому, куди, чим замінити, хто звільнений; на початку рядка номер документа і його рівень, наприклад [2, частина лісу]"], "found": true або false, "answer": "текст відповіді для місця з питання, у якому є всі ці пункти, крім тих, що пішли в other", "other": "порада, що радить інакше й тут поступається відповіді, з поясненням чому, або \"\"", "sources": [номери документів, з яких узято відповідь, найважливіший перший]}"""
 
 PLACE_UNKNOWN_RULE = """
 
@@ -69,11 +69,19 @@ PICK_SYSTEM = """Тобі дають питання звіра і перелік
 
 LEVEL_REMINDER = """
 
-Зверни увагу: документ [{better}] (рівень "{better_level}") конкретніший за документ [{weaker}] (рівень "{weaker_level}"), навіть якщо в [{weaker}] є розділ про місце з питання. Якщо в [{better}] є відповідь на питання, відповідай за ним і постав його першим у "sources", а [{weaker}] згадай лише додатково, сказавши, що для цього місця діє конкретніша порада."""
+Зверни увагу: документ [{better}] (рівень "{better_level}") конкретніший за документ [{weaker}] (рівень "{weaker_level}"), навіть якщо в [{weaker}] є розділ про місце з питання. Якщо в [{better}] є відповідь на питання, відповідай за ним і постав його першим у "sources", а пораду [{weaker}], якщо вона радить інакше, перекажи в полі "other"."""
 
 PARTS_REMINDER = """
 
 Зверни увагу: рукавичка "{mitten}" належить до кількох частин лісу, і їй підходять поради кожної з них. У відповіді є порада для частини лісу "{cited}", але немає поради для частини "{missing}". Якщо в документі {docs} є щось на тему питання (навіть без дерева, названого в питанні: воно лише вказує на рукавичку), додай це у відповідь, сказавши, що це порада для частини лісу "{missing}", і додай номер документа в "sources"."""
+
+FACTS_REMINDER = """
+
+Зверни увагу: ти виписав у "facts" із документів, на які посилаєшся, пункти, яких немає ні в "answer", ні в "other": {facts}. Додай їх у "answer" (можна коротко), нічого не вигадуючи, а пункт поради, що тут поступається конкретнішій чи архіву, — коротко в "other"."""
+
+ARCHIVE_REMINDER = """
+
+Зверни увагу: перша порада у відповіді — з документа звіра [{animal}], а документ Лісового архіву {archive} написаний для того самого місця. Якщо в архіві теж є відповідь на питання, за правилом 4 важливіший архів, навіть якщо документ звіра новіший: відповідай за архівом і постав його першим у "sources", а пораду [{animal}], якщо вона радить інакше, перекажи в полі "other". Якщо відповіді в архіві немає, відповідай як раніше."""
 
 RESIDENT_NOTE = " (місце визначено за звіром {name}, який тут живе; якщо порада однакова для всього лісу, на рукавичці не наголошуй)"
 
@@ -129,6 +137,91 @@ def source_line(doc: Document, tz: ZoneInfo) -> str:
         return f"{title} (Лісовий архів, місце: {place})"
     return (f"{title}, надіслано {format_date(doc.created_at, tz)}, автор: {doc.author_name or 'невідомо'}, "
             f"місце: {place}")
+
+
+# Numbers written as words count as the numbers: "чотири жолуді" keeps "4 жолуді".
+NUMERALS = {word: digits for digits, words in {
+    "1": "один одна одне одну одного одній", "2": "два дві двох двома", "3": "три трьох трьома тричі",
+    "4": "чотири чотирьох чотирьома", "5": "п'ять п'яти п'ятьма", "6": "шість шести шістьма", "7": "сім семи",
+    "8": "вісім восьми", "9": "дев'ять дев'яти", "10": "десять десяти десятого", "15": "п'ятнадцять п'ятнадцятого",
+    "20": "двадцять двадцяти двадцятого", "30": "тридцять тридцяти", "50": "п'ятдесят п'ятдесяти",
+}.items() for word in words.split()}
+ENDINGS = sorted("ами ями ові еві єві ого ому ими іми ою ею єю ом ем ам ям ах ях ів їв ий ій ої ей им ім "
+                 "а я у ю е є о и і ї ь".split(), key=len, reverse=True)
+
+
+def stem(word: str) -> str:
+    """A rough stem that meets the inflections: "щомісяця"/"місяць", "узимку"/"взимку", "мохом"/"мох"."""
+    if word.startswith("що") and len(word) > 6:
+        word = word[2:]
+    if len(word) > 3 and word[0] == "у" and word[1] not in "аеєиіїоуюя":
+        word = "в" + word[1:]
+    ending = next((ending for ending in ENDINGS if word.endswith(ending) and len(word) - len(ending) >= 2), "")
+    return word[:len(word) - len(ending)][:4]
+
+
+# A day of the month written as a word: "до першого числа" is "до 1 числа". Only before "числа", as
+# "після першого морозу" has no number in it.
+DAY_ORDINALS = {"першого": "1", "другого": "2", "третього": "3", "четвертого": "4", "п'ятого": "5", "десятого": "10",
+                "п'ятнадцятого": "15", "двадцятого": "20"}
+
+
+def fact_terms(text: str) -> set[str]:
+    """Numbers and the stems of meaningful words: "Кабанові в кошик біля входу" -> {"каба", "кош", "вход"}."""
+    text = re.sub(r"\b([а-яіїєґ']+)(?=\s+числ)", lambda match: DAY_ORDINALS.get(match.group(1), match.group(1)),
+                  text.lower().replace("’", "'").replace("ʼ", "'"))
+    words = re.findall(r"[а-щьюяіїєґa-z0-9']+", text)
+    return {word if word.isdigit() else NUMERALS.get(word) or stem(word) for word in words
+            if word.isdigit() or word in NUMERALS
+            or (len(word) >= 3 and word not in STOPWORDS and not word.startswith(COMMON_STEMS))}
+
+
+FACT = re.compile(r"\s*[-*•«\"(]*\s*\[\s*(?:№|документ\s*)?(\d+)[^\]]*\]\**\s*(.+)", re.S | re.I)
+
+
+def missing_facts(facts, docs: list[Document], sources: list[Document], text: str, question: str = "") -> list[str]:
+    """The facts ("[1, рукавичка] ...") the model listed from the documents it cites that the text leaves out:
+    checked sentence by sentence (and line by line for lists), a sentence is left out when the text lacks one of
+    its numbers or half of its word stems. Words of the question need not be repeated ("у хвойному лісі" in
+    "Коли утеплювати у соснах?" -> "У жовтні"). Facts from documents the answer does not cite are not required."""
+    cited = {docs.index(doc) + 1 for doc in sources}
+    have, asked = fact_terms(text), fact_terms(question)
+    left_out = []
+    for fact in facts if isinstance(facts, list) else []:
+        match = FACT.match(str(fact))
+        if not match or int(match.group(1)) not in cited:
+            continue
+        for sentence in re.split(r"(?<=[.!?;])\s+|\n+", match.group(2).strip()):
+            terms = fact_terms(sentence)
+            numbers = {term for term in terms if term.isdigit()}
+            terms = (terms - asked) or terms
+            if numbers - have or (terms and len(terms & have) * 2 < len(terms)):
+                left_out.append(sentence.strip())
+    return left_out
+
+
+def clean_text(value, documents: int) -> str:
+    """The model's text without the document numbers it now and then puts in ("у документі [2]", "[1, рукавичка]");
+    other numbers in brackets ("[2026]") stay."""
+    text = " ".join(str(part) for part in value) if isinstance(value, list) else str(value or "")
+    numbered = lambda match: "" if 1 <= int(match.group(1)) <= documents else match.group(0)
+    text = re.sub(r"(?:\s+(?:у\s+|в\s+)?документ\w*)?\s*\[(\d+)(?:,[^\]]*)?\]", numbered, text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+PLACEHOLDER = re.compile(r"(?:немає|нема|-+|—|–|null|none|n/a|порожній рядок|\"\")\.?"
+                         r"|(?:немає|нема)\s+ін\w*.*|інших\s+порад\s+немає.*", re.I)
+
+
+def clean_other(value, answer: str, documents: int) -> str:
+    """The advice that gives way, or "" for the stubs the model writes instead of nothing ("Немає", "-", "null")
+    and for a repeat of the answer."""
+    if value is not None and not isinstance(value, (str, list)):
+        return ""
+    other = clean_text(value, documents)
+    if not other or PLACEHOLDER.fullmatch(other) or fact_terms(other) <= fact_terms(answer):
+        return ""
+    return other
 
 
 def best_per_level(hits: list[Hit]) -> list[Document]:
@@ -286,24 +379,30 @@ class Answerer:
             + "\nДокументи:\n\n" + "\n\n".join(blocks)
         )
         system = ANSWER_SYSTEM + place_rule
-        asked_sources = asked_level = asked_parts = False
-        earlier = None  # an answer with sources, kept while the model is asked to put the levels right
+        asked_sources = asked_level = asked_archive = asked_parts = asked_facts = False
+        earlier = None  # an answer with sources, kept while the model is asked to put it right
         while True:
             try:
                 result = await self.llm.json(system, prompt, max_tokens=budget, reasoning=reasoning, deadline=deadline)
             except LLMUnavailable:
                 if earlier:  # no time or no model left for the second try: the first answer still holds
-                    answer, sources = earlier
+                    answer, other, sources = earlier
                     break
                 return Reply("unavailable", texts.LLM_UNAVAILABLE)
-            if place_rule and result.get("needs_place"):
-                return Reply("need_place")
-            answer = str(result.get("answer") or "").strip()
-            if result.get("found") in (False, "false") or not answer:
-                return Reply("not_found", texts.NOT_FOUND)
+            answer = clean_text(result.get("answer"), len(docs))
+            # Advice that says otherwise and gives way here (the whole forest's, or an animal's under the archive).
+            other = clean_other(result.get("other"), answer, len(docs))
             sources = self._sources(result.get("sources"), docs)
             if not sources and len(docs) == 1:
                 sources = docs  # one document given, so it is the source
+            gave_up = (place_rule and result.get("needs_place")) or result.get("found") in (False, "false") or not answer
+            if earlier and (gave_up or not sources):
+                answer, other, sources = earlier  # asked to put it right, the model lost the answer: keep the first
+                break
+            if place_rule and result.get("needs_place"):
+                return Reply("need_place")
+            if gave_up:
+                return Reply("not_found", texts.NOT_FOUND)
             if not sources:
                 if asked_sources:
                     return Reply("not_found", texts.NOT_FOUND)
@@ -314,17 +413,28 @@ class Answerer:
             better = next((doc for doc in sources[1:] if doc.scope.level > sources[0].scope.level), None)
             # With no place asked, PLACE_UNKNOWN_RULE alone decides between the whole forest and asking.
             if better and allowed and not asked_level:
-                asked_level, earlier = True, (answer, sources)
+                asked_level, earlier = True, (answer, other, sources)
                 prompt += LEVEL_REMINDER.format(
                     better=docs.index(better) + 1, better_level=LEVEL_NAMES[better.scope.kind],
                     weaker=docs.index(sources[0]) + 1, weaker_level=LEVEL_NAMES[sources[0].scope.kind],
                 )
                 continue
+            # The decision told to Mishka (20:46): for the same place the archive beats an animal's document,
+            # though the animal's is newer. A weaker fallback model now and then answers by the newer one, and
+            # does not even cite the archive document it was given on the same topic.
+            topic = self._topic_terms(question)
+            archived = [] if asked_archive or not allowed or sources[0].from_archive else [
+                doc for doc in docs if doc.from_archive and doc.scope == sources[0].scope and topic & fact_terms(doc.text)]
+            if archived:
+                asked_archive, earlier = True, (answer, other, sources)
+                prompt += ARCHIVE_REMINDER.format(archive=", ".join(f"[{docs.index(doc) + 1}]" for doc in archived),
+                                                  animal=docs.index(sources[0]) + 1)
+                continue
             # Mishka: "для «Під вербою» підходять поради і листяного лісу, і річки". When the answer took one
             # part's advice on the topic and left the other part's document out, the model is asked once more.
             missing = [] if asked_parts else self._missing_parts(mittens, docs, sources)
             if missing:
-                asked_parts, earlier = True, (answer, sources)
+                asked_parts, earlier = True, (answer, other, sources)
                 cited = {doc.scope.value for doc in sources if doc.scope.kind == "part"}
                 prompt += PARTS_REMINDER.format(
                     mitten=mittens[0], cited=", ".join(PART_NAMES[p] for p in sorted(cited)),
@@ -332,13 +442,30 @@ class Answerer:
                     docs=", ".join(f"[{docs.index(doc) + 1}]" for doc in missing),
                 )
                 continue
+            # The model lists the points of the cited documents in "facts", then now and then drops some of them
+            # when it writes the answer ("Кабанові в кошик біля входу" in the customer's own example).
+            left_out = [] if asked_facts else missing_facts(result.get("facts"), docs, sources, f"{answer} {other}",
+                                                            question)
+            if left_out:
+                asked_facts, earlier = True, (answer, other, sources)
+                prompt += FACTS_REMINDER.format(facts="; ".join(f'"{fact}"' for fact in left_out))
+                continue
             break
 
         if len(sources) == 1:
             cite = "Джерело: " + source_line(sources[0], self.tz)
         else:
             cite = "Джерела:\n" + "\n".join("- " + source_line(doc, self.tz) for doc in sources)
-        return Reply("answer", f"{answer}\n\n{cite}")
+        # The advice that gives way stands in a paragraph of its own, so it never reads as part of the answer.
+        text = f"{answer}\n\n{other[0].upper()}{other[1:]}" if other else answer
+        return Reply("answer", f"{text}\n\n{cite}")
+
+    def _topic_terms(self, question: str) -> set[str]:
+        """What the question is about, for telling whether an archive document is on its topic: the word stems
+        without the place, short words, numbers and the names of residents ("Ведмідь" is in his mitten's statute)."""
+        names = {stem for name in self.residents for stem in fact_terms(name)}
+        return {term for term in fact_terms(self.forest.strip_places(question))
+                if len(term) >= 4 and not term.isdigit()} - names
 
     def _missing_parts(self, mittens: list[str], docs: list[Document], sources: list[Document]) -> list[Document]:
         """For a mitten in several forest parts, with one part's advice cited: the best document of each
