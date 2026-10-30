@@ -20,7 +20,7 @@ from aiogram.utils.chat_action import ChatActionSender
 
 from . import texts
 from .answering import Answerer, format_date
-from .classify import WHOLE_FOREST_CAPTION, classify_document, scope_from_caption
+from .classify import SPLIT, WHOLE_FOREST_CAPTION, classify_document, scope_from_caption
 from .config import Settings
 from .extract import (MAX_OCR_PAGES, SUPPORTED_EXTENSIONS, TooManyScannedPages, extension, extract_text,
                       old_word_supported, title_from_filename)
@@ -419,7 +419,8 @@ async def document(message: Message, state: FSMContext, app: App, bot: Bot) -> N
         await message.answer(texts.DOC_UNREADABLE.format(filename=filename))
         return
     if not text.strip():
-        await message.answer(texts.DOC_EMPTY.format(filename=filename))
+        # A PDF without text is a scan that could not be read; any other file is just empty.
+        await message.answer((texts.DOC_EMPTY if ext == ".pdf" else texts.DOC_NO_TEXT).format(filename=filename))
         return
 
     pending = {"id": uuid.uuid4().hex[:8], "filename": filename, "title": title_from_filename(filename),
@@ -529,6 +530,11 @@ async def process_queue(message: Message, state: FSMContext, app: App, user_id: 
             await message.answer(texts.ASK_DOC_PLACE.format(title=pending["title"]),
                                  reply_markup=doc_place_keyboard(app.forest, pending))
             return
+        if scope.kind == SPLIT:
+            # Mishka: one document is for one place, so advice for two mittens comes as two documents.
+            await state.update_data(queue=queue[1:])
+            await message.answer(texts.DOC_SPLIT.format(title=pending["title"], mittens=scope.value))
+            continue
         await file_pending(message, state, app, user_id, queue, scope)
 
 

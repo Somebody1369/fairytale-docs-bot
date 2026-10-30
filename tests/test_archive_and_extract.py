@@ -8,7 +8,7 @@ from pathlib import Path
 
 from bot import archive as archive_module
 from bot.archive import DriveFile, parse_folder_page, parse_shown_date, sync_archive
-from bot.classify import classify_document, scope_from_caption
+from bot.classify import SPLIT, classify_document, scope_from_caption
 from bot.extract import _clean_ocr, extract_text, old_word_supported, title_from_filename
 from bot.places import CONIFER, DECIDUOUS, FOREST_SCOPE, Scope
 
@@ -279,7 +279,8 @@ async def test_places_after_the_first_pages_count(forest):
     text = f"У рукавичці Під дубом запасайте жолуді.\n{filler}\nА в рукавичці У соснах запасайте шишки."
     assert len(text) > 3000
     llm = FakeLLM({"kind": "mitten", "value": "Під дубом"})
-    assert await classify_document("Запаси", text, forest, llm) is None
+    # Two mittens' advice in one document: the sender is asked to split it (Mishka, 30 October).
+    assert await classify_document("Запаси", text, forest, llm) == Scope(SPLIT, "Під дубом, У соснах")
 
 
 @pytest.mark.parametrize("title, text, expected", [
@@ -365,7 +366,8 @@ async def test_whole_forest_by_the_model_when_not_addressed_so(forest, text):
 
 @pytest.mark.parametrize("title, text, expected", [
     ("Небезпеки", "Порада для хвойного та листяного лісу: утеплюйте рукавички в жовтні.", None),
-    ("Збори", "Шановні мешканці рукавичок «Під дубом» та «У соснах»! Спільні збори в суботу.", None),
+    ("Збори", "Шановні мешканці рукавичок «Під дубом» та «У соснах»! Спільні збори в суботу.",
+     Scope(SPLIT, "Під дубом, У соснах")),
     ("Мурахи", "Для всіх, хто проходить повз мурашник: не наступайте на мурах.", None),
     ("Жолуді", "Для всіх, хто живе під дубом: жолуді збираємо разом.", Scope("mitten", "Під дубом")),
     ("Гриби", "Мешканці лісу під ялинами! Рижики вже пішли.", Scope("part", CONIFER)),

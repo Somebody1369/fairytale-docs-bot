@@ -64,6 +64,14 @@ OTHER_MITTEN = r"(?:\b(?:до|від|з|із|зі|повз|сусід\w*)|як\s
 # "не залишайте малечу біля води" or "хто носить воду з річки" say nothing about who the advice is for.
 OPENING_WORDS = 3
 ASK = Scope("ask")  # several places addressed: the sender is asked
+# Advice for several mittens: Mishka wants one document per place, so the sender is asked to split it.
+# The scope's value lists the mittens.
+SPLIT = "split"
+
+
+def _split(mittens: list[str], low: str) -> Scope:
+    """The mittens in the order the text names them."""
+    return Scope(SPLIT, ", ".join(sorted(mittens, key=lambda mitten: low.find(normalize(mitten)))))
 
 
 def scope_from_caption(caption: str | None, forest: Forest) -> Scope | None:
@@ -87,11 +95,14 @@ async def classify_document(title: str, text: str, forest: Forest, llm: LLM) -> 
     a mitten named as the advice's own mitten, words for the whole forest. A place only mentioned in the
     advice ("білі гриби шукайте під дубом") is not clear: the model chooses between the places that cover
     the whole document, and when it cannot tell, or the text names no place, the sender is asked.
-    Signals that disagree, or a document addressed to several places, also mean asking."""
+    Signals that disagree, or a document addressed to several places, also mean asking. Advice for two
+    or more mittens, each named as a mitten, gives a scope of kind SPLIT: the sender splits the document."""
     low = normalize(text)
     addressee, title_scope = _addressee(text, forest), _from_title(title, forest)
     if addressee == ASK:
         return None
+    if addressee and addressee.kind == SPLIT:
+        return addressee
     if addressee and title_scope:
         # "Внески біля річки" with "Шановні мешканці рукавички Під вербою!": the more specific one.
         return addressee if _within(addressee, title_scope, forest) else \
@@ -100,6 +111,10 @@ async def classify_document(title: str, text: str, forest: Forest, llm: LLM) -> 
     own_anywhere = [m for m in forest.mittens if _named_as_mitten(m, low, own=True)]
     if addressee:
         return addressee
+    # "У рукавичці Під дубом внесок 4 жолуді, у рукавичці Під вербою 3 горіхи": unless the file name says the
+    # document is for a forest part or the whole forest, it is two documents in one.
+    if len(own_anywhere) >= 2 and not (title_scope and title_scope.kind != "mitten"):
+        return _split(own_anywhere, low)
     if title_scope:
         # "Внески Під дубом" with "У рукавичці У соснах внески 3 шишки": the text names another mitten.
         clash = title_scope.kind == "mitten" and any(m != title_scope.value for m in own_anywhere)
@@ -256,8 +271,10 @@ def _addressee(text: str, forest: Forest) -> Scope | None:
                 continue
             if scope == FOREST_SCOPE:
                 return scope
-            if not _covers(scope, forest.detect_mittens(sentence), set(forest.detect_parts(sentence)), forest):
-                return ASK  # "для хвойного та листяного лісу", "для Під дубом і Під вербою"
+            named = forest.detect_mittens(sentence)
+            if not _covers(scope, named, set(forest.detect_parts(sentence)), forest):
+                # "для Під дубом і Під вербою" is two documents in one; "для хвойного та листяного лісу" is asked about
+                return _split(named, sentence) if len(named) >= 2 else ASK
             return scope
     return None
 

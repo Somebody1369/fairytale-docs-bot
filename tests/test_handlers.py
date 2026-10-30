@@ -763,3 +763,24 @@ async def test_document_stranded_by_the_old_code_is_asked_about_after_an_answer(
     assert telegram.sent[-2].text.startswith("4 жолуді") and 'А для документа "Старий"' in telegram.sent[-1].text
     await dispatcher.feed_update(bot, press(telegram.sent[-1], "Увесь ліс"))
     assert 'Документ "Старий" збережено' in telegram.sent[-1].text
+
+
+async def test_document_for_two_mittens_is_sent_back_to_be_split(setup):
+    # Mishka: one document is for one place, so the animal is asked to split it, and nothing is saved.
+    dispatcher, bot, telegram, llm, store = setup
+    store.set_user_name(USER.id, "Їжак", datetime.now(timezone.utc))
+    telegram.file_bytes = ("У рукавичці Під дубом внесок 4 жолуді.\n"
+                           "А в рукавичці Під вербою внесок 3 горіхи.").encode()
+    await dispatcher.feed_update(bot, document_update("Внески.txt", "s1"))
+    assert telegram.sent[-1].text == texts.DOC_SPLIT.format(title="Внески", mittens="Під дубом, Під вербою")
+    assert store.documents_of(USER.id) == [] and await flow_state(dispatcher, bot) is None
+    # Sent again with the place in the caption, it is the sender's choice.
+    await dispatcher.feed_update(bot, document_update("Внески.txt", "s2", caption="для листяного лісу"))
+    assert [doc.scope.describe() for doc in store.documents_of(USER.id)] == ["листяний ліс"]
+
+
+async def test_empty_file_is_not_taken_for_a_scan(setup):
+    dispatcher, bot, telegram, _, store = setup
+    telegram.file_bytes = b"   \n"
+    await dispatcher.feed_update(bot, document_update("Порада.txt", "e1"))
+    assert telegram.sent[-1].text == texts.DOC_NO_TEXT.format(filename="Порада.txt")
