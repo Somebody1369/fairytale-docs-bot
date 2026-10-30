@@ -50,10 +50,10 @@ ANSWER_SYSTEM = """Ти бот-помічник звірів лісу. Ти ві
 1. Бери інформацію тільки з наданих документів. Нічого не вигадуй і не додавай від себе: жодних дат, умов чи уточнень, яких немає в тексті документів.
 2. Якщо в документах немає відповіді на питання, поверни "found": false.
 3. Конкретніша порада важливіша за загальну: рівень "рукавичка" важливіший за "частина лісу", а "частина лісу" важливіша за "увесь ліс". Рівень документа написано в рядку "Рівень", і місця, названі в тексті документа, його не змінюють. Якщо в документі для рукавички є хоч щось на тему питання, починай відповідь із нього. Якщо поради суперечать, у "answer" пиши лише конкретнішу, а із загальнішої тільки те, що їй не суперечить. Загальнішу пораду, що радить інакше, не змішуй із відповіддю: коротко перекажи її в полі "other", скажи там, для кого вона і що тут діє конкретніша, і додай її документ у "sources" (наприклад: "Загальна пам'ятка для всього лісу радить збиратися біля бобрової греблі, але для рукавички Під дубом діє конкретніша порада.").
-4. Якщо поради однаково конкретні: документ із Лісового архіву важливіший за документ від звіра. Серед документів архіву, як і серед документів від звірів, важливіший новіший (дата й час у рядку "Звідки"; якщо вони однакові, новіший той, що стоїть у переліку вище). Пораду, що поступилася й радить інакше, коротко перекажи в полі "other", як у правилі 3, і додай її документ у "sources".
+4. Якщо поради однаково конкретні й написані для того самого місця: документ із Лісового архіву важливіший за документ від звіра. Серед документів архіву, як і серед документів від звірів, важливіший новіший (дата й час у рядку "Звідки"; якщо вони однакові, новіший той, що стоїть у переліку вище). Пораду, що поступилася й радить інакше, коротко перекажи в полі "other", як у правилі 3, і додай її документ у "sources".
 5. Якщо питання про час, пору року, день тижня чи "чи вже можна", враховуй сьогоднішню дату. Дні тижня й дати бери лише з наданого календаря (там уже пораховано, наприклад, яка дата перша субота місяця), не обчислюй їх сам. Порівнюй дату події із сьогоднішньою: якщо вона раніше за сьогодні, пиши в минулому часі, що подія вже була, і не вигадуй дату наступної, якщо її немає в документах.
 6. Пиши грамотною українською, ввічливо, просто, доброзичливо й по суті, без казковості та без звертань на кшталт "любий звіре". Якщо звертаєшся до звіра, то на "Ви" (з великої літери): "Вам", "здайте", "зверніться". Відповідь коротка (1-5 речень), але переказуй усі пункти документа, що стосуються питання, нічого з них не пропускай: скільки, коли, кому й куди віддавати чи приносити, чим можна замінити, хто звільнений.
-7. Якщо рукавичка належить до кількох частин лісу (як "Під вербою": і листяний ліс, і біля річки), їй підходять поради кожної з цих частин: наведи поради всіх її частин лісу, що стосуються питання, навіть якщо вони не суперечать одна одній, і скажи, до якої частини лісу належить кожна. Порада самої рукавички, як і завжди, іде першою.
+7. Якщо рукавичка належить до кількох частин лісу (як "Під вербою": і листяний ліс, і біля річки), їй підходять поради кожної з цих частин: наведи в "answer" поради всіх її частин лісу, що стосуються питання, навіть якщо вони не суперечать одна одній, і скажи, до якої частини лісу належить кожна. Поради різних частин лісу однієї рукавички одна одній не поступаються, тож жодна з них не йде в "other". Порада самої рукавички, як і завжди, іде першою.
 8. Не згадуй в "answer" та "other" номери й назви документів: джерела бот додасть сам.
 9. Якщо в документі є окремі розділи для різних місць, бери розділ для місця з питання. Але рівень розділу той самий, що й у всього документа (рядок "Рівень"): розділ "Під дубом" у путівнику для всього лісу є порадою рівня "увесь ліс", тож документ для рукавички Під дубом або для її частини лісу важливіший за нього.
 10. Місце в питанні ("під дубом", "біля сосон", "біля верби") означає рукавичку з рядка "Місце з питання", а не саме дерево: відповідай усіма порадами, що підходять цій рукавичці, навіть якщо в них це дерево не згадано.
@@ -213,13 +213,17 @@ PLACEHOLDER = re.compile(r"(?:немає|нема|-+|—|–|null|none|n/a|по�
                          r"|(?:немає|нема)\s+ін\w*.*|інших\s+порад\s+немає.*", re.I)
 
 
+# The model talking about its own JSON ("тому її не включаємо в \"other\"") is not advice for an animal.
+SERVICE_WORDS = re.compile(r"\b(?:other|answer|sources|facts|json)\b", re.I)
+
+
 def clean_other(value, answer: str, documents: int) -> str:
-    """The advice that gives way, or "" for the stubs the model writes instead of nothing ("Немає", "-", "null")
-    and for a repeat of the answer."""
+    """The advice that gives way, or "" for the stubs the model writes instead of nothing ("Немає", "-", "null"),
+    for a repeat of the answer and for the model's words about its own reply."""
     if value is not None and not isinstance(value, (str, list)):
         return ""
     other = clean_text(value, documents)
-    if not other or PLACEHOLDER.fullmatch(other) or fact_terms(other) <= fact_terms(answer):
+    if not other or PLACEHOLDER.fullmatch(other) or SERVICE_WORDS.search(other) or fact_terms(other) <= fact_terms(answer):
         return ""
     return other
 
@@ -379,14 +383,16 @@ class Answerer:
             + "\nДокументи:\n\n" + "\n\n".join(blocks)
         )
         system = ANSWER_SYSTEM + place_rule
-        asked_sources = asked_level = asked_archive = asked_parts = asked_facts = False
-        earlier = None  # an answer with sources, kept while the model is asked to put it right
+        asked_sources = False
+        # The first answer with sources, (answer, other, sources, faults, facts), while the model is asked once
+        # to put it right.
+        first = None
         while True:
             try:
                 result = await self.llm.json(system, prompt, max_tokens=budget, reasoning=reasoning, deadline=deadline)
             except LLMUnavailable:
-                if earlier:  # no time or no model left for the second try: the first answer still holds
-                    answer, other, sources = earlier
+                if first:  # no time or no model left for the second try: the first answer still holds
+                    answer, other, sources = first[:3]
                     break
                 return Reply("unavailable", texts.LLM_UNAVAILABLE)
             answer = clean_text(result.get("answer"), len(docs))
@@ -396,8 +402,8 @@ class Answerer:
             if not sources and len(docs) == 1:
                 sources = docs  # one document given, so it is the source
             gave_up = (place_rule and result.get("needs_place")) or result.get("found") in (False, "false") or not answer
-            if earlier and (gave_up or not sources):
-                answer, other, sources = earlier  # asked to put it right, the model lost the answer: keep the first
+            if first and (gave_up or not sources):
+                answer, other, sources = first[:3]  # asked to put it right, the model lost the answer: keep the first
                 break
             if place_rule and result.get("needs_place"):
                 return Reply("need_place")
@@ -408,49 +414,23 @@ class Answerer:
                     return Reply("not_found", texts.NOT_FOUND)
                 asked_sources = True  # the model now and then forgets the source numbers; ask once more
                 continue
-            # A section about the asked mitten inside a whole-forest guide tempts the model to put the
-            # guide first, though a cited document for the mitten's forest part is more specific.
-            better = next((doc for doc in sources[1:] if doc.scope.level > sources[0].scope.level), None)
-            # With no place asked, PLACE_UNKNOWN_RULE alone decides between the whole forest and asking.
-            if better and allowed and not asked_level:
-                asked_level, earlier = True, (answer, other, sources)
-                prompt += LEVEL_REMINDER.format(
-                    better=docs.index(better) + 1, better_level=LEVEL_NAMES[better.scope.kind],
-                    weaker=docs.index(sources[0]) + 1, weaker_level=LEVEL_NAMES[sources[0].scope.kind],
-                )
-                continue
-            # The decision told to Mishka (20:46): for the same place the archive beats an animal's document,
-            # though the animal's is newer. A weaker fallback model now and then answers by the newer one, and
-            # does not even cite the archive document it was given on the same topic.
-            topic = self._topic_terms(question)
-            archived = [] if asked_archive or not allowed or sources[0].from_archive else [
-                doc for doc in docs if doc.from_archive and doc.scope == sources[0].scope and topic & fact_terms(doc.text)]
-            if archived:
-                asked_archive, earlier = True, (answer, other, sources)
-                prompt += ARCHIVE_REMINDER.format(archive=", ".join(f"[{docs.index(doc) + 1}]" for doc in archived),
-                                                  animal=docs.index(sources[0]) + 1)
-                continue
-            # Mishka: "для «Під вербою» підходять поради і листяного лісу, і річки". When the answer took one
-            # part's advice on the topic and left the other part's document out, the model is asked once more.
-            missing = [] if asked_parts else self._missing_parts(mittens, docs, sources)
-            if missing:
-                asked_parts, earlier = True, (answer, other, sources)
-                cited = {doc.scope.value for doc in sources if doc.scope.kind == "part"}
-                prompt += PARTS_REMINDER.format(
-                    mitten=mittens[0], cited=", ".join(PART_NAMES[p] for p in sorted(cited)),
-                    missing=", ".join(PART_NAMES[doc.scope.value] for doc in missing),
-                    docs=", ".join(f"[{docs.index(doc) + 1}]" for doc in missing),
-                )
-                continue
-            # The model lists the points of the cited documents in "facts", then now and then drops some of them
-            # when it writes the answer ("Кабанові в кошик біля входу" in the customer's own example).
-            left_out = [] if asked_facts else missing_facts(result.get("facts"), docs, sources, f"{answer} {other}",
-                                                            question)
-            if left_out:
-                asked_facts, earlier = True, (answer, other, sources)
-                prompt += FACTS_REMINDER.format(facts="; ".join(f'"{fact}"' for fact in left_out))
-                continue
-            break
+            facts = result.get("facts") if isinstance(result.get("facts"), list) else []
+            reminders, faults = self._review(question, docs, mittens, allowed, answer, other, sources, facts)
+            if first:
+                # The one second try is taken unless it came out worse: more broken rules, or more of the points
+                # both answers listed left out (a weaker fallback model may answer it worse than the first).
+                every = first[4] + facts
+                before = (first[3], len(missing_facts(every, docs, first[2], f"{first[0]} {first[1]}", question)))
+                after = (faults, len(missing_facts(every, docs, sources, f"{answer} {other}", question)))
+                if after > before:
+                    answer, other, sources = first[:3]
+                break
+            if not reminders:
+                break
+            # Everything to put right goes in one second try: each try costs a Groq request, and the free tier
+            # allows only so many tokens a minute.
+            first = (answer, other, sources, faults, facts)
+            prompt += "".join(reminders)
 
         if len(sources) == 1:
             cite = "Джерело: " + source_line(sources[0], self.tz)
@@ -467,17 +447,61 @@ class Answerer:
         return {term for term in fact_terms(self.forest.strip_places(question))
                 if len(term) >= 4 and not term.isdigit()} - names
 
-    def _missing_parts(self, mittens: list[str], docs: list[Document], sources: list[Document]) -> list[Document]:
-        """For a mitten in several forest parts, with one part's advice cited: the best document of each
-        of its other parts that was given to the model but left out of the answer."""
+    def _review(self, question: str, docs: list[Document], mittens: list[str], allowed, answer: str, other: str,
+                sources: list[Document], facts: list) -> tuple[list[str], int]:
+        """What to put right in an answer: the reminders for the model, and how many of the places' rules
+        (levels, the archive, both forest parts) the answer breaks."""
+        reminders = []
+        # A section about the asked mitten inside a whole-forest guide tempts the model to put the
+        # guide first, though a cited document for the mitten's forest part is more specific.
+        # With no place asked, PLACE_UNKNOWN_RULE alone decides between the whole forest and asking.
+        better = next((doc for doc in sources[1:] if doc.scope.level > sources[0].scope.level), None)
+        if better and allowed:
+            reminders.append(LEVEL_REMINDER.format(
+                better=docs.index(better) + 1, better_level=LEVEL_NAMES[better.scope.kind],
+                weaker=docs.index(sources[0]) + 1, weaker_level=LEVEL_NAMES[sources[0].scope.kind]))
+        # The decision told to Mishka (20:46): for the same place the archive beats an animal's document,
+        # though the animal's is newer. A weaker fallback model now and then answers by the newer one, and
+        # does not even cite the archive document it was given on the same topic.
+        topic = self._topic_terms(question)
+        archived = [] if not allowed or sources[0].from_archive else [
+            doc for doc in docs if doc.from_archive and doc.scope == sources[0].scope and topic & fact_terms(doc.text)]
+        if archived:
+            reminders.append(ARCHIVE_REMINDER.format(archive=", ".join(f"[{docs.index(doc) + 1}]" for doc in archived),
+                                                     animal=docs.index(sources[0]) + 1))
+        # Mishka: "для «Під вербою» підходять поради і листяного лісу, і річки". When the answer took one
+        # part's advice on the topic and left the other part's document out, the model is reminded of it.
+        missing = self._missing_parts(mittens, docs, sources, answer, question)
+        if missing:
+            cited = {doc.scope.value for doc in sources if doc.scope.kind == "part"} - {doc.scope.value for doc in missing}
+            reminders.append(PARTS_REMINDER.format(
+                mitten=mittens[0], cited=", ".join(PART_NAMES[p] for p in sorted(cited)),
+                missing=", ".join(PART_NAMES[doc.scope.value] for doc in missing),
+                docs=", ".join(f"[{docs.index(doc) + 1}]" for doc in missing)))
+        faults = len(reminders)
+        # The model lists the points of the cited documents in "facts", then now and then drops some of them
+        # when it writes the answer ("Кабанові в кошик біля входу" in the customer's own example).
+        left_out = missing_facts(facts, docs, sources, f"{answer} {other}", question)
+        if left_out:
+            reminders.append(FACTS_REMINDER.format(facts="; ".join(f'"{fact}"' for fact in left_out)))
+        return reminders, faults
+
+    def _missing_parts(self, mittens: list[str], docs: list[Document], sources: list[Document], answer: str,
+                       question: str) -> list[Document]:
+        """For a mitten in several forest parts, with one part's advice in the answer: the best document of
+        each of its other parts that was given to the model but left out of the answer. A part counts only
+        when its advice is in the answer itself, not just in the paragraph of advice that gives way."""
         if len(mittens) != 1:
             return []
-        cited = {doc.scope.value for doc in sources if doc.scope.kind == "part"}
-        if not cited:
+        said = fact_terms(answer) - fact_terms(question)
+        answered = {doc.scope.value for doc in sources
+                    if doc.scope.kind == "part" and len(fact_terms(doc.text) & said) >= 2}
+        if not answered:
             return []  # the answer needs no forest part's advice at all, e.g. the mitten's own dues
         missing = []
-        for part in sorted(self.forest.mitten_parts.get(mittens[0], frozenset()) - cited):
-            doc = next((doc for doc in docs if doc.scope == Scope("part", part)), None)
+        for part in sorted(self.forest.mitten_parts.get(mittens[0], frozenset()) - answered):
+            doc = next((doc for doc in sources if doc.scope == Scope("part", part)), None) or \
+                next((doc for doc in docs if doc.scope == Scope("part", part)), None)
             if doc:
                 missing.append(doc)
         return missing

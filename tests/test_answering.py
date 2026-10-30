@@ -375,7 +375,8 @@ async def test_second_try_that_loses_the_answer_keeps_the_first(store, forest):
 
 async def test_stub_or_repeated_other_is_left_out_and_document_numbers_go(store, forest):
     add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць.")
-    for stub in ("Немає.", "-", "null", "Немає іншої поради.", "4 жолуді на місяць.", ["", ""]):
+    for stub in ("Немає.", "-", "null", "Немає іншої поради.", "4 жолуді на місяць.", ["", ""],
+                 'Загальна пам\'ятка про інше, тому її не включаємо в "other".'):
         llm = FakeLLM({"found": True, "answer": "4 жолуді на місяць.", "other": stub, "sources": [1]})
         reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
         assert reply.text.split("\n\n")[1].startswith("Джерело:"), stub
@@ -383,6 +384,49 @@ async def test_stub_or_repeated_other_is_left_out_and_document_numbers_go(store,
                    "sources": [1]})
     reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
     assert reply.text.startswith("Як сказано, 4 жолуді на місяць з 2026 [2026].")
+
+
+async def test_everything_to_put_right_goes_in_one_second_try(store, forest):
+    # A guide section put before the part's advice, and a point left out: one request more, not two.
+    add_archive(store, forest, "Жолуді листяного лісу", "Порада для листяного лісу. Жолуді збирайте в жовтні, "
+                                                       "після першого морозу.")
+    add_animal(store, "Путівник лісом", "Путівник для всіх звірів.\n\nПід дубом. Жолуді збирайте у вересні.",
+               Scope("forest"), name="Сорока")
+    facts = ["[1, частина лісу] Жолуді збирайте в жовтні, після першого морозу."]
+    llm = FakeLLM({"facts": facts, "found": True, "answer": "У вересні.", "sources": [2, 1]},
+                  {"facts": facts, "found": True, "answer": "У жовтні, після першого морозу.", "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("коли збирати жолуді під дубом?", NOW)
+    second = llm.prompts[1][1]
+    assert len(llm.prompts) == 2 and "конкретніший за документ [2]" in second and "Жолуді збирайте в жовтні" in second
+    assert reply.text.startswith("У жовтні, після першого морозу.")
+
+
+async def test_second_try_that_came_out_worse_is_not_taken(store, forest):
+    # Asked to add the nuts, a weaker fallback model dropped the basket and the 10th as well.
+    add_archive(store, forest, "Членські внески рукавички Під дубом",
+                "Внесок 4 жолуді з дорослого звіра на місяць, до 10 числа. Віддавати Кабанові в кошик біля входу. "
+                "Замість 4 жолудів можна віддати 2 лісові горіхи.")
+    first = {"facts": DUES_FACTS, "found": True, "sources": [1],
+             "answer": "Внесок 4 жолуді з дорослого звіра на місяць, до 10 числа, Кабанові в кошик біля входу."}
+    worse = {"facts": DUES_FACTS, "found": True, "sources": [1], "answer": "Можна віддати 2 лісові горіхи."}
+    llm = FakeLLM(first, worse)
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert len(llm.prompts) == 2 and reply.text.startswith(first["answer"])
+
+
+async def test_willow_answer_with_the_river_only_in_the_other_paragraph_is_asked_again(store, forest):
+    # Both parts' advice fits "Під вербою"; the river's must not be shown as advice that gives way.
+    add_archive(store, forest, "Як утеплити рукавичку в листяному лісі", "Порада для листяного лісу. Утеплюйте "
+                                                                         "сухим дубовим листям.")
+    add_archive(store, forest, "Як утеплити рукавичку біля річки", "Ця порада для тих, хто живе біля річки. "
+                                                                   "Утеплюйте очеретом, мох біля води гниє.")
+    llm = FakeLLM({"found": True, "answer": "Утеплюйте сухим дубовим листям.", "sources": [1, 2],
+                   "other": "Порада для річки радить очерет, але тут діє листяний ліс."},
+                  {"found": True, "answer": "Листяний ліс: сухим дубовим листям; біля річки: очеретом, мох гниє.",
+                   "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Чим утеплити рукавичку під вербою?", NOW)
+    assert len(llm.prompts) == 2 and 'немає поради для частини "' in llm.prompts[1][1]
+    assert "очеретом" in reply.text.split("\n\n")[0]
 
 
 async def test_facts_of_documents_the_answer_does_not_cite_are_not_required(store, forest):
