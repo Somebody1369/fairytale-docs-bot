@@ -1,6 +1,6 @@
 import pytest
 
-from bot.places import CONIFER, DECIDUOUS, RIVER, FOREST_SCOPE, Forest, Scope, resident_mittens, residents_from_statute
+from bot.places import CONIFER, DECIDUOUS, RIVER, FOREST_SCOPE, Forest, Scope, resident_homes, residents_from_statute
 
 from .conftest import FOREST_MAP_TEXT
 
@@ -112,7 +112,7 @@ HOMES = {
     ("що робить Жолудівка-сойка?", "Під дубом"),
 ])
 def test_resident_named_in_question(question, home):
-    assert resident_mittens(question, HOMES) == {home}
+    assert set(resident_homes(question, HOMES).values()) == {home}
 
 
 @pytest.mark.parametrize("question", [
@@ -121,4 +121,15 @@ def test_resident_named_in_question(question, home):
     "коли толока?", "що таке совість?",
 ])
 def test_words_that_only_look_like_names(question):
-    assert resident_mittens(question, HOMES) == set()
+    assert resident_homes(question, HOMES) == {}
+
+
+@pytest.mark.parametrize("question, expected", [
+    ("Де шукати лисички?", {}),  # chanterelles
+    ("де живуть сови?", {}),  # any owls
+    ("Де нора Лисички?", {"Лисичка": "Біля бобрової греблі"}),
+    ("що їсть лисичка?", {"Лисичка": "Біля бобрової греблі"}),
+])
+def test_plural_of_a_common_word_is_not_the_resident(question, expected):
+    homes = {"Лисичка": "Біля бобрової греблі", "Сова": "Під дубом"}
+    assert resident_homes(question, homes) == expected

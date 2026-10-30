@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS members (
     tg_id INTEGER PRIMARY KEY,
     joined_at TEXT NOT NULL,
-    invited_by INTEGER             -- who shared the invite; NULL for the first animals
+    invited_by INTEGER,            -- who shared the invite; NULL for the first animals
+    tg_name TEXT                   -- Telegram name at joining, so /invited shows who it is before they name themselves
 );
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -103,6 +104,8 @@ class Store:
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(members)")}
         if "invited_by" not in columns:
             self.db.execute("ALTER TABLE members ADD COLUMN invited_by INTEGER")
+        if "tg_name" not in columns:
+            self.db.execute("ALTER TABLE members ADD COLUMN tg_name TEXT")
         self.revision = 0  # bumped on every change so the search index knows to rebuild
 
     # Users
@@ -118,6 +121,10 @@ class Store:
             (tg_id, name, now.isoformat()),
         )
         self.db.commit()
+
+    def rename_author(self, tg_id: int, name: str) -> None:
+        self.db.execute("UPDATE documents SET author_name = ? WHERE source = 'animal' AND author_id = ?", (name, tg_id))
+        self._changed()
 
     def meta(self, key: str) -> str | None:
         row = self.db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
@@ -140,6 +147,10 @@ class Store:
         self.db.commit()
         return token
 
+    def has_archive(self) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM documents WHERE source = 'archive' AND status = 'active' LIMIT 1").fetchone() is not None
+
     def has_members(self) -> bool:
         return self.db.execute("SELECT 1 FROM members LIMIT 1").fetchone() is not None
 
@@ -155,12 +166,13 @@ class Store:
 
     def invited_by_chain(self, inviter_id: int) -> list[tuple[int, str | None, datetime, int]]:
         """Everyone this member brought in, directly or through the animals they invited:
-        (id, name if they ever sent a document, when they joined, who invited them)."""
+        (id, the name they gave the bot or else their Telegram name, when they joined, who invited them)."""
         found, queue = [], [inviter_id]
         while queue:
             current = queue.pop(0)
             rows = self.db.execute(
-                "SELECT m.tg_id, u.name, m.joined_at, m.invited_by FROM members m LEFT JOIN users u ON u.tg_id = m.tg_id "
+                "SELECT m.tg_id, COALESCE(u.name, m.tg_name), m.joined_at, m.invited_by "
+                "FROM members m LEFT JOIN users u ON u.tg_id = m.tg_id "
                 "WHERE m.invited_by = ? ORDER BY m.joined_at",
                 (current,),
             ).fetchall()
@@ -192,7 +204,7 @@ class Store:
         self._changed()
         return removed
 
-    def use_invite(self, token: str, tg_id: int, now: datetime) -> bool:
+    def use_invite(self, token: str, tg_id: int, now: datetime, tg_name: str | None = None) -> bool:
         """Let the animal in if the invite exists, is unused and not older than INVITE_DAYS."""
         row = self.db.execute("SELECT * FROM invites WHERE token = ?", (token,)).fetchone()
         if not row or row["used_by"] is not None:
@@ -203,8 +215,8 @@ class Store:
         if creator is not None and (creator == tg_id or not self.is_member(creator)):
             return False  # one's own spare link, or a link from someone whose access was closed
         self.db.execute("UPDATE invites SET used_by = ?, used_at = ? WHERE token = ?", (tg_id, now.isoformat(), token))
-        self.db.execute("INSERT OR IGNORE INTO members (tg_id, joined_at, invited_by) VALUES (?, ?, ?)",
-                        (tg_id, now.isoformat(), creator))
+        self.db.execute("INSERT OR IGNORE INTO members (tg_id, joined_at, invited_by, tg_name) VALUES (?, ?, ?, ?)",
+                        (tg_id, now.isoformat(), creator, tg_name))
         # A neighbour vouched for this animal again: documents closed with their access count again.
         self.db.execute(
             "UPDATE documents SET status = 'active' WHERE source = 'animal' AND author_id = ? AND status = 'revoked'",
@@ -263,6 +275,12 @@ class Store:
         doc = self.get(doc_id)
         if not doc or doc.source != "animal" or doc.author_id != author_id or doc.status != "active":
             return None
+        # The animal's own document with this title already written for the new place is an older version.
+        self.db.execute(
+            "UPDATE documents SET status = 'superseded' WHERE source = 'animal' AND status = 'active' "
+            "AND author_id = ? AND norm_title = ? AND scope = ? AND id != ?",
+            (author_id, doc.norm_title, scope.encode(), doc_id),
+        )
         self.db.execute("UPDATE documents SET scope = ? WHERE id = ?", (scope.encode(), doc_id))
         self._changed()
         return self.get(doc_id)

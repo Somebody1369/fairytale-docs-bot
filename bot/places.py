@@ -39,10 +39,13 @@ MITTEN_PATTERNS = {
     "У соснах": r"\bсосн\w*|\bсосон\b|\bсосен\b",
 }
 
+# "хвойний ліс", "у хвойному", "хвойного та листяного лісу", but not "хвойні гілки" or "листяна підстилка";
+# "біля річки", "річкою", but not "порічки".
+AS_PLACE = r"\b{0}\w*\s+(?:\w+\s+){{0,2}}(?:ліс|частин)|\b(?:у|в|на|серед|для)\s+{0}"
 PART_PATTERNS = {
-    CONIFER: r"хвойн|\bялин(?:ами|ах|ам)\b",
-    DECIDUOUS: r"листян|\bдуб(?:и|ів|ами|ах|ам)\b",
-    RIVER: r"річк|річц|прибереж|\b(?:біля|коло|поблизу)\s+вод(?:и|і)\b",
+    CONIFER: AS_PLACE.format("хвойн") + r"|\bялин(?:ами|ах|ам)\b",
+    DECIDUOUS: AS_PLACE.format("листян") + r"|\bдуб(?:и|ів|ами|ах|ам)\b",
+    RIVER: r"\b(?:при)?річк|\bрічц|прибереж|\b(?:біля|коло|поблизу)\s+вод(?:и|і)\b",
 }
 
 WHOLE_FOREST_PATTERN = r"(?:всіх|усіх)\s+мешканців\s+лісу|для\s+(?:всього|усього)\s+лісу|незалежно\s+від\s+того,\s+де"
@@ -90,6 +93,10 @@ class Forest:
     @property
     def mittens(self) -> list[str]:
         return list(self.mitten_parts)
+
+    def mittens_in(self, parts: list[str]) -> list[str]:
+        """The mittens of these forest parts: "Під вербою" is in both the deciduous forest and by the river."""
+        return [m for m in self.mittens if self.mitten_parts[m] & set(parts)]
 
     def applies(self, scope: Scope, mitten: str | None = None, part: str | None = None) -> bool:
         """Whether advice written for `scope` is valid for the asked place."""
@@ -214,7 +221,27 @@ def name_pattern(name: str) -> str:
     return rf"\b{low}(?:а|у|ові|ом|е|у)?\b"  # Кабан, Зайчик, Їжак, Борсук
 
 
-def resident_mittens(question: str, residents: dict[str, str]) -> set[str]:
-    """Mittens of the residents named in the question."""
-    low = normalize(question)
-    return {mitten for name, mitten in residents.items() if re.search(name_pattern(name), low)}
+def plural_forms(name: str) -> set[str]:
+    """Forms of a name that are also the plural of a common word: "лисички" are chanterelles,
+    "сови" any owls, "синиці" any tits. They name the resident only with a capital letter ("у Лисички")."""
+    forms = set()
+    for part in name.lower().split("-"):
+        if part.endswith("а"):
+            forms.add(part[:-1] + "и")
+        elif part.endswith("я"):
+            forms.add(part[:-1] + "і")
+    return forms
+
+
+def resident_homes(question: str, residents: dict[str, str]) -> dict[str, str]:
+    """The residents named in the question and their mittens: {"Сова": "Під дубом"}."""
+    text = question.replace("’", "'").replace("ʼ", "'")
+    homes = {}
+    for name, mitten in residents.items():
+        plural = plural_forms(name)
+        for match in re.finditer(name_pattern(name), text, re.IGNORECASE):
+            word = match.group(0)
+            if word.lower() not in plural or word[0].isupper():
+                homes[name] = mitten
+                break
+    return homes
