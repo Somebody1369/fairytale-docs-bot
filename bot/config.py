@@ -2,7 +2,8 @@ import os
 from dataclasses import dataclass, field
 
 DEFAULT_DRIVE_FOLDER_ID = "1b_hEjnkQfP8ZVP-OEbnYWqoGSFwXMAP3"
-DEFAULT_GROQ_MODELS = "openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b"
+# Answers go down the list; qwen comes last, as the free tier lets it write only 1000 tokens a minute.
+DEFAULT_GROQ_MODELS = "openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b"
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,7 @@ class Settings:
     timezone: str = "Europe/Kyiv"
     max_file_mb: int = 20
     ocr_langs: str = "ukr"
-    invites_only: bool = True  # only animals invited by a neighbour may use the bot
+    invites_only: bool = False  # True: only animals invited by a neighbour may use the bot
     set_profile: bool = True  # the bot sets its own name, description and avatar
 
 
@@ -43,6 +44,6 @@ def load_settings() -> Settings:
         timezone=env("TZ_NAME", "Europe/Kyiv"),
         max_file_mb=int(env("MAX_FILE_MB", "20")),
         ocr_langs=env("OCR_LANGS", "ukr"),
-        invites_only=env("INVITES_ONLY", "true").lower() not in ("0", "false", "no", "ні"),
+        invites_only=env("INVITES_ONLY", "false").lower() in ("1", "true", "yes", "так"),
         set_profile=env("SET_BOT_PROFILE", "true").lower() not in ("0", "false", "no", "ні"),
     )

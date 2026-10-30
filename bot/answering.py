@@ -2,6 +2,7 @@
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -25,6 +26,10 @@ PROMPT_DOC_CHARS = 12000
 LEVEL_LIMIT = {"mitten": 3, "part": 2, "forest": 2}
 LEVEL_CUTOFF = {"mitten": 0.0, "part": 0.3, "forest": 0.3}
 PICK_LIMIT = 4
+# Seconds an animal waits for an answer at most, rate-limit pauses and slower fallback models included;
+# picking documents by title is a help, not a must, so it gets a short part of them.
+QUESTION_SECONDS = 45
+PICK_SECONDS = 10
 LOCATIVE = {"під", "біля", "коло", "поблизу", "у", "в", "на", "серед", "над", "за", "між"}  # a place at a line's start
 LEVEL_NAMES = {"mitten": "рукавичка", "part": "частина лісу", "forest": "увесь ліс"}
 PICK_ANIMAL_TITLES = 150  # newest animals' documents shown to the model when it picks by title
@@ -177,6 +182,7 @@ class Answerer:
         return self._residents
 
     async def ask(self, question: str, now: datetime, mitten: str | None = None) -> Reply:
+        deadline = time.monotonic() + QUESTION_SECONDS
         mittens = [mitten] if mitten else self.forest.detect_mittens(question)
         parts = [] if mittens else self.forest.detect_parts(question)
         resident = None
@@ -188,13 +194,13 @@ class Answerer:
 
         if mittens:
             allowed = lambda doc: any(self.forest.applies(doc.scope, mitten=m) for m in mittens)
-            docs = await self._docs_for_place(question, allowed)
+            docs = await self._docs_for_place(question, allowed, deadline)
         elif parts:
             allowed = lambda doc: any(self.forest.applies(doc.scope, part=p) for p in parts)
-            docs = await self._docs_for_parts(question, parts, allowed)
+            docs = await self._docs_for_parts(question, parts, allowed, deadline)
         else:
             allowed = None
-            docs = await self._docs_without_place(question)
+            docs = await self._docs_without_place(question, deadline)
         if not docs:
             return Reply("not_found", texts.NOT_FOUND)
         place_rule = ""
@@ -203,14 +209,14 @@ class Answerer:
         elif parts and not all(allowed(doc) for doc in docs):
             place_rule = PART_RULE.format(part=self._place_note([], parts),
                                           mittens=", ".join(self.forest.mittens_in(parts)))
-        reply = await self._answer(question, docs, mittens, parts, now, place_rule, resident, allowed)
+        reply = await self._answer(question, docs, mittens, parts, now, place_rule, resident, allowed, deadline)
         if reply.kind == "need_place" and parts:
             # "Скільки внесок біля річки?": the dues differ by mitten, so offer the mittens of that part.
             return Reply("need_place", texts.ASK_MITTEN_IN_PART.format(part=self._place_note([], parts)),
                          self.forest.mittens_in(parts))
         return reply
 
-    async def _docs_for_place(self, question: str, allowed, first=None) -> list[Document]:
+    async def _docs_for_place(self, question: str, allowed, deadline: float, first=None) -> list[Document]:
         """Keyword matches level by level, plus what the model picks by title: "що їсти" finds
         "Чим поживитись поруч із рукавичкою" that shares no word with the question.
         `first(doc)`: these keyword matches go before the others when the prompt is full, and the others
@@ -219,31 +225,31 @@ class Answerer:
         if first and hits:
             hits = [hit for hit in hits if first(hit.doc) or hit.score >= RELATIVE_CUTOFF * hits[0].score]
         candidates = [doc for doc in self.index.documents if allowed(doc)]
-        picked = await self._pick_by_title(question, candidates)
+        picked = await self._pick_by_title(question, candidates, deadline)
         found = best_per_level(hits)
         if first:
             found = sorted(found, key=lambda doc: not first(doc))
         return merge(picked, found, limit=MAX_DOCS)
 
-    async def _docs_for_parts(self, question: str, parts: list[str], allowed) -> list[Document]:
+    async def _docs_for_parts(self, question: str, parts: list[str], allowed, deadline: float) -> list[Document]:
         """A forest part named: its own and the whole forest's advice, and also the advice of its mittens.
         Dues or duties are written per mitten, so "скільки внесок біля річки?" finds them and the bot asks
         which mitten, instead of saying there is no such advice."""
         mittens = set(self.forest.mittens_in(parts))
         in_parts = lambda doc: allowed(doc) or (doc.scope.kind == "mitten" and doc.scope.value in mittens)
-        return await self._docs_for_place(question, in_parts, first=allowed)
+        return await self._docs_for_place(question, in_parts, deadline, first=allowed)
 
-    async def _docs_without_place(self, question: str) -> list[Document]:
+    async def _docs_without_place(self, question: str, deadline: float) -> list[Document]:
         """No place named: the best whole-forest advice plus the best advice for particular places.
         The model then decides whether the answer differs by mitten ("утеплювати": October in the
         conifer forest, November by the calendar) or is the same for everyone ("сорока кричить тричі")."""
         hits = self.index.search(question, limit=12)
         forest_docs = [hit.doc for hit in hits if hit.doc.scope.kind == "forest"][:3]
         place_docs = [hit.doc for hit in hits if hit.doc.scope.kind != "forest"][:4]
-        picked = await self._pick_by_title(question, self.index.documents)
+        picked = await self._pick_by_title(question, self.index.documents, deadline)
         return merge(picked, forest_docs + place_docs, limit=MAX_DOCS + 1)
 
-    async def _pick_by_title(self, question: str, candidates: list[Document]) -> list[Document]:
+    async def _pick_by_title(self, question: str, candidates: list[Document], deadline: float) -> list[Document]:
         """A light model chooses documents by their titles; keyword search alone misses synonyms."""
         archive = [doc for doc in candidates if doc.from_archive]
         animals = sorted((doc for doc in candidates if not doc.from_archive), key=lambda d: d.created_at, reverse=True)
@@ -253,7 +259,8 @@ class Answerer:
         listing = "\n".join(f"{i}. {self._title_line(doc)}" for i, doc in enumerate(candidates, 1))
         try:
             result = await self.llm.json(PICK_SYSTEM, f"Питання: {question}\n\nДокументи:\n{listing}",
-                                         max_tokens=700, fast=True)
+                                         max_tokens=700, fast=True,
+                                         deadline=min(deadline, time.monotonic() + PICK_SECONDS))
         except LLMUnavailable:
             return []
         ids = []
@@ -271,7 +278,7 @@ class Answerer:
 
     async def _answer(
         self, question: str, docs: list[Document], mittens: list[str], parts: list[str], now: datetime,
-        place_rule: str = "", resident: str | None = None, allowed=None,
+        place_rule: str = "", resident: str | None = None, allowed=None, deadline: float | None = None,
     ) -> Reply:
         """`allowed(doc)`: advice for the asked place. With a forest part asked, its mittens' advice
         also comes, but only as exceptions, after the part's own advice."""
@@ -293,10 +300,14 @@ class Answerer:
         )
         system = ANSWER_SYSTEM + place_rule
         asked_sources = asked_level = False
+        earlier = None  # an answer with sources, kept while the model is asked to put the levels right
         while True:
             try:
-                result = await self.llm.json(system, prompt, max_tokens=budget, reasoning=reasoning)
+                result = await self.llm.json(system, prompt, max_tokens=budget, reasoning=reasoning, deadline=deadline)
             except LLMUnavailable:
+                if earlier:  # no time or no model left for the second try: the first answer still holds
+                    answer, sources = earlier
+                    break
                 return Reply("unavailable", texts.LLM_UNAVAILABLE)
             if place_rule and result.get("needs_place"):
                 return Reply("need_place")
@@ -317,7 +328,7 @@ class Answerer:
             better = next((doc for doc in sources[1:] if doc.scope.level > sources[0].scope.level and own(doc)), None)
             # With no place asked, PLACE_UNKNOWN_RULE alone decides between the whole forest and asking.
             if better and allowed and not asked_level:
-                asked_level = True
+                asked_level, earlier = True, (answer, sources)
                 prompt += LEVEL_REMINDER.format(
                     better=docs.index(better) + 1, better_level=LEVEL_NAMES[better.scope.kind],
                     weaker=docs.index(sources[0]) + 1, weaker_level=LEVEL_NAMES[sources[0].scope.kind],
@@ -326,7 +337,7 @@ class Answerer:
             # The reverse with a forest part asked: one mitten's advice first, though the part's own was cited.
             own_cited = next((doc for doc in sources if own(doc)), None)
             if own_cited and not own(sources[0]) and not asked_level:
-                asked_level = True
+                asked_level, earlier = True, (answer, sources)
                 prompt += PART_REMINDER.format(better=docs.index(own_cited) + 1, weaker=docs.index(sources[0]) + 1,
                                                better_level=LEVEL_NAMES[own_cited.scope.kind])
                 continue

@@ -33,24 +33,29 @@ FOREST_MAP_TEXT = """Карта лісу
 
 
 class FakeLLM:
-    """Records prompts and returns prepared JSON answers in order. Picking documents by title
-    has its own queue of answers (`picks`), by default "none of them"."""
+    """Records prompts and returns prepared JSON answers in order; an exception among them is raised.
+    Picking documents by title has its own queue of answers (`picks`), by default "none of them"."""
 
-    def __init__(self, *answers: dict, picks: list[dict] | None = None):
+    def __init__(self, *answers: dict | Exception, picks: list[dict] | None = None):
         self.answers = list(answers)
         self.picks = list(picks or [])
         self.prompts: list[tuple[str, str]] = []
         self.pick_prompts: list[str] = []
         self.reasoning: list[str] = []
+        self.deadlines: list[float | None] = []
 
     async def json(self, system: str, user: str, max_tokens: int = 700, reasoning: str = "low",
-                   fast: bool = False) -> dict:
+                   fast: bool = False, deadline: float | None = None) -> dict:
+        self.deadlines.append(deadline)
         if system == PICK_SYSTEM:
             self.pick_prompts.append(user)
             return self.picks.pop(0) if self.picks else {"ids": []}
         self.prompts.append((system, user))
         self.reasoning.append(reasoning)
-        return self.answers.pop(0) if self.answers else {}
+        answer = self.answers.pop(0) if self.answers else {}
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
 
 
 @pytest.fixture

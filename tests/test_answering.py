@@ -1,4 +1,5 @@
 import io
+import time
 from datetime import timedelta
 from zoneinfo import ZoneInfo
 
@@ -6,8 +7,9 @@ import docx
 import pytest
 
 from bot import texts
-from bot.answering import DOC_CHARS, PROMPT_DOC_CHARS, Answerer
+from bot.answering import DOC_CHARS, PICK_SECONDS, PROMPT_DOC_CHARS, QUESTION_SECONDS, Answerer
 from bot.extract import extract_text
+from bot.llm import LLMUnavailable
 from bot.places import CONIFER, Scope
 
 from .conftest import NOW, FakeLLM, add_animal, add_archive
@@ -234,6 +236,20 @@ async def test_guide_section_weighs_as_the_whole_guide(store, forest):
     assert "Рівень: частина лісу" in first and "Рівень: увесь ліс" in first
     assert 'документ [1] (рівень "частина лісу") конкретніший за документ [2] (рівень "увесь ліс")' in second
     assert reply.text.startswith("У жовтні.") and reply.text.index("Жолуді листяного") < reply.text.index("Путівник")
+
+
+async def test_second_try_out_of_time_keeps_the_first_answer(store, forest):
+    # Asked again to put the levels right, but no model answers before the question's deadline.
+    add_archive(store, forest, "Жолуді листяного лісу", "Порада для листяного лісу. Жолуді збирайте в жовтні.")
+    add_animal(store, "Путівник лісом", "Путівник для всіх звірів.\n\nПід дубом. Жолуді збирайте у вересні.",
+               Scope("forest"), name="Сорока")
+    llm = FakeLLM({"found": True, "answer": "У жовтні.", "sources": [2, 1]}, LLMUnavailable("no time left"))
+    started = time.monotonic()
+    reply = await Answerer(store, forest, llm, TZ).ask("коли збирати жолуді під дубом?", NOW)
+    assert len(llm.prompts) == 2 and reply.kind == "answer" and reply.text.startswith("У жовтні.")
+    # Every call to the model carries the question's deadline; picking by title gets a shorter one.
+    assert all(started < deadline <= time.monotonic() + QUESTION_SECONDS for deadline in llm.deadlines)
+    assert llm.deadlines[0] <= started + PICK_SECONDS + 1
 
 
 def word_guide(sections: list[tuple[str, str]], intro: str = "") -> str:
