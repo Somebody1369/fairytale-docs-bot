@@ -16,7 +16,7 @@ from bot.answering import Answerer
 from bot.config import Settings
 from bot.fsm import SQLiteStorage
 from bot import texts
-from bot.handlers import App, clean_name, router
+from bot.handlers import App, Flow, clean_name, router
 from bot.places import FOREST_SCOPE
 
 from .conftest import FakeLLM, add_archive
@@ -766,17 +766,21 @@ async def test_document_stranded_by_the_old_code_is_asked_about_after_an_answer(
 
 
 async def test_document_for_two_mittens_is_sent_back_to_be_split(setup):
-    # Mishka: one document is for one place, so the animal is asked to split it, and nothing is saved.
+    # Mishka: one document is for one place, so the animal is asked to split it. It is not saved, but waits:
+    # the animal may still say the one place the whole document is for.
     dispatcher, bot, telegram, llm, store = setup
     store.set_user_name(USER.id, "Їжак", datetime.now(timezone.utc))
     telegram.file_bytes = ("У рукавичці Під дубом внесок 4 жолуді.\n"
                            "А в рукавичці Під вербою внесок 3 горіхи.").encode()
     await dispatcher.feed_update(bot, document_update("Внески.txt", "s1"))
     assert telegram.sent[-1].text == texts.DOC_SPLIT.format(title="Внески", mittens="Під дубом, Під вербою")
-    assert store.documents_of(USER.id) == [] and await flow_state(dispatcher, bot) is None
-    # Sent again with the place in the caption, it is the sender's choice.
-    await dispatcher.feed_update(bot, document_update("Внески.txt", "s2", caption="для листяного лісу"))
+    assert store.documents_of(USER.id) == [] and await flow_state(dispatcher, bot) == Flow.waiting_doc_place.state
+    await dispatcher.feed_update(bot, message(text="для листяного лісу"))
     assert [doc.scope.describe() for doc in store.documents_of(USER.id)] == ["листяний ліс"]
+    # Or /cancel, to send it again as separate documents.
+    await dispatcher.feed_update(bot, document_update("Внески.txt", "s2"))
+    await dispatcher.feed_update(bot, message(text="/cancel"))
+    assert telegram.sent[-1].text == texts.CANCELLED_DOCS.format(titles='"Внески"') and len(store.documents_of(USER.id)) == 1
 
 
 async def test_empty_file_is_not_taken_for_a_scan(setup):

@@ -531,10 +531,12 @@ async def process_queue(message: Message, state: FSMContext, app: App, user_id: 
                                  reply_markup=doc_place_keyboard(app.forest, pending))
             return
         if scope.kind == SPLIT:
-            # Mishka: one document is for one place, so advice for two mittens comes as two documents.
-            await state.update_data(queue=queue[1:])
-            await message.answer(texts.DOC_SPLIT.format(title=pending["title"], mittens=scope.value))
-            continue
+            # Mishka: one document is for one place, so advice for two mittens comes as two documents. The animal
+            # splits it, or says the one place the whole document is for; the bot does not choose.
+            await state.set_state(Flow.waiting_doc_place)
+            await message.answer(texts.DOC_SPLIT.format(title=pending["title"], mittens=scope.value),
+                                 reply_markup=doc_place_keyboard(app.forest, pending))
+            return
         await file_pending(message, state, app, user_id, queue, scope)
 
 

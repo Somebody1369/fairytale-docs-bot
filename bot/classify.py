@@ -4,7 +4,8 @@ import logging
 import re
 
 from .llm import LLM, LLMUnavailable
-from .places import FOREST_SCOPE, PART_NAMES, PART_PATTERNS, RIVER, WHOLE_FOREST_PATTERN, Forest, Scope, normalize
+from .places import (FOREST_SCOPE, MITTEN_PATTERNS, PART_NAMES, PART_PATTERNS, RIVER, WHOLE_FOREST_PATTERN, Forest,
+                     Scope, normalize)
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ WHOLE_FOREST_FOR = (WHOLE_FOREST_PATTERN + r"|(?:для|стосу\w*)\s+(?:(?:�
 # ... and words that only make the whole forest a possible answer: "буди мешканців усього лісу",
 # "Усім звірам!" (a mitten's note may begin so too).
 WHOLE_FOREST_TEXT = WHOLE_FOREST_FOR + r"|(?:мешканц|звір)\w*\s+(?:нашого\s+)?(?:(?:всього|усього)\s+)?лісу\b"
+EVERY_MITTEN = r"(?:кожн\w*|всіх|усіх)\s+рукавич"  # "Осінні справи в кожній рукавичці": for the whole forest
 WHOLE_GREETING = re.compile(r"(?:шановні\s+|дорогі\s+)?(?:всім|усім|всі|усі)\s+(?:мешканц|звір)\w*\s*[!:]")
 # A mitten named as somewhere else, not as the advice's own place: "до (старої) рукавички Під дубом іти 200 кроків",
 # "як і в рукавичці Під дубом", "сусідів з рукавички Під вербою".
@@ -111,9 +113,12 @@ async def classify_document(title: str, text: str, forest: Forest, llm: LLM) -> 
     own_anywhere = [m for m in forest.mittens if _named_as_mitten(m, low, own=True)]
     if addressee:
         return addressee
-    # "У рукавичці Під дубом внесок 4 жолуді, у рукавичці Під вербою 3 горіхи": unless the file name says the
-    # document is for a forest part or the whole forest, it is two documents in one.
-    if len(own_anywhere) >= 2 and not (title_scope and title_scope.kind != "mitten"):
+    # "У рукавичці Під дубом внесок 4 жолуді, у рукавичці Під вербою 3 горіхи": two documents in one, unless
+    # the file name or the opening says it is for a forest part or the whole forest (Mishka, 22:05: a guide's
+    # section about a mitten weighs as the whole guide).
+    whole_doc = bool(re.search(WHOLE_FOREST_FOR, head) or re.search(WHOLE_FOREST_TEXT, head)
+                     or WHOLE_GREETING.match(low) or re.search(EVERY_MITTEN, f"{normalize(title)} {head}"))
+    if len(own_anywhere) >= 2 and not whole_doc and not (title_scope and title_scope.kind != "mitten"):
         return _split(own_anywhere, low)
     if title_scope:
         # "Внески Під дубом" with "У рукавичці У соснах внески 3 шишки": the text names another mitten.
@@ -271,12 +276,21 @@ def _addressee(text: str, forest: Forest) -> Scope | None:
                 continue
             if scope == FOREST_SCOPE:
                 return scope
-            named = forest.detect_mittens(sentence)
+            # A mitten named as somewhere to go ("які ходять по горіхи до ліщини") is not one the advice is for.
+            named = [mitten for mitten in forest.detect_mittens(sentence) if _addressed(mitten, sentence)]
             if not _covers(scope, named, set(forest.detect_parts(sentence)), forest):
                 # "для Під дубом і Під вербою" is two documents in one; "для хвойного та листяного лісу" is asked about
                 return _split(named, sentence) if len(named) >= 2 else ASK
             return scope
     return None
+
+
+def _addressed(mitten: str, sentence: str) -> bool:
+    """The mitten is named in the sentence other than as a destination or a neighbour: "для Під дубом і Під вербою",
+    but not "... які ходять по горіхи до ліщини" or "... що поруч із вербою"."""
+    pattern = MITTEN_PATTERNS.get(mitten) or re.escape(normalize(mitten))
+    return any(not re.search(OTHER_MITTEN + "$", sentence[max(0, found.start() - 40):found.start()])
+               for found in re.finditer(pattern, sentence))
 
 
 def _just_the_place(place: str, scope: Scope) -> bool:
