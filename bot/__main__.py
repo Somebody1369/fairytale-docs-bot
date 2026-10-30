@@ -60,12 +60,15 @@ async def main() -> None:
     try:
         me = await bot.get_me()  # fail fast on a wrong token, before the long first archive load
         log.info("Telegram bot @%s", me.username)
+        invites = [
+            BotCommand(command="invite", description="Запрошення для сусіда"),
+            BotCommand(command="invited", description="Кого я запросив"),
+        ] if settings.invites_only else []
         await bot.set_my_commands([
             BotCommand(command="start", description="Почати"),
             BotCommand(command="help", description="Як працює бот"),
             BotCommand(command="my", description="Мої документи"),
-            BotCommand(command="invite", description="Запрошення для сусіда"),
-            BotCommand(command="invited", description="Кого я запросив"),
+            *invites,
             BotCommand(command="name", description="Змінити ім'я"),
             BotCommand(command="cancel", description="Скасувати поточну дію"),
         ])
@@ -75,7 +78,8 @@ async def main() -> None:
                 if me.first_name != texts.BOT_NAME:
                     await bot.set_my_name(texts.BOT_NAME)
                 await bot.set_my_short_description(texts.BOT_SHORT_DESCRIPTION)
-                await bot.set_my_description(texts.BOT_DESCRIPTION)
+                await bot.set_my_description(texts.BOT_DESCRIPTION_INVITES if settings.invites_only
+                                             else texts.BOT_DESCRIPTION)
             except TelegramAPIError as error:  # Telegram limits how often these can change
                 log.warning("Could not update the bot's name or description: %s", error)
             await set_avatar(bot, store)

@@ -188,6 +188,19 @@ async def test_invite_is_not_needed_when_invites_are_off(setup):
     assert "запрошення не потрібні" in telegram.sent[-1].text
 
 
+async def test_start_and_help_speak_of_invites_only_when_the_bot_is_closed(setup):
+    dispatcher, bot, telegram, _, _ = setup
+    await dispatcher.feed_update(bot, message(text="/start"))
+    await dispatcher.feed_update(bot, message(text="/help"))
+    assert all("/invite" not in sent.text for sent in telegram.sent[-2:])
+
+    dispatcher["app"].settings = Settings(telegram_token="1:x", groq_api_key="x", invites_only=True)
+    store = dispatcher["app"].store
+    await dispatcher.feed_update(bot, message(text=f"/start inv_{store.create_invite(None, datetime.now(timezone.utc))}"))
+    await dispatcher.feed_update(bot, message(text="/help"))
+    assert "/invited" in telegram.sent[-2].text and texts.HELP_INVITES == telegram.sent[-1].text
+
+
 def test_name_is_cleaned():
     assert clean_name("Мене звати Білочка.") == "Білочка"
     assert clean_name("я - Ведмідь") == "Ведмідь"

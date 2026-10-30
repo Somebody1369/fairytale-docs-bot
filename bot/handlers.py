@@ -179,7 +179,7 @@ class InviteGate(BaseMiddleware):
         # The Telegram name helps the inviter recognise the animal in /invited before it names itself.
         tg_name = user.full_name + (f" @{user.username}" if user.username else "")
         if token and app.store.use_invite(token, user.id, now_utc(), tg_name):
-            await event.answer(f"{texts.INVITE_WELCOME}\n\n{texts.START}")
+            await event.answer(f"{texts.INVITE_WELCOME}\n\n{texts.START_INVITES}")
         elif isinstance(event, Message):
             await event.answer(texts.INVITE_BAD if token else need_invite)
         else:
@@ -243,16 +243,16 @@ def scope_from_callback(forest: Forest, kind: str, value: str) -> Scope | None:
 # Commands
 
 @router.message(CommandStart())
-async def start(message: Message, state: FSMContext) -> None:
+async def start(message: Message, state: FSMContext, app: App) -> None:
     dropped = await drop_dialog(message, state)
     if dropped:
         await message.answer(texts.CANCELLED_DOCS.format(titles=dropped))
-    await message.answer(texts.START)
+    await message.answer(texts.START_INVITES if app.settings.invites_only else texts.START)
 
 
 @router.message(Command("help"))
-async def help_command(message: Message) -> None:
-    await message.answer(texts.HELP)
+async def help_command(message: Message, app: App) -> None:
+    await message.answer(texts.HELP_INVITES if app.settings.invites_only else texts.HELP)
 
 
 @router.message(Command("cancel"))
