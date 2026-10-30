@@ -186,3 +186,54 @@ async def test_no_reply_before_the_deadline_is_unavailable(monkeypatch):
     with pytest.raises(LLMUnavailable):
         await llm.json("system", "user", deadline=started + 0.3)
     assert time.monotonic() - started < 1 and used == ["openai/gpt-oss-120b"]
+
+
+def test_qwen_answers_without_thinking():
+    # Its hidden thinking used up all 900 output tokens the free tier allows, and no reply was left.
+    from bot.llm import model_options
+
+    assert model_options("qwen/qwen3.8-27b", "medium") == {"reasoning_effort": "none", "reasoning_format": "hidden"}
+    assert model_options("openai/gpt-oss-120b", "medium") == {"reasoning_effort": "medium"}
+
+
+async def test_with_every_model_busy_the_first_to_free_up_is_waited_for():
+    import time
+
+    llm = LLM("x", ["openai/gpt-oss-120b", "openai/gpt-oss-20b"])
+    used = []
+
+    async def create(model, **options):
+        used.append(model)
+        if model == "openai/gpt-oss-120b" and used.count(model) <= 2:
+            raise rate_limited("Rate limit reached: tokens per minute", **{"retry-after": "0.2"})
+        if model == "openai/gpt-oss-20b":
+            raise rate_limited("Rate limit reached: tokens per minute", **{"retry-after": "30"})
+        return OK
+
+    llm.client = fake_client(create)
+    started = time.monotonic()
+    assert await llm.json("system", "user", deadline=started + 10) == {"a": 1}
+    # 120b: waited out once, limited again; 20b: limited for longer; then the round is over and 120b,
+    # free first, is asked again instead of giving up.
+    assert used == ["openai/gpt-oss-120b", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+    assert time.monotonic() - started < 2 and llm.resting["openai/gpt-oss-20b"] > time.monotonic()
+
+
+async def test_reply_cut_off_by_long_thinking_is_asked_again_with_less_thinking():
+    import groq
+    import httpx
+
+    llm = LLM("x", ["openai/gpt-oss-20b"])
+    efforts = []
+
+    async def create(model, **options):
+        efforts.append(options["reasoning_effort"])
+        if len(efforts) == 1:
+            response = httpx.Response(400, request=httpx.Request("POST", "https://x"))
+            raise groq.BadRequestError("json_validate_failed: max completion tokens reached before generating a valid "
+                                       "document", response=response, body=None)
+        return OK
+
+    llm.client = fake_client(create)
+    assert await llm.json("system", "user", reasoning="medium") == {"a": 1}
+    assert efforts == ["medium", "low"]
