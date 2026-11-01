@@ -9,7 +9,7 @@ import pytest
 
 from bot import texts
 from bot.answering import (DOC_CHARS, PICK_SECONDS, PICK_SYSTEM, PICK_TOKENS, PROMPT_DOC_CHARS, QUESTION_SECONDS,
-                           Answerer, calendar_need, calendar_note, clean_text)
+                           Answerer, by_number, calendar_need, calendar_note, clean_text)
 from bot.extract import extract_text
 from bot.llm import LLM, LLMUnavailable
 from bot.places import CONIFER, Scope
@@ -99,6 +99,44 @@ async def test_forgotten_source_is_asked_again(forest_docs, forest):
                   {"found": True, "answer": "У жовтні.", "sources": ["1"]})
     reply = await Answerer(forest_docs, forest, llm, TZ).ask("коли утеплювати рукавичку у соснах?", NOW)
     assert reply.kind == "answer" and 'Джерело: "Як утеплити рукавичку в хвойному лісі"' in reply.text
+    # The second try says what was missing: the very same request would mostly bring the very same reply.
+    assert 'у "sources" немає номерів документів' in llm.prompts[1][1]
+
+
+async def test_flags_and_numbers_written_as_strings_or_odd_values(forest_docs, forest):
+    # "false" as a string is no, as for "found".
+    llm = FakeLLM({"needs_place": "false", "found": True, "answer": "Для всіх однаково.", "sources": [1]})
+    assert (await Answerer(forest_docs, forest, llm, TZ).ask("скільки внесок?", NOW)).kind == "answer"
+    # A superscript is no number (int() refuses "²"), and JSON true is no document number.
+    llm = FakeLLM({"found": True, "answer": "4 жолуді.", "sources": ["²", True, "[1]"]}, picks=[{"ids": ["²", " 1 "]}])
+    reply = await Answerer(forest_docs, forest, llm, TZ).ask("скільки внесок під дубом?", NOW)
+    assert reply.kind == "answer" and reply.text.endswith('місце: рукавичка "Під дубом")')
+    assert by_number([True, "²", 0, 3, 1.0, None, " 2 ", "[1]", 1], ["a", "b"]) == ["b", "a"]
+
+
+async def test_an_object_instead_of_the_answer_text_is_no_answer(forest_docs, forest):
+    llm = FakeLLM({"found": True, "answer": {"text": "4 жолуді."}, "sources": [1]})
+    reply = await Answerer(forest_docs, forest, llm, TZ).ask("скільки внесок під дубом?", NOW)
+    assert reply.kind == "not_found" and reply.text == texts.NOT_FOUND
+    # Of a list, only its texts are the answer.
+    llm = FakeLLM({"found": True, "answer": ["4 жолуді.", {"note": "x"}], "sources": [1]})
+    reply = await Answerer(forest_docs, forest, llm, TZ).ask("скільки внесок під дубом?", NOW)
+    assert reply.text.startswith("4 жолуді.\n\nДжерело:")
+
+
+async def test_answers_follow_documents_sent_and_deleted_after_the_first_question(store, forest):
+    # The search index is kept between questions: a document sent since must reach the prompt, and one deleted
+    # since must leave it.
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць.")
+    llm = FakeLLM(*({"found": True, "answer": "4 жолуді.", "sources": [1]} for _ in range(3)))
+    answerer = Answerer(store, forest, llm, TZ)
+    await answerer.ask("Скільки внесок під дубом?", NOW)
+    doc, _ = add_animal(store, "Нові внески", "Внесок під дубом тепер 5 жолудів.", Scope("mitten", "Під дубом"))
+    await answerer.ask("Скільки внесок під дубом?", NOW)
+    assert "Нові внески" in llm.prompts[1][1]
+    store.delete_animal_document(doc.id, doc.author_id)
+    await answerer.ask("Скільки внесок під дубом?", NOW)
+    assert "Нові внески" not in llm.prompts[2][1]
 
 
 async def test_animal_source_shows_author_and_time(store, forest):
@@ -559,8 +597,7 @@ async def test_animal_advice_put_before_the_archive_for_the_same_place_is_asked_
     assert len(llm.prompts) == 2 and reply.text.startswith("4 жолуді на місяць.\n\nДокумент пише про 5.")
 
 
-async def test_animal_advice_first_with_an_archive_document_on_another_topic_is_not_asked_again(forest):
-    store = Store(":memory:")
+async def test_animal_advice_first_with_an_archive_document_on_another_topic_is_not_asked_again(store, forest):
     add_archive(store, forest, "Небезпеки поруч із рукавичкою Під дубом", "Яма за 30 кроків на північ.")
     add_animal(store, "Пожежа", "Пожежа: збираємося під дубом.", Scope("mitten", "Під дубом"))
     # The model picking by title brings the mitten's dangers document into the prompt too.
@@ -683,18 +720,19 @@ async def test_advice_that_gives_way_stands_in_its_own_paragraph(store, forest):
     assert 'коротко перекажи її в полі "other"' in system and '"other":' in system
 
 
-def word_guide(sections: list[tuple[str, str]], intro: str = "") -> str:
-    """A guide as Word gives it: paragraphs joined by single line breaks, no blank lines."""
+def word_text(paragraphs: list[str]) -> str:
+    """Text as Word gives it: paragraphs joined by single line breaks, no blank lines."""
     document = docx.Document()
-    if intro:
-        document.add_paragraph(intro)
-    for heading, body in sections:
-        document.add_paragraph(heading)
-        for _ in range(3):
-            document.add_paragraph(body)
+    for paragraph in paragraphs:
+        document.add_paragraph(paragraph)
     buffer = io.BytesIO()
     document.save(buffer)
     return extract_text(buffer.getvalue(), "Путівник.docx")
+
+
+def word_guide(sections: list[tuple[str, str]], intro: str = "") -> str:
+    """A guide of sections, each a heading over three paragraphs."""
+    return word_text(([intro] if intro else []) + [line for heading, body in sections for line in (heading, body, body, body)])
 
 
 FILLER = "Восени дні коротшають, тож запаси робіть заздалегідь і перевіряйте їх щотижня після дощу. "
@@ -744,15 +782,6 @@ async def test_documents_together_fit_one_prompt(store, forest, lengths):
 
 
 LATE = " Це важливо, бо зима довга, а весна приходить пізно."
-
-
-def word_text(paragraphs: list[str]) -> str:
-    document = docx.Document()
-    for paragraph in paragraphs:
-        document.add_paragraph(paragraph)
-    buffer = io.BytesIO()
-    document.save(buffer)
-    return extract_text(buffer.getvalue(), "Путівник.docx")
 
 
 WINTER_GUIDE = [
@@ -954,12 +983,58 @@ async def test_terminal_ask_works_with_empty_settings(monkeypatch, capsys):
     for name in ("TZ_NAME", "OCR_LANGS"):
         monkeypatch.setenv(name, "")
     monkeypatch.setenv("DB_PATH", ":memory:")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1:x")
     monkeypatch.setenv("GROQ_API_KEY", "x")
     monkeypatch.setattr(ask, "sync_archive", no_sync)
     monkeypatch.setattr(ask, "Answerer", Answering)
+    stores = []
+    monkeypatch.setattr(ask, "Store", lambda path: stores.append(Store(path)) or stores[-1])
     await ask.main("скільки внесок під дубом?")
+    stores[0].db.close()
     assert str(used["tz"]) == "Europe/Kyiv" and used["ocr"] == "ukr"
     assert capsys.readouterr().out.strip() == "4 жолуді."
+
+
+async def test_terminal_tools_read_the_settings_as_the_bot_does(monkeypatch):
+    # The bot reads GROQ_MODELS="a, b" as ["a", "b"] and DB_PATH="" as data/bot.db. bot.ask sent Groq the model
+    # " b", and bot.check opened "" as an empty temporary database, so every reference question failed.
+    from bot import ask, check
+    from bot.answering import Reply
+
+    used = []
+
+    class Answering:
+        def __init__(self, store, forest, llm, tz):
+            used.append(llm.models)
+
+        async def ask(self, question, now, mitten=None):
+            return Reply("need_place")
+
+    async def nothing(*args):
+        pass
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1:x")
+    monkeypatch.setenv("GROQ_API_KEY", "x")
+    monkeypatch.setenv("GROQ_MODELS", "openai/gpt-oss-120b, openai/gpt-oss-20b")
+    monkeypatch.setenv("DB_PATH", "")
+    monkeypatch.setattr(ask, "sync_archive", nothing)
+    monkeypatch.setattr(LLM, "check_models", nothing)
+    stores = []
+
+    def open_store(path):
+        used.append(path)
+        stores.append(Store(":memory:"))
+        return stores[-1]
+
+    for module in (ask, check):
+        monkeypatch.setattr(module, "Answerer", Answering)
+        monkeypatch.setattr(module, "Store", open_store)
+    await ask.main("скільки внесок?")
+    await check.main()
+    for store in stores:
+        store.db.close()
+    models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+    assert used == ["data/bot.db", models, "data/bot.db", models]
 
 
 def test_text_without_blank_lines_is_cut_into_chunks():
@@ -1067,11 +1142,19 @@ def test_bare_document_mentions_are_cleaned():
     assert clean_text("Збір біля греблі (з документа «Що робити при пожежі»).", 3) == "Збір біля греблі."
     assert clean_text("Толока була 3 жовтня (у 2026 році).", 3) == "Толока була 3 жовтня (у 2026 році)."
     assert clean_text("Утеплюйте в жовтні (у документі [2]).", 3) == "Утеплюйте в жовтні."
+    # Any one bracket after "(документ…" goes, as before the runs of numbers came in.
+    for cited in ("(у документі [№2])", "(документ [Членські внески])", "(у документі [ 2 ])"):
+        assert clean_text(f"Внесок 4 жолуді {cited}.", 3) == "Внесок 4 жолуді.", cited
     # A parenthesis with a fact in it stays, though it names a document.
     assert clean_text("Внесок 4 жолуді (у документі сказано: до 10 числа).", 3) == \
         "Внесок 4 жолуді (у документі сказано: до 10 числа)."
     assert clean_text("Здайте внесок (документи приймає Сова до 15 числа).", 3) == \
         "Здайте внесок (документи приймає Сова до 15 числа)."
+    # Several numbers go together, with nothing like "(,)", "()" or "жолуді і." left behind.
+    for cited in ("([1], [2])", "([1])", "([1, рукавичка])", "(у документах [1] і [2])", "у документах [1] і [2]",
+                  "[1], [2]", "[1] та [2]"):
+        assert clean_text(f"Внесок 4 жолуді {cited}.", 3) == "Внесок 4 жолуді.", cited
+    assert clean_text("Толока [2026].", 3) == "Толока [2026]."
 
 
 def test_quoted_sentences_answer_the_topic(store, forest):

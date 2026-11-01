@@ -5,6 +5,7 @@ import logging
 import re
 import uuid
 from collections import defaultdict
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -14,7 +15,7 @@ from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.chat_action import ChatActionSender
 
@@ -22,7 +23,7 @@ from . import texts
 from .answering import Answerer, Reply, format_date
 from .classify import SPLIT, WHOLE_FOREST_CAPTION, classify_document, scope_from_caption
 from .config import Settings
-from .extract import (MAX_OCR_PAGES, SUPPORTED_EXTENSIONS, TooManyScannedPages, extension, extract_text,
+from .extract import (MAX_OCR_PAGES, SUPPORTED_EXTENSIONS, TooManyScannedPages, UnreadableScan, extension, extract_text,
                       old_word_supported, title_from_filename)
 from .llm import LLM
 from .places import FOREST_SCOPE, PART_NAMES, Forest, Scope, normalize
@@ -261,6 +262,29 @@ def place_button(forest: Forest, data: str) -> tuple[str | None, Scope | None]:
     return fields[1], scope_from_callback(forest, fields[2], fields[3])
 
 
+async def drop_keyboard(callback: CallbackQuery) -> None:
+    """Take the pressed buttons off. A double tap finds them gone already, and Telegram refuses an edit that
+    changes nothing ("message is not modified"); a message the bot can no longer see comes as an
+    InaccessibleMessage, with nothing to edit. Either way the button still does its work."""
+    if isinstance(callback.message, Message):
+        with suppress(TelegramBadRequest):
+            await callback.message.edit_reply_markup(reply_markup=None)
+
+
+async def show(callback: CallbackQuery, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+    """Put the outcome in place of the pressed message, or below it when the bot can no longer see that one.
+    A double tap of "Ні" edits the text to what it is already, and Telegram refuses ("message is not
+    modified"): the answer is there, so that is no failure. Any other refusal still reaches the error handler."""
+    if not isinstance(callback.message, Message):
+        await callback.message.answer(text, reply_markup=reply_markup)
+        return
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as error:
+        if "message is not modified" not in error.message:
+            raise
+
+
 # Commands
 
 @router.message(CommandStart())
@@ -301,9 +325,10 @@ async def drop_dialog(message: Message, state: FSMContext, app: App) -> str:
 
 
 @router.message(Command("name"))
-async def change_name(message: Message, state: FSMContext) -> None:
-    await state.set_state(Flow.waiting_name)
-    await state.update_data(renaming=True)
+async def change_name(message: Message, state: FSMContext, app: App) -> None:
+    async with app.locks[message.from_user.id]:  # a document being placed now would end the dialog after it
+        await state.set_state(Flow.waiting_name)
+        await state.update_data(renaming=True)
     await message.answer(texts.ASK_NEW_NAME)
 
 
@@ -356,14 +381,14 @@ async def confirm_revoke(callback: CallbackQuery, app: App) -> None:
     await callback.answer()
     names = {tg_id: name for tg_id, name, _, _ in app.store.invited_by_chain(callback.from_user.id)}
     if member_id not in names:
-        await callback.message.edit_text(texts.NOT_YOUR_INVITEE)
+        await show(callback, texts.NOT_YOUR_INVITEE)
         return
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=texts.REVOKE_YES, callback_data=f"revok:{member_id}"),
         InlineKeyboardButton(text=texts.REVOKE_NO, callback_data="revno"),
     ]])
     name = names[member_id] or texts.INVITED_UNNAMED
-    await callback.message.edit_text(texts.CONFIRM_REVOKE.format(name=name), reply_markup=keyboard)
+    await show(callback, texts.CONFIRM_REVOKE.format(name=name), keyboard)
 
 
 @router.callback_query(F.data.startswith("revok:"))
@@ -371,16 +396,16 @@ async def revoke(callback: CallbackQuery, app: App) -> None:
     removed = app.store.revoke_member(int(callback.data.split(":")[1]), callback.from_user.id)
     await callback.answer()
     if not removed:
-        await callback.message.edit_text(texts.NOT_YOUR_INVITEE)
+        await show(callback, texts.NOT_YOUR_INVITEE)
         return
     animals = "1 звіра" if len(removed) == 1 else f"{len(removed)} звірів"
-    await callback.message.edit_text(texts.REVOKED.format(animals=animals))
+    await show(callback, texts.REVOKED.format(animals=animals))
 
 
 @router.callback_query(F.data == "revno")
 async def keep_access(callback: CallbackQuery) -> None:
     await callback.answer()
-    await callback.message.edit_text(texts.REVOKE_KEPT)
+    await show(callback, texts.REVOKE_KEPT)
 
 
 @router.callback_query(F.data.startswith("del:"))
@@ -388,26 +413,26 @@ async def confirm_delete(callback: CallbackQuery, app: App) -> None:
     doc = app.store.get(int(callback.data.split(":")[1]))
     await callback.answer()
     if not doc or doc.author_id != callback.from_user.id or doc.status != "active":
-        await callback.message.edit_text(texts.NOT_YOURS)
+        await show(callback, texts.NOT_YOURS)
         return
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=texts.DELETE_YES, callback_data=f"delok:{doc.id}"),
         InlineKeyboardButton(text=texts.DELETE_NO, callback_data="delno"),
     ]])
-    await callback.message.edit_text(texts.CONFIRM_DELETE.format(title=doc.title), reply_markup=keyboard)
+    await show(callback, texts.CONFIRM_DELETE.format(title=doc.title), keyboard)
 
 
 @router.callback_query(F.data.startswith("delok:"))
 async def delete_document(callback: CallbackQuery, app: App) -> None:
     doc = app.store.delete_animal_document(int(callback.data.split(":")[1]), callback.from_user.id)
     await callback.answer()
-    await callback.message.edit_text(texts.DELETED.format(title=doc.title) if doc else texts.NOT_YOURS)
+    await show(callback, texts.DELETED.format(title=doc.title) if doc else texts.NOT_YOURS)
 
 
 @router.callback_query(F.data == "delno")
 async def keep_document(callback: CallbackQuery) -> None:
     await callback.answer()
-    await callback.message.edit_text(texts.KEPT)
+    await show(callback, texts.KEPT)
 
 
 # Documents (advice)
@@ -444,8 +469,12 @@ async def document(message: Message, state: FSMContext, app: App, bot: Bot) -> N
     except TooManyScannedPages as error:
         await message.answer(texts.DOC_TOO_MANY_SCANS.format(filename=filename, pages=error.pages, limit=MAX_OCR_PAGES))
         return
+    except UnreadableScan as error:
+        log.warning("Cannot read the scan %s: %s", filename, error)
+        await message.answer(texts.DOC_EMPTY.format(filename=filename))
+        return
     except Exception as error:  # broken PDF, wrong encoding, etc.
-        log.warning("Cannot read %s: %s", filename, error)
+        log.warning("Cannot read %s: %s", filename, error, exc_info=True)
         await message.answer(texts.DOC_UNREADABLE.format(filename=filename))
         return
     if not text.strip():
@@ -463,10 +492,11 @@ async def document(message: Message, state: FSMContext, app: App, bot: Bot) -> N
         if data.get("epoch", 0) != epoch:  # /cancel or /start while the file was being read
             await message.answer(texts.CANCELLED_DOCS.format(titles=f'"{pending["title"]}"'))
             return
-        queue = data.get("queue", []) + [pending]
-        await state.update_data(queue=queue)
+        waiting = data.get("queue", [])
+        await state.update_data(queue=waiting + [pending])
         current = await state.get_state()
-        if current in DOCUMENT_STATES:
+        # Waiting for a place with no document left means the reply about the last one failed: this file is next.
+        if current in DOCUMENT_STATES and (waiting or current != Flow.waiting_doc_place.state):
             waits_for_name = current != Flow.waiting_doc_place.state  # a first document or /name
             await message.answer((texts.DOC_AFTER_NAME if waits_for_name else texts.DOC_QUEUED).format(title=pending["title"]))
             return
@@ -515,7 +545,7 @@ def name_keyboard() -> InlineKeyboardMarkup:
 @router.callback_query(F.data.startswith("nm:"))
 async def name_confirmed(callback: CallbackQuery, state: FSMContext, app: App) -> None:
     await callback.answer()
-    await callback.message.edit_reply_markup(reply_markup=None)
+    await drop_keyboard(callback)
     name = (await state.get_data()).get("name")
     if await state.get_state() != Flow.confirming_name.state or not name:
         return
@@ -528,6 +558,8 @@ async def name_confirmed(callback: CallbackQuery, state: FSMContext, app: App) -
 
 async def accept_name(message: Message, state: FSMContext, app: App, user_id: int, name: str) -> None:
     async with app.locks[user_id]:
+        if await state.get_state() != Flow.confirming_name.state:
+            return  # a double tap of "Так": the first tap took the name while this one waited for the lock
         renaming = (await state.get_data()).get("renaming")
         app.store.set_user_name(user_id, name, now_utc())
         await state.update_data(renaming=None)
@@ -616,13 +648,13 @@ async def file_pending(message: Message, state: FSMContext, app: App, user_id: i
 async def doc_place_chosen(callback: CallbackQuery, state: FSMContext, app: App) -> None:
     key, scope = place_button(app.forest, callback.data)  # "dp:<document>:m:3"
     await callback.answer()
-    await callback.message.edit_reply_markup(reply_markup=None)
+    await drop_keyboard(callback)
     async with app.locks[callback.from_user.id]:
         data = await state.get_data()
         queue = data.get("queue", [])
         saved = data.get("saved", {}).get(key)
         if saved:  # a second keyboard for a document already saved: where it is now (after "Змінити місце")
-            doc = app.store.get(saved) if isinstance(saved, int) else None
+            doc = app.store.get(saved)
             await callback.message.answer(texts.DOC_ALREADY_SAVED.format(title=doc.title, scope=doc.scope.describe())
                                           if doc and doc.status == "active" else texts.NOT_YOURS)
             return
@@ -650,6 +682,11 @@ async def doc_place_chosen(callback: CallbackQuery, state: FSMContext, app: App)
 
 @router.message(Flow.waiting_doc_place, F.text, ~F.text.startswith("/"))
 async def doc_place_typed(message: Message, state: FSMContext, app: App, bot: Bot) -> None:
+    if not (await state.get_data()).get("queue"):
+        # No document waits any more (the reply about saving the last one failed): the text is an ordinary message.
+        await state.set_state(None)
+        await question(message, state, app, bot)
+        return
     scope = typed_place(message.text, app.forest)
     if scope is None and looks_like_question(message.text, app.forest):
         # A question while a document waits for its place: answer it, the document keeps waiting.
@@ -680,7 +717,7 @@ async def place_changed(callback: CallbackQuery, app: App) -> None:
     scope = scope_from_callback(app.forest, kind, value)
     await callback.answer()
     doc = app.store.change_scope(int(doc_id), callback.from_user.id, scope) if scope else None
-    await callback.message.edit_reply_markup(reply_markup=None)
+    await drop_keyboard(callback)
     await callback.message.answer(
         texts.PLACE_CHANGED.format(title=doc.title, scope=scope.describe()) if doc else texts.NOT_YOURS)
 
@@ -691,7 +728,7 @@ async def place_changed(callback: CallbackQuery, app: App) -> None:
 async def question_place_chosen(callback: CallbackQuery, state: FSMContext, app: App, bot: Bot) -> None:
     key, scope = place_button(app.forest, callback.data)  # "qp:<question>:m:3"
     await callback.answer()
-    await callback.message.edit_reply_markup(reply_markup=None)
+    await drop_keyboard(callback)
     async with app.locks[callback.from_user.id]:  # a double tap answers once
         data = await state.get_data()
         # Each keyboard answers its own question, also under an older one.
@@ -719,6 +756,10 @@ async def question_place_chosen(callback: CallbackQuery, state: FSMContext, app:
 @router.message(F.text, ~F.text.startswith("/"))
 async def question(message: Message, state: FSMContext, app: App, bot: Bot) -> None:
     text, mitten = message.text.strip(), None
+    reply = small_talk(text)
+    if reply:  # "Дякую" after "Про яку рукавичку?" too: the question keeps waiting, and no Groq request is spent
+        await message.answer(reply)
+        return
     data = await state.get_data()
     pending = data.get("question")
     waiting = await state.get_state() == Flow.waiting_question_place.state
@@ -727,7 +768,8 @@ async def question(message: Message, state: FSMContext, app: App, bot: Bot) -> N
     asked_at = data.get("question_at")
     fresh = pending and asked_at and asked_at > (data.get("last_at") or "") and \
         (now_utc() - datetime.fromisoformat(asked_at)).total_seconds() < FOLLOW_UP_MINUTES * 60
-    place = typed_place(text, app.forest) if pending and (waiting or fresh) else None
+    # "А у соснах?" answers "Про яку рукавичку?" too, since /help teaches the place with a question mark.
+    place = typed_place(text.rstrip(" ?!"), app.forest) if pending and (waiting or fresh) else None
     if waiting or place:
         if place and place.kind != "mitten":
             # "У хвойному лісі": the answer differs by mitten, so offer the mittens of that part.
@@ -745,10 +787,6 @@ async def question(message: Message, state: FSMContext, app: App, bot: Bot) -> N
             # The animal answered "під дубом" instead of pressing a button.
             text, mitten = pending, place.value
     else:
-        reply = small_talk(text)
-        if reply:
-            await message.answer(reply)
-            return
         last_at = data.get("last_at")
         recent = last_at and (now_utc() - datetime.fromisoformat(last_at)).total_seconds() < FOLLOW_UP_MINUTES * 60
         # "А у соснах?": the question still waiting for its mitten first, else the last one answered.
@@ -780,14 +818,14 @@ async def answer_question(message: Message, state: FSMContext, app: App, bot: Bo
     if reply.kind == "unavailable":
         await answer_later(message, state, app, text, mitten, epoch)
     else:
-        await deliver(message, state, app, text, reply, keep_state, epoch=epoch)
+        await deliver(message, state, app, text, reply, epoch, keep_state)
 
 
-async def deliver(message: Message, state: FSMContext, app: App, question: str, reply: Reply,
-                  keep_state: bool = False, lead: str = "", epoch: int | None = None) -> None:
+async def deliver(message: Message, state: FSMContext, app: App, question: str, reply: Reply, epoch: int,
+                  keep_state: bool = False, lead: str = "") -> None:
     """Send the answer, or the mitten buttons when the answer depends on the mitten.
-    `lead`: an answer given later starts with the question it answers (see later_lead).
-    `epoch`: the dialog's epoch when the question came; a /cancel since then drops it."""
+    `epoch`: the dialog's epoch when the question came; a /cancel since then drops it.
+    `lead`: an answer given later starts with the question it answers (see later_lead)."""
     if reply.kind == "need_place":
         # The answer took a few seconds, or minutes when it came later: a document may have come meanwhile
         # and now waits for a name or a place, and typed words go to it. Then the question is asked again
@@ -796,7 +834,7 @@ async def deliver(message: Message, state: FSMContext, app: App, question: str, 
         asking.append(question)
         try:
             async with app.locks[message.chat.id]:
-                if epoch is not None and (await state.get_data()).get("epoch", 0) != epoch:
+                if (await state.get_data()).get("epoch", 0) != epoch:
                     return  # /cancel or /start while a document held the lock: the question is dropped
                 busy = keep_state or await state.get_state() in DOCUMENT_STATES
                 if not busy:
@@ -810,8 +848,8 @@ async def deliver(message: Message, state: FSMContext, app: App, question: str, 
         if busy:
             await message.answer(lead + texts.ASK_PLACE_IN_TEXT)  # the callers then remind about the document
         else:
-            await message.answer(lead + (reply.text or texts.ASK_PLACE), reply_markup=mitten_keyboard(
-                app.forest, question_prefix(await state.get_data()), reply.mittens or None))
+            await message.answer(lead + (reply.text or texts.ASK_PLACE),
+                                 reply_markup=mitten_keyboard(app.forest, f"qp:{key}", reply.mittens or None))
         return
     await state.update_data(last_question=question, last_at=now_utc().isoformat())
     await message.answer(lead + reply.text)
@@ -863,7 +901,7 @@ async def ask_later(message: Message, state: FSMContext, app: App, question: str
             if reply.kind != "unavailable":
                 # Answered: a /cancel from now on no longer says the bot will not answer it.
                 app.later.get(message.chat.id, {}).pop(asyncio.current_task(), None)
-                await deliver(message, state, app, question, reply, lead=lead, epoch=epoch)
+                await deliver(message, state, app, question, reply, epoch, lead=lead)
                 break
         else:
             app.later.get(message.chat.id, {}).pop(asyncio.current_task(), None)

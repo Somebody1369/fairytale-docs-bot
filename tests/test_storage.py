@@ -1,6 +1,10 @@
 from datetime import timedelta
 
+from aiogram.fsm.storage.base import StorageKey
+
+from bot.fsm import SQLiteStorage
 from bot.places import CONIFER, Scope
+from bot.storage import Store
 
 from .conftest import NOW, add_animal, add_archive
 
@@ -47,6 +51,48 @@ def test_archive_file_content_update(store, forest):
                               scope=Scope("forest"), text="Толока в другу суботу жовтня", modified_at=NOW, now=NOW)
     store.recompute_archive_status()
     assert [d.text for d in store.active_documents()] == ["Толока в другу суботу жовтня"]
+
+
+DUES = "Членські внески рукавички Під дубом"
+
+
+def add_dues_version(store, forest, text, marker="m2"):
+    """A new version of the dues file as sync_archive stores it, before recompute_archive_status() runs."""
+    store.add_archive_version(drive_file_id="f", marker=marker, filename=f"{DUES}.txt", title=DUES,
+                              scope=forest.archive_scope(DUES, text), text=text, modified_at=NOW, now=NOW)
+
+
+def test_new_archive_version_waits_for_the_end_of_the_sync(store, forest):
+    add_archive(store, forest, DUES, "Внесок 4 жолуді.", file_id="f")
+    add_dues_version(store, forest, "Внесок 5 жолудів.")
+    # The sync still reads the next files (the scans take about two minutes to read) or a restart cuts it short:
+    # answers keep the old version alone instead of "4 жолуді" and "5 жолудів" both.
+    assert [d.text for d in store.active_documents()] == ["Внесок 4 жолуді."]
+    store.recompute_archive_status()
+    assert [d.text for d in store.active_documents()] == ["Внесок 5 жолудів."]
+
+
+def test_first_load_cut_short_is_not_a_loaded_archive(store, forest):
+    add_dues_version(store, forest, "Внесок 4 жолуді.", marker="m1")
+    # On the next start __main__ answers at once when has_archive() is true; half a folder must not count.
+    assert not store.has_archive()
+    store.recompute_archive_status()
+    assert store.has_archive()
+
+
+def test_search_index_follows_a_sync_made_by_another_process(tmp_path, forest):
+    # `python -m bot.ask` syncs the bot's database from another process. The bot's own next sync then finds every
+    # status right already, and its search index must still be rebuilt.
+    bot_store, terminal = Store(str(tmp_path / "bot.db")), Store(str(tmp_path / "bot.db"))
+    add_archive(bot_store, forest, DUES, "Внесок 4 жолуді.", file_id="f")
+    revision = bot_store.revision
+    add_dues_version(terminal, forest, "Внесок 5 жолудів.")
+    terminal.recompute_archive_status()
+    bot_store.recompute_archive_status()
+    assert bot_store.revision != revision
+    assert [doc.text for doc in bot_store.active_documents()] == ["Внесок 5 жолудів."]
+    bot_store.db.close()
+    terminal.db.close()
 
 
 def test_user_name_is_remembered(store):
@@ -133,3 +179,25 @@ def test_own_spare_link_does_not_bring_one_back(store):
     own = store.create_invite(2, NOW)
     store.db.execute("DELETE FROM members WHERE tg_id = 2")   # as if access were closed without clearing invites
     assert not store.use_invite(own, 2, NOW)
+
+
+async def test_dialog_state_survives_a_new_connection(tmp_path):
+    # A real restart opens the file again; a new Dispatcher on the same connection would also see
+    # writes that were never committed.
+    key = StorageKey(bot_id=1, chat_id=10, user_id=10)
+    data = {"queue": [{"id": "ab12", "title": "Гриби"}], "saved": {"cd34": 7}}
+    store = Store(str(tmp_path / "bot.db"))
+    fsm = SQLiteStorage(store.db)
+    await fsm.set_state(key, "Flow:waiting_doc_place")
+    await fsm.update_data(key, data)
+    store.db.close()
+
+    store = Store(str(tmp_path / "bot.db"))
+    fsm = SQLiteStorage(store.db)
+    assert await fsm.get_state(key) == "Flow:waiting_doc_place"
+    assert await fsm.get_data(key) == data
+    assert await fsm.update_data(key, {"epoch": 1}) == {**data, "epoch": 1}
+    await fsm.set_state(key, None)
+    await fsm.set_data(key, {})
+    assert await fsm.get_state(key) is None and await fsm.get_data(key) == {}
+    store.db.close()

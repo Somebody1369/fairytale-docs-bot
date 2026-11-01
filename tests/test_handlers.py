@@ -1,7 +1,6 @@
 """Whole conversations through aiogram with a fake Telegram server."""
 
 import asyncio
-from collections import defaultdict
 from datetime import datetime, timezone
 from itertools import count
 from zoneinfo import ZoneInfo
@@ -9,11 +8,13 @@ from zoneinfo import ZoneInfo
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import GetFile, GetMe, SendMessage
-from aiogram.types import CallbackQuery, Chat, Document, File, Message, Update, User
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import AnswerCallbackQuery, EditMessageReplyMarkup, EditMessageText, GetFile, GetMe, SendMessage
+from aiogram.types import CallbackQuery, Chat, Document, File, InaccessibleMessage, Message, Update, User
 
-from bot.answering import Answerer
+from bot.answering import Answerer, Reply
 from bot.config import Settings
+from bot.extract import UnreadableScan
 from bot.fsm import SQLiteStorage
 from bot import handlers, texts
 from bot.handlers import App, Flow, clean_name, router
@@ -57,8 +58,18 @@ def message(user: User = USER, **fields) -> Update:
     return Update(update_id=next(ids), message=msg)
 
 
-def callback(data: str) -> Update:
-    msg = Message(message_id=next(ids), date=datetime.now(timezone.utc), chat=CHAT, text="...")
+def callback(data: str, user: User = USER) -> Update:
+    chat = Chat(id=user.id, type="private")
+    msg = Message(message_id=next(ids), date=datetime.now(timezone.utc), chat=chat, text="...")
+    query = CallbackQuery(id=str(next(ids)), from_user=user, chat_instance="c", data=data, message=msg)
+    return Update(update_id=next(ids), callback_query=query)
+
+
+def same_message_callback(message_id: int, data: str, inaccessible: bool = False) -> Update:
+    """A button under one given message: tapped twice, both taps come from it. A message the bot can no
+    longer see (deleted, or too old) comes as an InaccessibleMessage, which has no edit_* methods."""
+    msg = (InaccessibleMessage(chat=CHAT, message_id=message_id) if inaccessible
+           else Message(message_id=message_id, date=datetime.now(timezone.utc), chat=CHAT, text="..."))
     query = CallbackQuery(id=str(next(ids)), from_user=USER, chat_instance="c", data=data, message=msg)
     return Update(update_id=next(ids), callback_query=query)
 
@@ -83,7 +94,7 @@ def setup(store, forest):
     llm = FakeLLM()
     settings = Settings(telegram_token="1:x", groq_api_key="x", invites_only=False)  # dialogs; invites tested below
     app = App(settings=settings, store=store, forest=forest, llm=llm, answerer=Answerer(store, forest, llm, TZ),
-              tz=TZ, locks=defaultdict(asyncio.Lock))
+              tz=TZ)
     telegram = FakeTelegram()
     bot = Bot("123:TEST", session=telegram)
     dispatcher = Dispatcher(storage=SQLiteStorage(store.db), app=app)
@@ -181,6 +192,34 @@ async def test_invites_let_neighbours_in(setup):
     llm.answers.append({"found": True, "answer": "4 жолуді на місяць.", "sources": [1]})
     await dispatcher.feed_update(bot, message(user=neighbour, text="скільки внесок під дубом?"))
     assert telegram.sent[-1].text.startswith("4 жолуді на місяць.")
+
+
+async def test_gate_is_silent_in_groups_and_alerts_under_buttons(setup, monkeypatch):
+    # The bot answers in private chats only, so a group hears nothing. A non-member is asked for an invite,
+    # and a button they press (under an old message of the bot) answers with the same words in an alert.
+    dispatcher, bot, telegram, _, store = setup
+    dispatcher["app"].settings = Settings(telegram_token="1:x", groq_api_key="x", invites_only=True)
+    store.use_invite(store.create_invite(None, datetime.now(timezone.utc)), USER.id, datetime.now(timezone.utc))
+    stranger = User(id=99, is_bot=False, first_name="Stranger")
+    group = Chat(id=-5, type="group")
+    await dispatcher.feed_update(bot, Update(update_id=next(ids), message=Message(
+        message_id=next(ids), date=datetime.now(timezone.utc), chat=group, from_user=stranger, text="привіт")))
+    assert telegram.sent == []
+    await dispatcher.feed_update(bot, message(user=stranger, text="/help"))
+    assert telegram.sent[-1].text == texts.NEED_INVITE
+
+    alerts = []
+    make_request = telegram.make_request
+
+    async def record(bot_, method, timeout=None):
+        if isinstance(method, AnswerCallbackQuery):
+            alerts.append((method.text, method.show_alert))
+        return await make_request(bot_, method, timeout)
+
+    monkeypatch.setattr(telegram, "make_request", record)
+    for data in ("del:1", "qp:abc:m:1", "nm:yes"):
+        await dispatcher.feed_update(bot, callback(data, user=stranger))
+    assert alerts == [(texts.NEED_INVITE, True)] * 3
 
 
 async def test_invite_is_not_needed_when_invites_are_off(setup):
@@ -344,7 +383,6 @@ async def test_question_waits_for_the_first_archive_load(setup):
 
 
 async def test_old_word_without_antiword_asks_for_docx(setup, monkeypatch):
-    from bot import handlers
     dispatcher, bot, telegram, _, _ = setup
     monkeypatch.setattr(handlers, "old_word_supported", lambda: False)
     await dispatcher.feed_update(bot, message(document=Document(
@@ -419,6 +457,39 @@ async def test_typed_whole_forest_and_part_are_places(setup):
     assert "напишіть лише місце" in telegram.sent[-1].text
 
 
+async def test_text_in_a_document_state_with_no_document_is_an_ordinary_message(setup):
+    # The reply about saving the last document failed, so the dialog still waits for a place while no document
+    # waits: "Дякую" is small talk again, not "оберіть місце кнопкою" for a document that is not there.
+    dispatcher, bot, telegram, _, _ = setup
+    await dispatcher.fsm.get_context(bot, chat_id=USER.id, user_id=USER.id).set_state(Flow.waiting_doc_place)
+    await dispatcher.feed_update(bot, message(text="Дякую"))
+    assert telegram.sent[-1].text == texts.THANKS and await flow_state(dispatcher, bot) is None
+
+
+async def test_document_after_a_dialog_left_waiting_for_a_place_is_placed(setup):
+    # The same failed reply, then the next file: it is placed at once, not "збережу його одразу після
+    # попереднього" behind a document that is not there.
+    dispatcher, bot, telegram, _, store = setup
+    store.set_user_name(USER.id, "Їжак", datetime.now(timezone.utc))
+    await dispatcher.fsm.get_context(bot, chat_id=USER.id, user_id=USER.id).set_state(Flow.waiting_doc_place)
+    telegram.file_bytes = "Збирайте гриби після дощу.".encode()  # no place at all, so the model is not asked
+    await dispatcher.feed_update(bot, document_update("Гриби.txt", "w1"))
+    assert "для якого місця ця порада" in telegram.sent[-1].text and telegram.sent[-1].reply_markup
+
+
+async def test_scan_that_cannot_be_read_in_time_asks_for_a_document_with_text(setup, monkeypatch):
+    # As agreed for scans that cannot be read: not "maybe it is damaged, send it again", which would time out again.
+    dispatcher, bot, telegram, _, store = setup
+    store.set_user_name(USER.id, "Їжак", datetime.now(timezone.utc))
+
+    def unreadable(data, filename, langs, ext):
+        raise UnreadableScan("Tesseract process timeout")
+
+    monkeypatch.setattr(handlers, "extract_text", unreadable)
+    await dispatcher.feed_update(bot, document_update("Скан.pdf", "t1"))
+    assert telegram.sent[-1].text == texts.DOC_EMPTY.format(filename="Скан.pdf") and store.documents_of(USER.id) == []
+
+
 async def test_forest_part_as_the_place_offers_its_mittens(setup):
     dispatcher, bot, telegram, llm, _ = setup
     llm.answers.append({"needs_place": True})
@@ -430,6 +501,38 @@ async def test_forest_part_as_the_place_offers_its_mittens(setup):
     llm.answers.append({"found": True, "answer": "3 шишки на місяць.", "sources": [1]})
     await dispatcher.feed_update(bot, message(text="у соснах"))
     assert telegram.sent[-1].text.startswith("3 шишки на місяць.")
+    assert "Питання звіра: скільки внесок?" in llm.prompts[-1][1]
+
+
+async def test_place_with_a_question_mark_answers_the_waiting_question(setup):
+    # /help teaches the short form with a question mark: "А у соснах?" answers "Про яку рукавичку?" too.
+    dispatcher, bot, telegram, llm, _ = setup
+    llm.answers.append({"needs_place": True})
+    await dispatcher.feed_update(bot, message(text="скільки внесок?"))
+    llm.answers.append({"found": True, "answer": "3 шишки на місяць.", "sources": [1]})
+    await dispatcher.feed_update(bot, message(text="А у соснах?"))
+    assert telegram.sent[-1].text.startswith("3 шишки на місяць.")
+    assert "Питання звіра: скільки внесок?" in llm.prompts[-1][1] and 'рукавичка "У соснах"' in llm.prompts[-1][1]
+
+
+async def test_part_with_a_question_mark_offers_its_mittens(setup):
+    dispatcher, bot, telegram, llm, _ = setup
+    llm.answers.append({"needs_place": True})
+    await dispatcher.feed_update(bot, message(text="скільки внесок?"))
+    await dispatcher.feed_update(bot, message(text="у хвойному лісі?"))
+    assert [text for text, _ in buttons(telegram.sent[-1])] == ["Під ялиною", "У соснах", "Біля мурашника"]
+
+
+async def test_thanks_while_a_question_waits_for_its_mitten_is_small_talk(setup):
+    # No Groq request is spent on "Дякую", and the question still waits: a place typed next answers it.
+    dispatcher, bot, telegram, llm, _ = setup
+    llm.answers.append({"needs_place": True})
+    await dispatcher.feed_update(bot, message(text="скільки внесок?"))
+    picks = len(llm.pick_prompts)
+    await dispatcher.feed_update(bot, message(text="Дякую"))
+    assert telegram.sent[-1].text == texts.THANKS and len(llm.pick_prompts) == picks and len(llm.prompts) == 1
+    llm.answers.append({"found": True, "answer": "3 шишки на місяць.", "sources": [1]})
+    await dispatcher.feed_update(bot, message(text="у соснах"))
     assert "Питання звіра: скільки внесок?" in llm.prompts[-1][1]
 
 
@@ -540,7 +643,6 @@ async def test_name_after_a_pending_question_is_a_name(setup):
 
 async def test_question_needing_a_mitten_does_not_push_out_a_document(setup):
     # The answer takes a few seconds; a document comes meanwhile and asks for its place.
-    from bot.answering import Reply
     dispatcher, bot, telegram, llm, store = setup
     release = asyncio.Event()
 
@@ -634,7 +736,6 @@ async def test_buttons_under_an_older_question_answer_that_question(setup):
 
 
 async def test_slow_question_does_not_push_out_a_document_waiting_for_the_name(setup):
-    from bot.answering import Reply
     dispatcher, bot, telegram, llm, store = setup
     started, release = asyncio.Event(), asyncio.Event()
 
@@ -712,7 +813,6 @@ async def test_cancel_while_the_model_places_a_document_drops_it(setup):
 
 
 async def test_file_still_being_read_at_cancel_is_dropped(setup, monkeypatch):
-    from bot import handlers
     dispatcher, bot, telegram, _, store = setup
     store.set_user_name(USER.id, "Їжак", datetime.now(timezone.utc))
     started, release = asyncio.Event(), asyncio.Event()
@@ -771,6 +871,93 @@ async def test_question_buttons_answer_once(setup):
     assert len(telegram.sent) == n
 
 
+async def test_double_tap_on_the_name_saves_the_document_once(setup, monkeypatch):
+    # The second tap of "Так" waits for the lock while another file is being taken, then finds the name accepted
+    # already: the waiting document is asked about once, and no apology comes.
+    dispatcher, bot, telegram, _, _ = setup
+    telegram.file_bytes = "Збирайте гриби після дощу.".encode()
+    await dispatcher.feed_update(bot, document_update("Гриби.txt", "n1"))
+    await dispatcher.feed_update(bot, message(text="Білочка"))
+    assert telegram.sent[-1].text.startswith('Вас звати "Білочка"?')
+    make_request, edited, taking = telegram.make_request, set(), asyncio.Event()
+
+    async def telegram_like(bot_, method, timeout=None):
+        if isinstance(method, (EditMessageReplyMarkup, EditMessageText)):
+            if method.message_id in edited:
+                raise TelegramBadRequest(method=method, message="Bad Request: message is not modified")
+            edited.add(method.message_id)
+        if isinstance(method, SendMessage) and "щойно Ви назветеся" in method.text:
+            taking.set()
+            await asyncio.sleep(0.05)  # one Telegram round trip under the user's lock
+        return await make_request(bot_, method, timeout)
+
+    monkeypatch.setattr(telegram, "make_request", telegram_like)
+    second = asyncio.create_task(dispatcher.feed_update(bot, document_update("Ягоди.txt", "n2")))
+    await taking.wait()
+    pressed = next(ids)
+    await asyncio.gather(dispatcher.feed_update(bot, same_message_callback(pressed, "nm:yes")),
+                         dispatcher.feed_update(bot, same_message_callback(pressed, "nm:yes")), second)
+    sent = [sent.text for sent in telegram.sent]
+    assert sum("для якого місця ця порада" in text for text in sent) == 1 and texts.SOMETHING_WRONG not in sent
+
+
+async def test_double_tap_answers_once_without_an_apology(setup, monkeypatch):
+    # Both taps come from one message, and Telegram refuses to take its keyboard off a second time
+    # ("message is not modified"): the second tap has nothing to do, and no apology comes next to the answer.
+    dispatcher, bot, telegram, llm, _ = setup
+    llm.answers.append({"needs_place": True})
+    await dispatcher.feed_update(bot, message(text="скільки внесок?"))
+    data = dict(buttons(telegram.sent[-1]))["Під дубом"]
+    edited: set[int] = set()
+    make_request = telegram.make_request
+
+    async def telegram_like(bot_, method, timeout=None):
+        if isinstance(method, (EditMessageReplyMarkup, EditMessageText)):
+            await asyncio.sleep(0.01)
+            if method.message_id in edited:
+                raise TelegramBadRequest(method=method, message="Bad Request: message is not modified")
+            edited.add(method.message_id)
+        return await make_request(bot_, method, timeout)
+
+    monkeypatch.setattr(telegram, "make_request", telegram_like)
+    llm.answers.append({"found": True, "answer": "4 жолуді на місяць.", "sources": [1]})
+    pressed = next(ids)
+    await asyncio.gather(dispatcher.feed_update(bot, same_message_callback(pressed, data)),
+                         dispatcher.feed_update(bot, same_message_callback(pressed, data)))
+    sent = [sent.text for sent in telegram.sent]
+    assert len([text for text in sent if text.startswith("4 жолуді")]) == 1 and texts.SOMETHING_WRONG not in sent
+
+
+@pytest.mark.parametrize("refusal, apology", [("message is not modified", False), ("message can't be edited", True)])
+async def test_refused_edit_of_the_pressed_message(setup, monkeypatch, refusal, apology):
+    # A double tap of "Ні" edits the message to the text it shows already, and Telegram refuses: the answer is
+    # there. Any other refusal is still a failure the animal hears about.
+    dispatcher, bot, telegram, _, _ = setup
+    make_request = telegram.make_request
+
+    async def refuse(bot_, method, timeout=None):
+        if isinstance(method, EditMessageText):
+            raise TelegramBadRequest(method=method, message=f"Bad Request: {refusal}")
+        return await make_request(bot_, method, timeout)
+
+    monkeypatch.setattr(telegram, "make_request", refuse)
+    await dispatcher.feed_update(bot, callback("delno"))
+    assert [sent.text for sent in telegram.sent] == ([texts.SOMETHING_WRONG] if apology else [])
+
+
+async def test_buttons_under_an_inaccessible_message_still_work(setup):
+    # A message the bot can no longer see has nothing to edit: the button still does its work, and what
+    # would replace the message comes as a new one.
+    dispatcher, bot, telegram, llm, store = setup
+    await send_unclear_document(dispatcher, bot, telegram, llm, store)
+    data = dict(buttons(telegram.sent[-1]))["Увесь ліс"]
+    await dispatcher.feed_update(bot, same_message_callback(next(ids), data, inaccessible=True))
+    assert "Він стосується: увесь ліс" in telegram.sent[-1].text
+    doc = store.documents_of(USER.id)[0]
+    await dispatcher.feed_update(bot, same_message_callback(next(ids), f"delok:{doc.id}", inaccessible=True))
+    assert telegram.sent[-1].text == texts.DELETED.format(title=doc.title)
+
+
 async def test_document_during_rename_waits_for_the_name(setup):
     dispatcher, bot, telegram, _, store = setup
     store.set_user_name(USER.id, "Білка", datetime.now(timezone.utc))
@@ -778,6 +965,32 @@ async def test_document_during_rename_waits_for_the_name(setup):
     telegram.file_bytes = "Збирайте гриби після дощу.".encode()
     await dispatcher.feed_update(bot, document_update("Гриби.txt", "c4"))
     assert telegram.sent[-1].text == texts.DOC_AFTER_NAME.format(title="Гриби")
+
+
+async def test_name_command_while_the_model_places_a_document_still_asks_the_name(setup):
+    # /name waits till the model has placed the document, so the end of that dialog does not wipe it,
+    # and the name typed next is a name, not a question.
+    dispatcher, bot, telegram, llm, store = setup
+    store.set_user_name(USER.id, "Їжак", datetime.now(timezone.utc))
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_json(system, user, **kwargs):
+        started.set()
+        await release.wait()
+        return {"kind": "forest", "value": ""}
+
+    llm.json = slow_json
+    telegram.file_bytes = "Білі гриби шукайте під дубом після дощу. Ця порада для мешканців усього лісу.".encode()
+    sending = asyncio.create_task(dispatcher.feed_update(bot, document_update("Гриби.txt", "n1")))
+    await started.wait()
+    naming = asyncio.create_task(dispatcher.feed_update(bot, message(text="/name")))
+    await asyncio.sleep(0.01)
+    assert not naming.done()  # it waits for the document's lock
+    release.set()
+    await asyncio.gather(sending, naming)
+    assert telegram.sent[-1].text == texts.ASK_NEW_NAME
+    await dispatcher.feed_update(bot, message(text="Білочка"))
+    assert telegram.sent[-1].text.startswith('Вас звати "Білочка"?')
 
 
 async def test_saved_document_buttons_say_where_it_is_now(setup):
@@ -941,7 +1154,6 @@ async def test_questions_forwarded_together_do_not_pass_the_cap(setup, monkeypat
 
 
 async def test_error_while_answering_later_still_gets_a_polite_reply(setup, no_pauses, caplog):
-    from bot.answering import Reply
     dispatcher, bot, telegram, _, _ = setup
     replies = [Reply("unavailable")]
 
@@ -989,7 +1201,6 @@ async def test_start_drops_the_waiting_document_and_question_together(setup, mon
 async def test_question_cancelled_while_the_model_answers_gets_nothing_after(setup, busy):
     # /cancel answers at once and names the question; the answer that comes after it, or the promise to
     # answer later, is not sent.
-    from bot.answering import Reply
     dispatcher, bot, telegram, _, _ = setup
     started, release = asyncio.Event(), asyncio.Event()
 
@@ -1010,7 +1221,6 @@ async def test_question_cancelled_while_the_model_answers_gets_nothing_after(set
 
 
 async def test_cancel_names_the_question_being_answered_and_the_one_waiting(setup, monkeypatch):
-    from bot.answering import Reply
     dispatcher, bot, telegram, _, _ = setup
     monkeypatch.setattr(handlers, "LATER_PAUSES", (3600,))
     started, release = asyncio.Event(), asyncio.Event()
@@ -1052,7 +1262,6 @@ class WatchedLock(asyncio.Lock):
 async def test_mitten_question_waiting_for_a_document_is_dropped_at_cancel(setup):
     # The model wants the mitten while a document is still being placed and holds the chat's lock; /cancel
     # comes meanwhile and names the question, no mitten buttons follow it and the dialog stays cleared.
-    from bot.answering import Reply
     dispatcher, bot, telegram, llm, store = setup
     store.set_user_name(USER.id, "Їжак", datetime.now(timezone.utc))
     lock = dispatcher["app"].locks[USER.id] = WatchedLock()
@@ -1084,7 +1293,6 @@ async def test_mitten_question_waiting_for_a_document_is_dropped_at_cancel(setup
 
 async def test_question_promised_later_waiting_for_a_document_is_named_at_cancel(setup, monkeypatch):
     # The same, when the mitten is asked in the answer that comes later.
-    from bot.answering import Reply
     dispatcher, bot, telegram, llm, store = setup
     monkeypatch.setattr(handlers, "LATER_PAUSES", (0,))
     store.set_user_name(USER.id, "Їжак", datetime.now(timezone.utc))

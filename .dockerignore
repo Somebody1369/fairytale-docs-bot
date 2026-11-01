@@ -3,6 +3,8 @@ data/
 tests/
 docs/
 .git/
-__pycache__/
+# Patterns are matched from the context root, so __pycache__/ alone would let bot/__pycache__ into the image.
+**/__pycache__/
+**/.DS_Store
 .pytest_cache/
 .venv/

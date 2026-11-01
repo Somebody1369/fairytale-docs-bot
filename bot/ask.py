@@ -6,28 +6,26 @@ Uses the same database as the bot, so the archive and animals' documents are alr
 """
 
 import asyncio
-import os
 import sys
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from .answering import Answerer
 from .archive import DriveArchive, sync_archive
-from .config import DEFAULT_DRIVE_FOLDER_ID, DEFAULT_GROQ_MODELS, env
+from .config import load_settings
 from .llm import LLM
 from .places import Forest
 from .storage import Store
 
 
 async def main(question: str) -> None:
-    # docker-compose passes unset settings as empty strings, so "" means the default too.
-    store = Store(env("DB_PATH", "data/bot.db"))
+    # Read as the bot reads them ("" is the default, "a, b" two models); docker compose demands the
+    # Telegram token that load_settings wants anyway.
+    settings = load_settings()
+    store = Store(settings.db_path)
     forest = Forest()
-    archive = DriveArchive(os.getenv("DRIVE_FOLDER_ID") or DEFAULT_DRIVE_FOLDER_ID, os.getenv("GOOGLE_API_KEY") or None,
-                           env("OCR_LANGS", "ukr"))
-    await sync_archive(store, forest, archive)
-    models = (os.getenv("GROQ_MODELS") or DEFAULT_GROQ_MODELS).split(",")
-    answerer = Answerer(store, forest, LLM(os.environ["GROQ_API_KEY"], models), ZoneInfo(env("TZ_NAME", "Europe/Kyiv")))
+    await sync_archive(store, forest, DriveArchive(settings.drive_folder_id, settings.google_api_key, settings.ocr_langs))
+    answerer = Answerer(store, forest, LLM(settings.groq_api_key, settings.groq_models), ZoneInfo(settings.timezone))
     reply = await answerer.ask(question, datetime.now(timezone.utc))
     print("Потрібно уточнити рукавичку." if reply.kind == "need_place" else reply.text)
 

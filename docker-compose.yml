@@ -1,7 +1,8 @@
 services:
   bot:
     build: .
-    # Settings come from .env if it exists, otherwise from the shell's environment variables.
+    # ${...} below comes from the shell, or from .env next to this file when the shell does not set it;
+    # env_file passes .env to the container as well.
     env_file:
       - path: .env
         required: false
@@ -19,3 +20,5 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    logging:
+      driver: local  # json-file, the default, never rotates; local keeps about 100 MB, compressed

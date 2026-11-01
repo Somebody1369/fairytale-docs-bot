@@ -89,6 +89,26 @@ def test_default_models_answer_with_gpt_oss_first_and_pick_with_the_smallest():
     assert llm.client.max_retries == 0  # waiting is decided by LLM.json alone, not by the SDK as well
 
 
+async def test_configured_models_stay_as_they_are_and_defaults_stand_in_only_for_none_offered():
+    from bot.config import DEFAULT_GROQ_MODELS
+
+    offered = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+
+    async def models_list():
+        return SimpleNamespace(data=[SimpleNamespace(id=model) for model in offered])
+
+    async def checked(models: list[str]) -> list[str]:
+        llm = LLM("x", models)
+        llm.client = SimpleNamespace(models=SimpleNamespace(list=models_list))
+        await llm.check_models()
+        return llm.models
+
+    # The README's advice for the paid tier, where qwen costs several times more: it must not come back.
+    assert await checked(["openai/gpt-oss-120b", "openai/gpt-oss-20b"]) == ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+    assert await checked(["vendor/gone"]) == offered  # no configured model is offered any more
+    assert await checked(DEFAULT_GROQ_MODELS.split(",")) == DEFAULT_GROQ_MODELS.split(",")
+
+
 async def test_qwen_is_asked_for_no_more_output_than_its_minute_allows():
     llm = LLM("x", ["qwen/qwen3.8-27b"])
     used = []
@@ -237,3 +257,24 @@ async def test_reply_cut_off_by_long_thinking_is_asked_again_with_less_thinking(
     llm.client = fake_client(create)
     assert await llm.json("system", "user", reasoning="medium") == {"a": 1}
     assert efforts == ["medium", "low"]
+
+
+async def test_reply_cut_off_on_qwen_is_asked_again_as_plain_text_not_the_same_way():
+    import groq
+    import httpx
+
+    llm = LLM("x", ["qwen/qwen3.8-27b"])
+    sent = []
+
+    async def create(model, **options):
+        sent.append(options)
+        if len(sent) == 1:
+            response = httpx.Response(400, request=httpx.Request("POST", "https://x"))
+            raise groq.BadRequestError("json_validate_failed: max completion tokens reached before generating a valid "
+                                       "document", response=response, body=None)
+        return OK
+
+    llm.client = fake_client(create)
+    # Dates are asked with reasoning="medium", but qwen never thinks: thinking less would send the same request.
+    assert await llm.json("system", "user", reasoning="medium") == {"a": 1}
+    assert "response_format" in sent[0] and "response_format" not in sent[1]

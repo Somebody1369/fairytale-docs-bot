@@ -24,10 +24,10 @@ docker compose up --build
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | так | токен від @BotFather |
 | `GROQ_API_KEY` | так | ключ Groq |
-| `GROQ_MODELS` | ні | моделі в порядку пріоритету, зайняту бот пропускає; документи за назвами обирає найменша. За замовчуванням `openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b` |
+| `GROQ_MODELS` | ні | моделі в порядку пріоритету, зайняту бот пропускає; документи за назвами обирає найменша. Бот бере лише задані моделі, а ті, яких ключ не має, пропускає. За замовчуванням `openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b` |
 | `DRIVE_FOLDER_ID` | ні | тека "Лісовий архів" |
 | `GOOGLE_API_KEY` | ні | ключ Drive API для точного часу зміни файлів; без нього бот читає публічну сторінку теки |
-| `ARCHIVE_SYNC_MINUTES` | ні | як часто перевіряти архів, за замовчуванням 10 |
+| `ARCHIVE_SYNC_MINUTES` | ні | як часто перевіряти архів, у хвилинах (щонайменше 1), за замовчуванням 10 |
 | `TZ_NAME` | ні | часовий пояс, за замовчуванням `Europe/Kyiv` |
 | `INVITES_ONLY` | ні | `true` (за замовчуванням): лише запрошені; `false`: усі |
 | `SET_BOT_PROFILE` | ні | `true` (за замовчуванням): бот ставить собі назву, опис і аватарку; `false`: лишає задане в @BotFather |
@@ -109,8 +109,10 @@ Google Диск ──> archive (кожні 10 хв) ──> storage (версі
 
 ## Тести
 
+Потрібен Python 3.12, як у Docker і CI (3.13 теж підходить).
+
 ```bash
-python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest
 .venv/bin/ruff check .
 ```

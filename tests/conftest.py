@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -64,8 +65,10 @@ def forest() -> Forest:
 
 
 @pytest.fixture
-def store() -> Store:
-    return Store(":memory:")
+def store() -> Iterator[Store]:
+    store = Store(":memory:")
+    yield store
+    store.db.close()  # Python 3.13 warns about a connection that is never closed
 
 
 def add_archive(store: Store, forest: Forest, title: str, text: str, file_id: str | None = None,

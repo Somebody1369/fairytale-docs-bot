@@ -2,14 +2,18 @@
 
 import logging
 import re
+import time
 
 from .llm import LLM, LLMUnavailable
-from .places import (FOREST_SCOPE, MITTEN_PATTERNS, PART_NAMES, PART_PATTERNS, RIVER, WHOLE_FOREST_PATTERN, Forest,
-                     Scope, normalize)
+from .places import (FOREST_SCOPE, PART_NAMES, PART_PATTERNS, RIVER, WHOLE_FOREST_PATTERN, Forest, Scope,
+                     mitten_pattern, normalize)
 
 log = logging.getLogger(__name__)
 
 EXCERPT_CHARS = 3000
+# Seconds the model has to name the place, rate-limit pauses included. Then the sender is asked with buttons,
+# as when Groq is unavailable: the sender's next files, and a question that needs the mitten, wait for this.
+CLASSIFY_SECONDS = 30
 
 CLASSIFY_SYSTEM = """Ти визначаєш, для якого місця в лісі написано документ із порадами.
 
@@ -26,8 +30,8 @@ CLASSIFY_SYSTEM = """Ти визначаєш, для якого місця в л
 Поверни JSON: {{"kind": "mitten" | "part" | "forest" | "unclear", "value": "точна назва рукавички або частини лісу, або порожньо"}}"""
 
 PART_BY_NAME = {normalize(name): key for key, name in PART_NAMES.items()} | {
-    "хвойний": "conifer", "листяний": "deciduous", "річка": "river", "біля річки": "river",
-}
+    "хвойний": "conifer", "листяний": "deciduous", "річка": "river",
+} | {key: key for key in PART_NAMES}  # the model may answer with the key itself: "conifer"
 
 
 WHOLE_FOREST_CAPTION = r"(?:весь|увесь|всього|усього|для)\s+(?:ліс|лісу)\b|всіх\s+звір|усіх\s+звір"
@@ -72,8 +76,12 @@ SPLIT = "split"
 
 
 def _split(mittens: list[str], low: str) -> Scope:
-    """The mittens in the order the text names them."""
-    return Scope(SPLIT, ", ".join(sorted(mittens, key=lambda mitten: low.find(normalize(mitten)))))
+    """The mittens in the order the text names them, by name or by the words for it: "Для мешканців Під дубом
+    і біля сосон" is Під дубом, У соснах. Each one was found in `low`, so its pattern matches there."""
+    def first_named(mitten: str) -> int:
+        name = normalize(mitten)
+        return low.find(name) if name in low else re.search(mitten_pattern(mitten), low).start()
+    return Scope(SPLIT, ", ".join(sorted(mittens, key=first_named)))
 
 
 def scope_from_caption(caption: str | None, forest: Forest) -> Scope | None:
@@ -99,7 +107,6 @@ async def classify_document(title: str, text: str, forest: Forest, llm: LLM) -> 
     the whole document, and when it cannot tell, or the text names no place, the sender is asked.
     Signals that disagree, or a document addressed to several places, also mean asking. Advice for two
     or more mittens, each named as a mitten, gives a scope of kind SPLIT: the sender splits the document."""
-    low = normalize(text)
     addressee, title_scope = _addressee(text, forest), _from_title(title, forest)
     if addressee == ASK:
         return None
@@ -109,10 +116,10 @@ async def classify_document(title: str, text: str, forest: Forest, llm: LLM) -> 
         # "Внески біля річки" with "Шановні мешканці рукавички Під вербою!": the more specific one.
         return addressee if _within(addressee, title_scope, forest) else \
             title_scope if _within(title_scope, addressee, forest) else None
-    head = normalize(text[:EXCERPT_CHARS])
-    own_anywhere = [m for m in forest.mittens if _named_as_mitten(m, low, own=True)]
     if addressee:
-        return addressee
+        return addressee  # "Порада для листяного лісу: ...": the rest of the text cannot change it
+    low, head = normalize(text), normalize(text[:EXCERPT_CHARS])
+    own_anywhere = [m for m in forest.mittens if _named_as_mitten(m, low, own=True)]
     # "У рукавичці Під дубом внесок 4 жолуді, у рукавичці Під вербою 3 горіхи": two documents in one, unless
     # the file name or the opening says it is for a forest part or the whole forest (Mishka, 22:05: a guide's
     # section about a mitten weighs as the whole guide).
@@ -163,6 +170,8 @@ async def classify_document(title: str, text: str, forest: Forest, llm: LLM) -> 
         return None
     accepted = {scope for scope in offered
                 if scope.kind != "mitten" or scope.value in own_anywhere or _opens_with(text, scope.value)}
+    if not accepted:
+        return None  # "Звіробій ... збирайте на узліссі": no answer of the model could be taken
 
     explicit = [m for m in mentioned if _named_as_mitten(m, low)]
     places = [f'рукавичка "{m}"' if m in explicit else f'"{m.lower()}" (рукавичка або просто дерево чи місцевість)'
@@ -175,6 +184,7 @@ async def classify_document(title: str, text: str, forest: Forest, llm: LLM) -> 
             f"Можливі відповіді: {'; '.join(choices)}; або \"unclear\", якщо з тексту це не зрозуміло."
             f"\n\nТекст:\n{text[:EXCERPT_CHARS]}",
             max_tokens=400, fast=True,  # a short {"kind", "value"}: the budget counts against the minute
+            deadline=time.monotonic() + CLASSIFY_SECONDS,
         )
     except LLMUnavailable:
         log.warning("Groq unavailable, asking the sender about %r", title)
@@ -189,8 +199,13 @@ def _named_as_mitten(mitten: str, low: str, own: bool = False) -> bool:
     named = rf"(?:рукавич\w*\s+(?:під\s+назвою\s+)?{QUOTE}?|{QUOTE}){re.escape(normalize(mitten))}"
     starts = [found.start() for found in re.finditer(named, low)]
     if own:
-        starts = [start for start in starts if not re.search(OTHER_MITTEN + "$", low[max(0, start - 40):start])]
+        starts = [start for start in starts if not _elsewhere(low, start)]
     return bool(starts)
+
+
+def _elsewhere(text: str, start: int) -> bool:
+    """The words before `start` name the place as somewhere else: "до (старої) рукавички", "сусідів з"."""
+    return bool(re.search(OTHER_MITTEN + "$", text[max(0, start - 40):start]))
 
 
 def _covers(scope: Scope, mentioned: list[str], parts: set[str], forest: Forest) -> bool:
@@ -265,7 +280,7 @@ def _addressee(text: str, forest: Forest) -> Scope | None:
                     # "Для всіх, хто живе біля річки": only where they live says who.
                     lives = WHO_LIVES.match(who)
                     scope = _place_at_start(lives.group(1).strip(QUOTES), forest) if lives else None
-                    if not scope and not (forest.detect_mittens(who) or forest.detect_parts(who)) and WHOLE_FOR.match(clause):
+                    if not scope and not (forest.detect_mittens(who) or forest.detect_parts(who)):
                         scope = FOREST_SCOPE  # "для всіх, хто любить гриби"
                 elif WHOLE_FOR.match(clause) and (clause != "лісу" or not after.strip()) if kind == "for" \
                         else WHOLE_OF.fullmatch(clause):
@@ -288,9 +303,7 @@ def _addressee(text: str, forest: Forest) -> Scope | None:
 def _addressed(mitten: str, sentence: str) -> bool:
     """The mitten is named in the sentence other than as a destination or a neighbour: "для Під дубом і Під вербою",
     but not "... які ходять по горіхи до ліщини" or "... що поруч із вербою"."""
-    pattern = MITTEN_PATTERNS.get(mitten) or re.escape(normalize(mitten))
-    return any(not re.search(OTHER_MITTEN + "$", sentence[max(0, found.start() - 40):found.start()])
-               for found in re.finditer(pattern, sentence))
+    return any(not _elsewhere(sentence, found.start()) for found in re.finditer(mitten_pattern(mitten), sentence))
 
 
 def _just_the_place(place: str, scope: Scope) -> bool:
@@ -347,7 +360,7 @@ def _validate(result: dict, forest: Forest) -> Scope | None:
             if normalize(mitten) == value:
                 return Scope("mitten", mitten)
     if kind == "part":
-        key = PART_BY_NAME.get(value) or next((k for k in PART_NAMES if k == value), None)
+        key = PART_BY_NAME.get(value)
         if key:
             return Scope("part", key)
     return None

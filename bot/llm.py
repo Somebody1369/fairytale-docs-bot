@@ -79,14 +79,17 @@ class LLM:
         self.output_caps: dict[str, int] = dict(OUTPUT_CAPS)
 
     async def check_models(self) -> None:
-        """Keep configured models this Groq key can use; add known free-tier ones as fallbacks."""
+        """Keep the configured models this Groq key can use, in their order; when it can use none of them,
+        the known free-tier models it can use take their place."""
         try:
             available = {model.id for model in (await self.client.models.list()).data}
         except groq.APIError as error:
             log.warning("Could not list Groq models: %s", error)
             return
-        usable = [m for m in self.models if m in available]
-        usable += [m for m in DEFAULT_GROQ_MODELS.split(",") if m in available and m not in usable]
+        # The known free-tier models stand in only when none of the configured ones is offered any more:
+        # GROQ_MODELS without qwen (the README's advice for the paid tier) stays without it.
+        usable = [m for m in self.models if m in available] \
+            or [m for m in DEFAULT_GROQ_MODELS.split(",") if m in available]
         if usable:
             self.models = usable
         else:
@@ -164,9 +167,11 @@ class LLM:
                         await asyncio.sleep(wait)
                     except groq.BadRequestError as error:
                         last_error = error
+                        # It thought so long that the reply was cut off: think less. That is retried only when
+                        # it changes the request; qwen never thinks, so it goes straight to the plain-text retry.
                         if "json_validate_failed" in str(error) and "max completion tokens" in str(error) \
-                                and effort != "low":
-                            effort = "low"  # it thought so long that the reply was cut off: think less
+                                and model_options(model, effort) != model_options(model, "low"):
+                            effort = "low"
                             continue
                         if strict and "json_validate_failed" in str(error):
                             strict = False  # ask again and read the JSON from plain text

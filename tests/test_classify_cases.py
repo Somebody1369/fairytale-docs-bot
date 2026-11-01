@@ -3,9 +3,12 @@
 by itself, nor file a clear one somewhere else. A clear one may still go to the model or be asked about.
 "split:..." is advice for several mittens: Mishka wants one document per place, so the sender splits it."""
 
+import time
+
 import pytest
 
-from bot.classify import classify_document
+from bot.classify import CLASSIFY_SECONDS, classify_document
+from bot.llm import LLMUnavailable
 
 from .conftest import FakeLLM
 
@@ -94,6 +97,8 @@ CASES = [
     ('s13', 'Хвойний ліс', 'Мешканці дубово-соснового лісу! Жолуді вже впали.', 'ask'),
     ('s14', 'Порада', 'Порада для хвойно-листяного лісу: утеплюйте рукавички в жовтні.', 'ask'),
     ('s15', 'Порада', 'Для мешканців хвойно-дубового лісу: жолуді збирайте після морозу.', 'ask'),
+    # The sender sees the mittens in the text's order, also one named by its tree ("біля сосон" is У соснах).
+    ('s16', 'Порада', 'Для мешканців Під дубом і біля сосон: збори в суботу.', 'split:Під дубом, У соснах'),
     ('k10', 'Лісник', 'Дубовий лісник приходить щосуботи, зустрічайте його привітно.', 'ask'),
     ('k11', 'Утеплення', 'Гілки ялин кладіть на рукавичку шаром у дві лапи.', 'ask'),
     ('k1', 'Варення', 'Порічки збирайте в липні, коли вони зовсім червоні.', 'ask'),
@@ -178,3 +183,19 @@ TREE_CASES = [case for case in CASES if case[0] in {"p12", "p13", "p14", "p15", 
 async def test_forest_part_named_by_its_trees_needs_no_model(forest, case_id, title, text, expected):
     scope = await classify_document(title, text, forest, FakeLLM({"kind": "unclear", "value": ""}))
     assert scope is not None and scope.encode() == expected
+
+
+async def test_busy_model_does_not_keep_the_sender_waiting(forest):
+    # The sender's next files, and a question that needs the mitten, wait behind this document:
+    # when Groq is busy, the sender is asked.
+    llm = FakeLLM(LLMUnavailable("busy"))
+    started = time.monotonic()
+    assert await classify_document("Рижики", "Рижики ростуть під ялиною, де багато моху.", forest, llm) is None
+    assert llm.deadlines[0] is not None and started < llm.deadlines[0] <= time.monotonic() + CLASSIFY_SECONDS
+
+
+async def test_model_is_not_asked_when_no_answer_could_be_taken(forest):
+    # "На узліссі" in the middle of the advice is no mitten of its own, and it lies in no forest part.
+    llm = FakeLLM({"kind": "mitten", "value": "На узліссі"})
+    assert await classify_document("Звіробій", "Звіробій для чаю збирайте на узліссі в липні.", forest, llm) is None
+    assert llm.prompts == []

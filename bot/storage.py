@@ -98,7 +98,7 @@ class Store:
     def __init__(self, path: str):
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         self.revision = 0  # bumped on every change so the search index knows to rebuild
@@ -179,14 +179,9 @@ class Store:
         and for everyone that animal invited in turn. Their documents stop being used in answers
         (kept with status "revoked") and their unused invites stop working. No admins are needed:
         whoever stands above in the chain can do it, so a sleeping inviter does not leave a stranger in."""
-        chain = {member[0] for member in self.invited_by_chain(by_id)}
-        if member_id not in chain:
+        if member_id not in {member[0] for member in self.invited_by_chain(by_id)}:
             return None
-        removed, queue = [], [member_id]
-        while queue:
-            current = queue.pop()
-            removed.append(current)
-            queue += [r[0] for r in self.db.execute("SELECT tg_id FROM members WHERE invited_by = ?", (current,))]
+        removed = [member_id] + [member[0] for member in self.invited_by_chain(member_id)]
         for tg_id in removed:
             self.db.execute("DELETE FROM members WHERE tg_id = ?", (tg_id,))
             self.db.execute("DELETE FROM invites WHERE used_by IS NULL AND created_by = ?", (tg_id,))
@@ -301,9 +296,11 @@ class Store:
         self.db.execute(
             "UPDATE documents SET present = 0 WHERE source = 'archive' AND drive_file_id = ?", (drive_file_id,)
         )
+        # Not active yet: recompute_archive_status() picks the one current version once the whole folder is
+        # read, so answers never see "4 жолуді" and "5 жолудів" both, not even after a sync cut short by a restart.
         return self._insert(
             source="archive", title=title, filename=filename, scope=scope, text=text, created_at=now,
-            modified_at=modified_at, drive_file_id=drive_file_id, drive_marker=marker,
+            modified_at=modified_at, drive_file_id=drive_file_id, drive_marker=marker, status="superseded",
         )
 
     def mark_missing_archive_files(self, present_ids: set[str]) -> int:
@@ -331,6 +328,8 @@ class Store:
             status = "active" if row["id"] in winners else "superseded"
             if row["status"] != status:
                 self.db.execute("UPDATE documents SET status = ? WHERE id = ?", (status, row["id"]))
+        # Also commits mark_missing_archive_files' updates. The search index is rebuilt after every sync, even one
+        # that found nothing new here: `python -m bot.ask` may have synced the same database from another process.
         self._changed()
 
     # Internals
@@ -338,16 +337,16 @@ class Store:
     def _insert(
         self, *, source: str, title: str, filename: str, scope: Scope, text: str, created_at: datetime,
         modified_at: datetime, author_id: int | None = None, author_name: str | None = None,
-        drive_file_id: str | None = None, drive_marker: str | None = None,
+        drive_file_id: str | None = None, drive_marker: str | None = None, status: str = "active",
     ) -> int:
         cursor = self.db.execute(
             "INSERT INTO documents (source, title, norm_title, filename, scope, author_id, author_name, "
             "drive_file_id, drive_marker, present, content_hash, text, created_at, modified_at, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 'active')",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
             (
                 source, title, norm_title(title), filename, scope.encode(), author_id, author_name,
                 drive_file_id, drive_marker, content_hash(text), text, created_at.isoformat(),
-                modified_at.isoformat(),
+                modified_at.isoformat(), status,
             ),
         )
         self.db.commit()

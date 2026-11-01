@@ -32,14 +32,17 @@ def load_settings() -> Settings:
     if missing:
         raise SystemExit(f"Missing environment variables: {', '.join(missing)}. See .env.example.")
 
-    models = os.getenv("GROQ_MODELS") or os.getenv("GROQ_MODEL") or DEFAULT_GROQ_MODELS
+    models = env("GROQ_MODELS", DEFAULT_GROQ_MODELS)
+    sync_minutes = int(env("ARCHIVE_SYNC_MINUTES", "10"))
+    if sync_minutes < 1:  # with 0 the archive sync would list Google Drive back to back, without a pause
+        raise SystemExit("ARCHIVE_SYNC_MINUTES must be 1 or more.")
     return Settings(
         telegram_token=os.environ["TELEGRAM_BOT_TOKEN"],
         groq_api_key=os.environ["GROQ_API_KEY"],
         groq_models=[m.strip() for m in models.split(",") if m.strip()],
-        drive_folder_id=os.getenv("DRIVE_FOLDER_ID") or DEFAULT_DRIVE_FOLDER_ID,
-        google_api_key=os.getenv("GOOGLE_API_KEY") or None,
-        sync_minutes=int(env("ARCHIVE_SYNC_MINUTES", "10")),
+        drive_folder_id=env("DRIVE_FOLDER_ID", DEFAULT_DRIVE_FOLDER_ID),
+        google_api_key=env("GOOGLE_API_KEY", "") or None,
+        sync_minutes=sync_minutes,
         db_path=env("DB_PATH", "data/bot.db"),
         timezone=env("TZ_NAME", "Europe/Kyiv"),
         max_file_mb=int(env("MAX_FILE_MB", "20")),

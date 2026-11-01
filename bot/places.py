@@ -68,10 +68,18 @@ WHOLE_FOREST_PATTERN = r"(?:всіх|усіх)\s+мешканців\s+лісу|�
 
 LEVEL_MITTEN, LEVEL_PART, LEVEL_FOREST = 3, 2, 1
 
+# Word writes "пам’ятка", keyboards "пам'ятка", "памʼятка" or "пам`ятка": texts are compared with one apostrophe.
+APOSTROPHES = str.maketrans({"’": "'", "ʼ": "'", "`": "'"})
+
 
 def normalize(text: str) -> str:
-    text = text.lower().replace("’", "'").replace("ʼ", "'").replace("`", "'")
-    return re.sub(r"\s+", " ", text)
+    return re.sub(r"\s+", " ", text.lower().translate(APOSTROPHES))
+
+
+def mitten_pattern(name: str) -> str:
+    """How texts name the mitten: "біля сосон" is У соснах. One the map adds without words of its own
+    is named by its name."""
+    return MITTEN_PATTERNS.get(name) or re.escape(normalize(name))
 
 
 @dataclass(frozen=True)
@@ -130,8 +138,7 @@ class Forest:
         low = normalize(text)
         found = []
         for name in self.mittens:
-            pattern = MITTEN_PATTERNS.get(name) or re.escape(normalize(name))
-            if re.search(pattern, low):
+            if re.search(mitten_pattern(name), low):
                 found.append(name)
         return found
 
@@ -233,7 +240,7 @@ def name_pattern(name: str) -> str:
     "кабани" are any boars, "жолуді" are acorns, not Жолудівка-сойка, "їжа" is not Їжак."""
     if "-" in name:  # "Жолудівка-сойка": either part names her, "де живе сойка?"
         return "|".join(name_pattern(part.capitalize()) for part in name.split("-"))
-    low = name.lower()
+    low = name.lower().translate(APOSTROPHES)  # the statute's "Солов’їха" as the question's "Солов'їха"
     if low in IRREGULAR_FORMS:
         return rf"\b(?:{IRREGULAR_FORMS[low]})\b"
     if low.endswith("а"):  # Сова, Білочка: сови, сові, сову, совою; Білочці
@@ -242,14 +249,14 @@ def name_pattern(name: str) -> str:
         return rf"\b(?:{stem}(?:а|и|і|у|ою|о){alternation})\b"
     if low.endswith("я"):  # Синиця: синиці, синицю, синицею
         return rf"\b{low[:-1]}(?:я|і|ю|ею|е)\b"
-    return rf"\b{low}(?:а|у|ові|ом|е|у)?\b"  # Кабан, Зайчик, Їжак, Борсук
+    return rf"\b{low}(?:а|у|ові|ом|е)?\b"  # Кабан, Зайчик, Їжак, Борсук
 
 
 def plural_forms(name: str) -> set[str]:
     """Forms of a name that are also the plural of a common word: "лисички" are chanterelles,
     "сови" any owls, "синиці" any tits. They name the resident only with a capital letter ("у Лисички")."""
     forms = set()
-    for part in name.lower().split("-"):
+    for part in name.lower().translate(APOSTROPHES).split("-"):
         if part.endswith("а"):
             forms.add(part[:-1] + "и")
         elif part.endswith("я"):
@@ -259,7 +266,7 @@ def plural_forms(name: str) -> set[str]:
 
 def resident_homes(question: str, residents: dict[str, str]) -> dict[str, str]:
     """The residents named in the question and their mittens: {"Сова": "Під дубом"}."""
-    text = question.replace("’", "'").replace("ʼ", "'")
+    text = question.translate(APOSTROPHES)
     homes = {}
     for name, mitten in residents.items():
         plural = plural_forms(name)

@@ -10,19 +10,37 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
+
+import docx
+import pypdfium2 as pdfium
+import pytesseract
+from PIL import ImageOps
 
 log = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt"}
 MIN_PAGE_TEXT = 20
 MAX_OCR_PAGES = 30  # a scanned page takes a few seconds to read; a longer scan is refused rather than cut
+# Pixels on the longer side, so an oversized page (a poster, A0) cannot take gigabytes; A4 and A3 still get 300 dpi.
+MAX_RENDER_SIDE = 5000
+# Tesseract is stopped after this, and the file counts as unreadable rather than being stored without the page.
+OCR_PAGE_SECONDS = 120
+
+# PDFium is not thread-safe, not even for different documents (pypdfium2 docs), and PDFs are read in threads:
+# the archive sync and every animal's file at once. Two PDFs read together crashed the process.
+PDFIUM = threading.Lock()
 
 
 class TooManyScannedPages(ValueError):
     def __init__(self, pages: int):
         super().__init__(f"{pages} scanned pages, at most {MAX_OCR_PAGES} are read")
         self.pages = pages
+
+
+class UnreadableScan(ValueError):
+    """Tesseract did not finish a scanned page in OCR_PAGE_SECONDS."""
 
 
 class UnsupportedFormat(Exception):
@@ -69,8 +87,6 @@ def _decode_text(data: bytes) -> str:
 
 
 def _docx_text(data: bytes) -> str:
-    import docx
-
     document = docx.Document(io.BytesIO(data))
     parts = [p.text for p in document.paragraphs]
     for table in document.tables:
@@ -91,35 +107,33 @@ def _doc_text(data: bytes) -> str:
 
 
 def _pdf_text(data: bytes, ocr_langs: str) -> str:
-    import pypdfium2 as pdfium
-
-    pdf = pdfium.PdfDocument(data)
-    pages = [pdf[index].get_textpage().get_text_range() for index in range(len(pdf))]
-    scanned = [index for index, text in enumerate(pages) if len(text.strip()) < MIN_PAGE_TEXT]
-    if len(scanned) > MAX_OCR_PAGES:
-        raise TooManyScannedPages(len(scanned))
-    for index in scanned:
-        pages[index] = _ocr_page(pdf[index], ocr_langs) or pages[index]
+    # The document is closed inside the lock too, so no PDFium call is left for later in another thread.
+    # OCR stays inside as well: simpler, and a second PDF waits for at most one file's scanned pages.
+    with PDFIUM, pdfium.PdfDocument(data) as pdf:
+        pages = [pdf[index].get_textpage().get_text_range() for index in range(len(pdf))]
+        scanned = [index for index, text in enumerate(pages) if len(text.strip()) < MIN_PAGE_TEXT]
+        if len(scanned) > MAX_OCR_PAGES:
+            raise TooManyScannedPages(len(scanned))
+        for index in scanned:
+            pages[index] = _ocr_page(pdf[index], ocr_langs) or pages[index]
     return "\n\n".join(pages)
 
 
 def _ocr_page(page, ocr_langs: str) -> str:
-    try:
-        import pytesseract
-        from PIL import ImageOps
-    except ImportError:
-        log.warning("OCR is not available, scanned page skipped")
-        return ""
-
-    image = page.render(scale=300 / 72).to_pil().convert("L")
+    scale = min(300 / 72, MAX_RENDER_SIDE / max(page.get_size()))  # PDF sizes are in points, 72 per inch
+    image = page.render(scale=scale).to_pil().convert("L")
     image = ImageOps.autocontrast(image)
     # Text is near-black; the bark background and its stains are lighter.
     image = image.point(lambda value: 0 if value < 110 else 255)
+    # A timeout fails the whole file: the sender is asked for a document with text, as for any scan that could not
+    # be read, and the archive sync retries the file later instead of storing the scan without this page.
     try:
-        raw = pytesseract.image_to_string(image, lang=ocr_langs, config="--psm 4")
+        raw = pytesseract.image_to_string(image, lang=ocr_langs, config="--psm 4", timeout=OCR_PAGE_SECONDS)
     except pytesseract.TesseractError as error:
         log.warning("OCR failed: %s", error)
         return ""
+    except RuntimeError as error:  # pytesseract's timeout; TesseractError above is a RuntimeError too
+        raise UnreadableScan(str(error)) from error
     return _clean_ocr(raw)
 
 

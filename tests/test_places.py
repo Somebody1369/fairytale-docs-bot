@@ -226,6 +226,13 @@ def test_plural_of_a_common_word_is_not_the_resident(question, expected):
     assert resident_homes(question, homes) == expected
 
 
+def test_resident_named_with_either_apostrophe():
+    # Word writes "Солов’їха", a keyboard "Солов'їха"; the statute's name keeps its own spelling.
+    homes = {name: "Під вербою" for name in residents_from_statute("Мешканці рукавички: Солов’їха, Сова і Їжак.")}
+    assert resident_homes("де живе Солов’їха?", homes) == {"Солов’їха": "Під вербою"}
+    assert resident_homes("де живе Солов'їха?", homes) == {"Солов’їха": "Під вербою"}
+
+
 def test_long_words_do_not_stall_the_place_search(forest):
     # One long run of letters once took seconds: the hyphenated first half was looked for at every letter.
     started = time.monotonic()

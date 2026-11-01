@@ -1,6 +1,5 @@
 """From a question to an answer: pick the place, find the documents, ask Groq, cite sources."""
 
-import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -12,8 +11,6 @@ from .places import PART_NAMES, Forest, Scope, resident_homes, residents_from_st
 from .search import COMMON_STEMS, STOPWORDS, Hit, Index, expand, looks_like_heading, split_chunks, tokens
 from .storage import Document, Store, norm_title
 from . import texts
-
-log = logging.getLogger(__name__)
 
 MAX_DOCS = 7  # documents in one answer prompt; archive documents are short (under 1100 characters)
 DOC_CHARS = 2500  # a long guide from an animal is cut to the parts that match the question
@@ -120,6 +117,10 @@ FACTS_REMINDER = """
 ARCHIVE_REMINDER = """
 
 Зверни увагу: перша порада у відповіді — з документа звіра [{animal}], а документ Лісового архіву {archive} написаний для того самого місця. Якщо в архіві теж є відповідь на питання, за правилом 4 важливіший архів, навіть якщо документ звіра новіший: відповідай за архівом і постав його першим у "sources", а пораду [{animal}], якщо вона радить інакше, перекажи в полі "other". Якщо відповіді в архіві немає, відповідай як раніше."""
+
+SOURCES_REMINDER = """
+
+Зверни увагу: у "sources" немає номерів документів, з яких узято відповідь. Без них бот відповідь не покаже: постав у "sources" номери документів, з яких відповідаєш, найважливіший перший."""
 
 # The model, given "Де шукати гриби біля верби?", kept to the willow and skipped the deciduous guide's "Білі гриби
 # тримаються старих дубів" even when reminded of it; quoting the sentences on the topic brought them in.
@@ -252,15 +253,28 @@ def missing_facts(facts, docs: list[Document], sources: list[Document], text: st
     return left_out
 
 
+# Document numbers as the model writes them: "[1]", "[2, рукавичка]" and runs of them like "[1], [2]" or "[1] і [2]".
+REFERENCES = r"\[\s*\d+(?:,[^\]]*)?\](?:\s*(?:,|;|і|й|та)\s*\[\s*\d+(?:,[^\]]*)?\])*"
+
+
 def clean_text(value, documents: int) -> str:
     """The model's text without the document numbers it now and then puts in ("у документі [2]", "[1, рукавичка]")
     or a bare "(документ)"; other numbers in brackets ("[2026]") stay."""
-    text = " ".join(str(part) for part in value) if isinstance(value, list) else str(value or "")
-    numbered = lambda match: "" if 1 <= int(match.group(1)) <= documents else match.group(0)
-    # "(документ)", "(у документі [2])", "(з документа «…»)", but not "(у документі сказано: до 10 числа)".
+    # An object or a number where a text belongs is no text: "{'text': '4 жолуді.'}" must never reach an animal.
+    if isinstance(value, list):
+        text = " ".join(part for part in value if isinstance(part, str))
+    else:
+        text = value if isinstance(value, str) else ""
+    # A run goes only when all its numbers are documents' numbers, so "[1] і [2026]" stays whole.
+    numbered = lambda match: "" if all(1 <= int(n) <= documents for n in re.findall(r"\[\s*(\d+)", match.group(0))) \
+        else match.group(0)
+    # "(документ)", "(у документі [2])", "(у документах [1] і [2])", "(з документа «…»)", but not
+    # "(у документі сказано: до 10 числа)". Any one bracket goes too ("(у документі [№2])", "(документ [Внески])"):
+    # the run is tried first, so "[1] і [2]" goes whole.
     text = re.sub(r"\s*\((?:згідно\s+з\s+|див\.\s*|з\s+|із\s+|у\s+|в\s+)?документ\w*"
-                  r"(?:\s*\[[^\]]*\]|\s+\d+|\s*«[^»]{0,80}»|\s*\"[^\"]{0,80}\")?\s*\)", "", text)
-    text = re.sub(r"(?:\s+(?:у\s+|в\s+)?документ\w*)?\s*\[(\d+)(?:,[^\]]*)?\]", numbered, text)
+                  rf"(?:\s*{REFERENCES}|\s*\[[^\]]*\]|\s+\d+|\s*«[^»]{{0,80}}»|\s*\"[^\"]{{0,80}}\")?\s*\)", "", text)
+    text = re.sub(rf"(?:\s+(?:у\s+|в\s+)?документ\w*)?\s*{REFERENCES}", numbered, text)
+    text = re.sub(r"\s*\(\s*\)", "", text)  # "([1], [2])" once its numbers are gone
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
@@ -275,12 +289,23 @@ SERVICE_WORDS = re.compile(r"\b(?:other|answer|sources|facts|json)\b", re.I)
 def clean_other(value, answer: str, documents: int) -> str:
     """The advice that gives way, or "" for the stubs the model writes instead of nothing ("Немає", "-", "null"),
     for a repeat of the answer and for the model's words about its own reply."""
-    if value is not None and not isinstance(value, (str, list)):
-        return ""
     other = clean_text(value, documents)
     if not other or PLACEHOLDER.fullmatch(other) or SERVICE_WORDS.search(other) or fact_terms(other) <= fact_terms(answer):
         return ""
     return other
+
+
+def by_number(numbers, items: list) -> list:
+    """The items the model named by number from 1 ([2, "1", "[3]"]), each once; other values are skipped.
+    isdecimal(), as int() takes no "²" that isdigit() lets through; type() is int, as JSON true is a bool,
+    and a bool is an int in Python."""
+    chosen = []
+    for number in numbers if isinstance(numbers, list) else []:
+        if isinstance(number, str) and number.strip(" []").isdecimal():
+            number = int(number.strip(" []"))
+        if type(number) is int and 1 <= number <= len(items) and items[number - 1] not in chosen:
+            chosen.append(items[number - 1])
+    return chosen
 
 
 def best_per_level(hits: list[Hit]) -> list[Document]:
@@ -350,11 +375,9 @@ class Answerer:
             allowed = lambda doc: any(self.forest.applies(doc.scope, part=p) for p in parts)
             docs = await self._docs_for_place(question, allowed, deadline)
         else:
-            allowed = None
             docs = await self._docs_without_place(question, deadline)
         if docs:
-            place_rule = PLACE_UNKNOWN_RULE if not allowed and any(doc.scope.kind != "forest" for doc in docs) else ""
-            reply = await self._answer(question, docs, mittens, parts, now, place_rule, resident, allowed, deadline)
+            reply = await self._answer(question, docs, mittens, parts, now, resident, deadline)
         else:
             reply = Reply("not_found", texts.NOT_FOUND)
         if parts and reply.kind == "not_found" and self._mittens_know(question, parts):
@@ -413,24 +436,18 @@ class Answerer:
                                          deadline=min(deadline, time.monotonic() + PICK_SECONDS))
         except LLMUnavailable:
             return []
-        ids = []
-        for i in result.get("ids", []) if isinstance(result.get("ids"), list) else []:
-            if isinstance(i, str) and i.strip().isdigit():
-                i = int(i.strip())
-            if isinstance(i, int) and 1 <= i <= len(candidates) and i not in ids:
-                ids.append(i)
-        return [candidates[i - 1] for i in ids[:PICK_LIMIT]]
+        return by_number(result.get("ids"), candidates)[:PICK_LIMIT]
 
     def _title_line(self, doc: Document) -> str:
         if doc.from_archive:
             return f"{doc.title} ({doc.scope.describe()})"
         return f"{doc.title} ({doc.scope.describe()}, надіслав звір, {doc.created_at.astimezone(self.tz):%d.%m %H:%M})"
 
-    async def _answer(
-        self, question: str, docs: list[Document], mittens: list[str], parts: list[str], now: datetime,
-        place_rule: str = "", resident: str | None = None, allowed=None, deadline: float | None = None,
-    ) -> Reply:
-        """`allowed`: the documents were chosen for a place named in the question."""
+    async def _answer(self, question: str, docs: list[Document], mittens: list[str], parts: list[str], now: datetime,
+                      resident: str | None, deadline: float) -> Reply:
+        # The documents were chosen for one place: named in the question, picked by button or a named resident's home.
+        named = bool(mittens or parts)
+        place_rule = PLACE_UNKNOWN_RULE if not named and any(doc.scope.kind != "forest" for doc in docs) else ""
         # Most specific first, archive before animals, newer before older.
         docs = sorted(docs, key=lambda d: (-d.scope.level, not d.from_archive, -d.modified_at.timestamp()))
         place = self._place_note(mittens, parts) + (RESIDENT_NOTE.format(name=resident) if resident else "")
@@ -441,9 +458,9 @@ class Answerer:
         size = self._excerpt_size(docs)
         blocks = [self._doc_block(i, doc, question, mittens, parts, size) for i, doc in enumerate(docs, 1)]
         # "Де шукати гриби біля верби?" is about mushrooms for the mitten, not about willow trees.
-        topic = re.sub(r"\s+", " ", self.forest.strip_places(question)).strip(" ?.!,") if mittens or parts else ""
+        topic = re.sub(r"\s+", " ", self.forest.strip_places(question)).strip(" ?.!,") if named else ""
         # A place found by a resident ("коли Ведмідь лягає спати?") was not asked about: no labels for it.
-        varies = ("так" if self._varies_by_place(question) else "ні") if (mittens or parts) and not resident else ""
+        varies = ("так" if self._varies_by_place(question) else "ні") if named and not resident else ""
         prompt = (
             f"{calendar_note(now, self.tz, need)}\n\n"
             f"Питання звіра: {question}\n"
@@ -468,14 +485,16 @@ class Answerer:
             answer = clean_text(result.get("answer"), len(docs))
             # Advice that says otherwise and gives way here (the whole forest's, or an animal's under the archive).
             other = clean_other(result.get("other"), answer, len(docs))
-            sources = self._sources(result.get("sources"), docs)
+            sources = by_number(result.get("sources"), docs)
             if not sources and len(docs) == 1:
                 sources = docs  # one document given, so it is the source
-            gave_up = (place_rule and result.get("needs_place")) or result.get("found") in (False, "false") or not answer
+            # A flag written as a string: "false" is no, as for "found".
+            needs_place = bool(place_rule) and result.get("needs_place") in (True, "true")
+            gave_up = needs_place or result.get("found") in (False, "false") or not answer
             if first and (gave_up or not sources):
                 answer, other, sources = first[:3]  # asked to put it right, the model lost the answer: keep the first
                 break
-            if place_rule and result.get("needs_place"):
+            if needs_place:
                 return Reply("need_place")
             if gave_up:
                 return Reply("not_found", texts.NOT_FOUND)
@@ -483,9 +502,10 @@ class Answerer:
                 if asked_sources:
                     return Reply("not_found", texts.NOT_FOUND)
                 asked_sources = True  # the model now and then forgets the source numbers; ask once more
+                prompt += SOURCES_REMINDER  # the very same request would mostly bring the very same reply
                 continue
             facts = result.get("facts") if isinstance(result.get("facts"), list) else []
-            reminders, faults = self._review(question, docs, mittens, allowed, answer, other, sources, facts)
+            reminders, faults = self._review(question, docs, mittens, named, answer, other, sources, facts)
             if first:
                 # The one second try is taken unless it came out worse: more broken rules, or more of the points
                 # both answers listed left out (a weaker fallback model may answer it worse than the first).
@@ -523,7 +543,7 @@ class Answerer:
         return {term for term in fact_terms(self.forest.strip_places(question))
                 if len(term) >= 4 and not term.isdigit()} - names
 
-    def _review(self, question: str, docs: list[Document], mittens: list[str], allowed, answer: str, other: str,
+    def _review(self, question: str, docs: list[Document], mittens: list[str], named: bool, answer: str, other: str,
                 sources: list[Document], facts: list) -> tuple[list[str], int]:
         """What to put right in an answer: the reminders for the model, and how many of the places' rules
         (levels, the archive, both forest parts) the answer breaks."""
@@ -532,7 +552,7 @@ class Answerer:
         # guide first, though a cited document for the mitten's forest part is more specific.
         # With no place asked, PLACE_UNKNOWN_RULE alone decides between the whole forest and asking.
         better = next((doc for doc in sources[1:] if doc.scope.level > sources[0].scope.level), None)
-        if better and allowed:
+        if better and named:
             reminders.append(LEVEL_REMINDER.format(
                 better=docs.index(better) + 1, better_level=LEVEL_NAMES[better.scope.kind],
                 weaker=docs.index(sources[0]) + 1, weaker_level=LEVEL_NAMES[sources[0].scope.kind]))
@@ -540,7 +560,7 @@ class Answerer:
         # though the animal's is newer. A weaker fallback model now and then answers by the newer one, and
         # does not even cite the archive document it was given on the same topic.
         topic = self._topic_terms(question)
-        archived = [] if not allowed or sources[0].from_archive else [
+        archived = [] if not named or sources[0].from_archive else [
             doc for doc in docs if doc.from_archive and doc.scope == sources[0].scope and topic & fact_terms(doc.text)]
         if archived:
             reminders.append(ARCHIVE_REMINDER.format(archive=", ".join(f"[{docs.index(doc) + 1}]" for doc in archived),
@@ -615,16 +635,6 @@ class Answerer:
             if doc:
                 missing.append(doc)
         return missing
-
-    @staticmethod
-    def _sources(numbers, docs: list[Document]) -> list[Document]:
-        sources = []
-        for number in numbers if isinstance(numbers, list) else []:
-            if isinstance(number, str) and number.strip(" []").isdigit():
-                number = int(number.strip(" []"))
-            if isinstance(number, int) and 1 <= number <= len(docs) and docs[number - 1] not in sources:
-                sources.append(docs[number - 1])
-        return sources
 
     @staticmethod
     def _place_genitive(mittens: list[str], parts: list[str]) -> str | None:

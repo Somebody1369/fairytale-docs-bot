@@ -4,10 +4,14 @@ import pytest
 from datetime import datetime, timezone
 
 import docx
+import pypdfium2 as pdfium
+import pytesseract
 from pathlib import Path
+from PIL import Image
 
 from bot import archive as archive_module
-from bot.archive import DriveFile, parse_folder_page, parse_shown_date, refresh_map, sync_archive
+from bot import extract
+from bot.archive import DriveArchive, DriveFile, parse_folder_page, parse_shown_date, refresh_map, sync_archive
 from bot.classify import SPLIT, classify_document, scope_from_caption
 from bot.extract import _clean_ocr, extract_text, old_word_supported, title_from_filename
 from bot.places import CONIFER, DECIDUOUS, FOREST_SCOPE, Forest, Scope
@@ -38,10 +42,65 @@ def test_google_docs_document_in_public_folder_is_exported_as_text():
 <div class="flip-entry" id="entry-gdoc1" tabindex="0" role="link"><div class="flip-entry-info">
 <a href="https://docs.google.com/document/d/gdoc1/edit?usp=drive_web"><div class="flip-entry-title">Нові правила</div></a>
 </div><div class="flip-entry-last-modified"><div>Oct 20</div></div></div>
+<div class="flip-entry" id="entry-gdoc2" tabindex="0" role="link"><div class="flip-entry-info">
+<a href="https://docs.google.com/document/d/gdoc2/edit?usp=drive_web"><div class="flip-entry-title">Внески від 01.11</div></a>
+</div><div class="flip-entry-last-modified"><div>Oct 20</div></div></div>
 """
     files = {f.id: f for f in parse_folder_page(page, NOW)}
     assert files["gdoc1"].name == "Нові правила.txt" and files["gdoc1"].export_mime == "text/plain"
     assert files["abc123"].export_mime is None
+    # A date in the title is not an extension: as a ".11" file the sync would skip the document.
+    assert files["gdoc2"].name == "Внески від 01.11.txt"
+    assert title_from_filename(files["gdoc2"].name) == "Внески від 01.11"
+
+
+class DriveResponse:
+    """What aiohttp's session.get() gives the archive: a status check and the body as JSON or bytes."""
+
+    def __init__(self, payload: dict):
+        self.payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *error):
+        return None
+
+    def raise_for_status(self):
+        pass
+
+    async def json(self):
+        return self.payload
+
+    async def read(self):
+        return "Порада для всього лісу.".encode("utf-8")
+
+
+class FakeDriveSession:
+    """Answers every request alike, with one Drive API listing, and records what was sent."""
+
+    def __init__(self, payload: dict):
+        self.payload, self.requests = payload, []
+
+    def get(self, url, params=None, headers=None):
+        self.requests.append((url, params, headers))
+        return DriveResponse(self.payload)
+
+
+async def test_drive_api_key_is_sent_in_a_header():
+    # A failed request's error shows its URL, and the log with it: the key must not be in the URL.
+    session = FakeDriveSession({"files": [{
+        "id": "gdoc1", "name": "Порада. Осінь", "mimeType": "application/vnd.google-apps.document",
+        "modifiedTime": "2026-10-20T09:30:00.000Z",
+    }]})
+    archive = DriveArchive("folder", "k", "ukr")
+    [file] = await archive.list_files(session)
+    assert file.name == "Порада. Осінь.txt" and file.export_mime == "text/plain"
+    await archive.download(session, file)
+    await archive.download(session, DriveFile(id="pdf1", name="Карта лісу.pdf", marker="m", modified=NOW))
+    assert not [params for _, params, _ in session.requests if params and "key" in params]
+    # The key goes only to the Drive API; the public download host never received it.
+    assert [headers for _, _, headers in session.requests] == [{"X-Goog-Api-Key": "k"}, {"X-Goog-Api-Key": "k"}, None]
 
 
 def test_shown_dates():
@@ -237,18 +296,81 @@ async def test_title_with_two_places_is_not_decided_by_the_title(forest):
     assert llm.prompts == []
 
 
-def test_long_scan_is_refused_instead_of_cut(monkeypatch):
-    import pypdfium2 as pdfium
-    from bot import extract
-
+def blank_pdf(pages: int) -> bytes:
+    """A PDF whose pages have no text, as a scan without a text layer."""
     pdf = pdfium.PdfDocument.new()
-    for _ in range(extract.MAX_OCR_PAGES + 1):
+    for _ in range(pages):
         pdf.new_page(200, 200)
     data = io.BytesIO()
     pdf.save(data)
+    return data.getvalue()
+
+
+def test_long_scan_is_refused_instead_of_cut(monkeypatch):
     monkeypatch.setattr(extract, "_ocr_page", lambda page, langs: pytest.fail("no page is read before the check"))
     with pytest.raises(extract.TooManyScannedPages):
-        extract_text(data.getvalue(), "scan.pdf")
+        extract_text(blank_pdf(extract.MAX_OCR_PAGES + 1), "scan.pdf")
+
+
+def test_pdf_is_read_inside_the_pdfium_lock(monkeypatch):
+    # Two PDFs read by two threads at once crash the process, PDFs with a text layer as much as scans, so a PDF
+    # is opened, read, OCR'd and closed under the lock.
+    scan, opening = blank_pdf(1), pdfium.PdfDocument
+
+    def opened(*args, **kwargs):
+        if not extract.PDFIUM.locked():
+            pytest.fail("PDF opened outside the lock")
+        return opening(*args, **kwargs)
+
+    def ocr_page(page, langs):
+        if not extract.PDFIUM.locked():
+            pytest.fail("page read outside the lock")
+        return "Рижики ростуть під ялиною."
+
+    monkeypatch.setattr(pdfium, "PdfDocument", opened)
+    monkeypatch.setattr(extract, "_ocr_page", ocr_page)
+    assert extract_text(scan, "scan.pdf") == "Рижики ростуть під ялиною."
+    monkeypatch.setattr(extract, "MIN_PAGE_TEXT", 0)  # the page now counts as text: no OCR, only the text layer
+    assert extract_text(scan, "text.pdf") == ""
+    assert not extract.PDFIUM.locked()
+
+
+def test_scan_page_that_tesseract_cannot_finish_fails_the_whole_file(monkeypatch):
+    def timeout(image, **options):
+        raise RuntimeError("Tesseract process timeout")  # what pytesseract raises when `timeout` runs out
+
+    monkeypatch.setattr(pytesseract, "image_to_string", timeout)
+    with pytest.raises(extract.UnreadableScan):
+        extract_text(blank_pdf(1), "scan.pdf")
+    assert not extract.PDFIUM.locked()
+
+
+class FakePage:
+    """A PDF page of a given size in points; it records the render scale and renders as a small white image."""
+
+    def __init__(self, size: tuple[float, float]):
+        self.size, self.scales = size, []
+
+    def get_size(self):
+        return self.size
+
+    def render(self, scale):
+        self.scales.append(scale)
+        return self
+
+    def to_pil(self):
+        return Image.new("RGB", (40, 40), "white")
+
+
+def test_ocr_of_a_page_is_bounded_in_size_and_time(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pytesseract, "image_to_string", lambda image, **options: calls.append(options) or "")
+    poster = FakePage((2384, 3370))  # an A0 page at 300 dpi would be 9933 x 14042 pixels
+    extract._ocr_page(poster, "ukr")
+    assert poster.scales[0] <= 5000 / 3370 and calls[0]["timeout"] == 120
+    a4 = FakePage((595, 842))
+    extract._ocr_page(a4, "ukr")
+    assert a4.scales == [300 / 72]
 
 
 async def test_whole_forest_greeting_is_the_addressee(forest):

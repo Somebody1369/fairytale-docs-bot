@@ -7,14 +7,13 @@ The first one is the customer's own example. Every answer must mention the expec
 """
 
 import asyncio
-import os
 import sys
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from .answering import Answerer
 from .archive import refresh_map
-from .config import DEFAULT_GROQ_MODELS
+from .config import load_settings
 from .llm import LLM
 from .places import Forest
 from .storage import Store
@@ -43,13 +42,13 @@ CHECKS = [
 
 
 async def main() -> int:
-    store = Store(os.getenv("DB_PATH", "data/bot.db"))
+    settings = load_settings()  # read as the bot reads them, see bot.ask
+    store = Store(settings.db_path)
     forest = Forest()
     refresh_map(store, forest)
-    models = (os.getenv("GROQ_MODELS") or DEFAULT_GROQ_MODELS).split(",")
-    llm = LLM(os.environ["GROQ_API_KEY"], models)
+    llm = LLM(settings.groq_api_key, settings.groq_models)
     await llm.check_models()
-    answerer = Answerer(store, forest, llm, ZoneInfo(os.getenv("TZ_NAME") or "Europe/Kyiv"))
+    answerer = Answerer(store, forest, llm, ZoneInfo(settings.timezone))
     failed = 0
     for question, expected in CHECKS:
         reply = await answerer.ask(question, datetime.now(timezone.utc))
