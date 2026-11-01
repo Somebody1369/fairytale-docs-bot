@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"  # as in the Dockerfile
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install antiword, so the old Word .doc test runs too
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends antiword
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: python -m pytest
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t fairytale-docs-bot .
+      - name: The bot imports, and Tesseract reads Ukrainian
+        run: docker run --rm fairytale-docs-bot sh -c "python -c 'import bot.__main__' && tesseract --list-langs | grep -x ukr"

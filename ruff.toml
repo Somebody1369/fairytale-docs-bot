@@ -1,0 +1,8 @@
+# `ruff check` in CI: pyflakes, pycodestyle and bugbear. Regexes and Ukrainian texts run past 120 characters,
+# and short lambdas name the document filters, so these two rules are off.
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E501", "E731"]

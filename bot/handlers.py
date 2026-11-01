@@ -42,9 +42,12 @@ class App:
     tz: ZoneInfo
     locks: defaultdict = field(default_factory=lambda: defaultdict(asyncio.Lock))
     archive_ready: asyncio.Event | None = None  # set once the archive is read; None means ready
-    # Questions each chat waits for while every model is busy, asked again in the background. The tasks
-    # are kept here so they are not garbage-collected half way.
-    later: defaultdict = field(default_factory=lambda: defaultdict(set))
+    # Questions each chat waits for while every model is busy, asked again in the background: task -> question.
+    # A task leaves once its answer goes out, so /cancel names and stops only the questions still waiting.
+    later: defaultdict = field(default_factory=lambda: defaultdict(dict))
+    background: set = field(default_factory=set)  # those tasks till they end, so none is garbage-collected half way
+    # Questions the model is answering right now in each chat, so /cancel can say they are dropped too.
+    asking: defaultdict = field(default_factory=lambda: defaultdict(list))
 
 
 BIG_PDF_BYTES = 1024 * 1024  # a scan this big takes a while to read, so the sender is told
@@ -262,9 +265,9 @@ def place_button(forest: Forest, data: str) -> tuple[str | None, Scope | None]:
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext, app: App) -> None:
-    dropped = await drop_dialog(message, state)
+    dropped = await drop_dialog(message, state, app)
     if dropped:
-        await message.answer(texts.CANCELLED_DOCS.format(titles=dropped))
+        await message.answer(dropped)
     await message.answer(texts.START_INVITES if app.settings.invites_only else texts.START)
 
 
@@ -274,18 +277,27 @@ async def help_command(message: Message, app: App) -> None:
 
 
 @router.message(Command("cancel"))
-async def cancel(message: Message, state: FSMContext) -> None:
-    dropped = await drop_dialog(message, state)
-    await message.answer(texts.CANCELLED_DOCS.format(titles=dropped) if dropped else texts.CANCELLED)
+async def cancel(message: Message, state: FSMContext, app: App) -> None:
+    await message.answer(await drop_dialog(message, state, app) or texts.CANCELLED)
 
 
-async def drop_dialog(message: Message, state: FSMContext) -> str:
-    """/cancel and /start: forget waiting documents and questions, and say which documents were dropped.
-    A new epoch tells a document still being read or placed by the model to stop: it was dropped too."""
+async def drop_dialog(message: Message, state: FSMContext, app: App) -> str:
+    """/cancel and /start: forget waiting documents and questions, those promised an answer later too, and
+    say which were dropped ("" when none). A new epoch tells a document still being read or placed by the
+    model, or a question the model still answers, to stop: it was dropped too."""
+    later = app.later.pop(message.chat.id, {})
+    for task in later:
+        task.cancel()
+    asking = app.asking.pop(message.chat.id, [])
     data = await state.get_data()
     await state.clear()
     await state.update_data(saved=data.get("saved", {}), epoch=data.get("epoch", 0) + 1)
-    return ", ".join(f'"{pending["title"]}"' for pending in data.get("queue", []))
+    titles = ", ".join(f'"{pending["title"]}"' for pending in data.get("queue", []))
+    dropped = texts.CANCELLED_DOCS.format(titles=titles) if titles else ""
+    if later or asking:
+        questions = ", ".join(f'"{short_question(question)}"' for question in [*later.values(), *asking])
+        dropped = f"{dropped or texts.CANCELLED} {texts.CANCELLED_QUESTIONS.format(questions=questions)}"
+    return dropped
 
 
 @router.message(Command("name"))
@@ -752,33 +764,49 @@ async def answer_question(message: Message, state: FSMContext, app: App, bot: Bo
                           mitten: str | None = None, keep_state: bool = False) -> None:
     """`keep_state`: a document is waiting for a name or a place, so a question that needs the mitten
     is asked to name it in the text instead of switching the dialog to mitten buttons."""
-    async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-        if app.archive_ready and not app.archive_ready.is_set():
-            await message.answer(texts.ARCHIVE_LOADING)
-            await app.archive_ready.wait()
-        reply = await app.answerer.ask(text, now_utc(), mitten=mitten)
+    epoch = (await state.get_data()).get("epoch", 0)
+    asking = app.asking[message.chat.id]
+    asking.append(text)
+    try:
+        async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
+            if app.archive_ready and not app.archive_ready.is_set():
+                await message.answer(texts.ARCHIVE_LOADING)
+                await app.archive_ready.wait()
+            reply = await app.answerer.ask(text, now_utc(), mitten=mitten)
+    finally:
+        asking.remove(text)
+    if (await state.get_data()).get("epoch", 0) != epoch:
+        return  # /cancel or /start while the model answered: the question is dropped
     if reply.kind == "unavailable":
-        await answer_later(message, state, app, text, mitten)
+        await answer_later(message, state, app, text, mitten, epoch)
     else:
-        await deliver(message, state, app, text, reply, keep_state)
+        await deliver(message, state, app, text, reply, keep_state, epoch=epoch)
 
 
 async def deliver(message: Message, state: FSMContext, app: App, question: str, reply: Reply,
-                  keep_state: bool = False, lead: str = "") -> None:
+                  keep_state: bool = False, lead: str = "", epoch: int | None = None) -> None:
     """Send the answer, or the mitten buttons when the answer depends on the mitten.
-    `lead`: an answer given later starts with the question it answers (see later_lead)."""
+    `lead`: an answer given later starts with the question it answers (see later_lead).
+    `epoch`: the dialog's epoch when the question came; a /cancel since then drops it."""
     if reply.kind == "need_place":
         # The answer took a few seconds, or minutes when it came later: a document may have come meanwhile
         # and now waits for a name or a place, and typed words go to it. Then the question is asked again
-        # with its mitten.
-        async with app.locks[message.chat.id]:
-            busy = keep_state or await state.get_state() in DOCUMENT_STATES
-            if not busy:
-                key = uuid.uuid4().hex[:8]
-                questions = dict(list((await state.get_data()).get("questions", {}).items())[-9:]) | {key: question}
-                await state.set_state(Flow.waiting_question_place)
-                await state.update_data(question=question, question_id=key, questions=questions,
-                                        question_at=now_utc().isoformat())
+        # with its mitten. While a document holds the lock the question is still unanswered, so /cancel names it.
+        asking = app.asking[message.chat.id]
+        asking.append(question)
+        try:
+            async with app.locks[message.chat.id]:
+                if epoch is not None and (await state.get_data()).get("epoch", 0) != epoch:
+                    return  # /cancel or /start while a document held the lock: the question is dropped
+                busy = keep_state or await state.get_state() in DOCUMENT_STATES
+                if not busy:
+                    key = uuid.uuid4().hex[:8]
+                    questions = dict(list((await state.get_data()).get("questions", {}).items())[-9:]) | {key: question}
+                    await state.set_state(Flow.waiting_question_place)
+                    await state.update_data(question=question, question_id=key, questions=questions,
+                                            question_at=now_utc().isoformat())
+        finally:
+            asking.remove(question)
         if busy:
             await message.answer(lead + texts.ASK_PLACE_IN_TEXT)  # the callers then remind about the document
         else:
@@ -789,18 +817,23 @@ async def deliver(message: Message, state: FSMContext, app: App, question: str, 
     await message.answer(lead + reply.text)
 
 
-def later_lead(question: str, mitten: str | None, limit: int = 200) -> str:
-    """The start of a message sent later: other messages may have come in between, so it names its question
-    (and the mitten chosen with a button). A long question is cut, so the answer still fits one message."""
+def short_question(question: str, limit: int = 200) -> str:
+    """The question as the bot quotes it back: on one line, and cut when long, so the message still fits."""
     question = " ".join(question.split())
-    if len(question) > limit:
-        question = question[:limit].rstrip() + "…"
+    return question[:limit].rstrip() + "…" if len(question) > limit else question
+
+
+def later_lead(question: str, mitten: str | None) -> str:
+    """The start of a message sent later: other messages may have come in between, so it names its question
+    (and the mitten chosen with a button)."""
+    question = short_question(question)
     if mitten:
         return texts.ANSWER_LATER_LEAD_MITTEN.format(question=question, mitten=mitten)
     return texts.ANSWER_LATER_LEAD.format(question=question)
 
 
-async def answer_later(message: Message, state: FSMContext, app: App, question: str, mitten: str | None) -> None:
+async def answer_later(message: Message, state: FSMContext, app: App, question: str, mitten: str | None,
+                       epoch: int) -> None:
     """No model answered in time, as all rest after their rate limits: promise the answer and ask again
     in the background."""
     waiting = app.later[message.chat.id]
@@ -809,13 +842,16 @@ async def answer_later(message: Message, state: FSMContext, app: App, question: 
         return
     # The task counts before the first await: questions forwarded together are handled at once and would
     # all pass the check above. It pauses before it asks, so the promise still comes first.
-    task = asyncio.create_task(ask_later(message, state, app, question, mitten))
-    waiting.add(task)
-    task.add_done_callback(waiting.discard)
+    task = asyncio.create_task(ask_later(message, state, app, question, mitten, epoch))
+    waiting[task] = question
+    task.add_done_callback(lambda done: waiting.pop(done, None))
+    app.background.add(task)
+    task.add_done_callback(app.background.discard)
     await message.answer(texts.ANSWER_LATER)
 
 
-async def ask_later(message: Message, state: FSMContext, app: App, question: str, mitten: str | None) -> None:
+async def ask_later(message: Message, state: FSMContext, app: App, question: str, mitten: str | None,
+                    epoch: int) -> None:
     """Ask again after each pause. The first reply is delivered as it would have been at once, and then the
     bot's last word is again about what still waits for a typed answer. The router's error handler does not
     see this task, so it logs its own errors and still tells the animal."""
@@ -825,9 +861,12 @@ async def ask_later(message: Message, state: FSMContext, app: App, question: str
             await asyncio.sleep(pause)
             reply = await app.answerer.ask(question, now_utc(), mitten=mitten)
             if reply.kind != "unavailable":
-                await deliver(message, state, app, question, reply, lead=lead)
+                # Answered: a /cancel from now on no longer says the bot will not answer it.
+                app.later.get(message.chat.id, {}).pop(asyncio.current_task(), None)
+                await deliver(message, state, app, question, reply, lead=lead, epoch=epoch)
                 break
         else:
+            app.later.get(message.chat.id, {}).pop(asyncio.current_task(), None)
             log.warning("No model was free for a question of chat %s in %s s", message.chat.id, sum(LATER_PAUSES))
             await message.answer(lead + texts.ANSWER_LATER_FAILED)
         await remind_document(message, state, app)

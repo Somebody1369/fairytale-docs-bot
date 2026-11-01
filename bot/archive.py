@@ -197,16 +197,22 @@ async def sync_archive(store: Store, forest: Forest, archive: DriveArchive) -> S
 
         report.removed = store.mark_missing_archive_files({f.id for f in files})
     store.recompute_archive_status()
-    refresh_map(store, forest)
+    if refresh_map(store, forest):
+        log.info("Forest map changed: %s", map_summary(forest))
     return report
 
 
-def refresh_map(store: Store, forest: Forest) -> None:
+def refresh_map(store: Store, forest: Forest) -> bool:
+    """Re-read "Карта лісу" from the saved archive; whether the map the bot uses changed."""
     for doc in store.active_documents():
         if doc.from_archive and doc.norm_title == norm_title("Карта лісу"):
-            if forest.update_from_map(doc.text):
-                log.info("Forest map loaded: %s", {m: sorted(p) for m, p in forest.mitten_parts.items()})
-            return
+            before = list(forest.mitten_parts.items())  # in order: mitten buttons go by position
+            return forest.update_from_map(doc.text) and list(forest.mitten_parts.items()) != before
+    return False
+
+
+def map_summary(forest: Forest) -> dict[str, list[str]]:
+    return {mitten: sorted(parts) for mitten, parts in forest.mitten_parts.items()}
 
 
 async def run_periodic_sync(store: Store, forest: Forest, archive: DriveArchive, minutes: int) -> None:

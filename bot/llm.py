@@ -135,7 +135,7 @@ class LLM:
                                       response.usage.prompt_tokens, response.usage.completion_tokens)
                         return parse_json(response.choices[0].message.content or "")
                     except TimeoutError:
-                        raise LLMUnavailable(f"no reply before the deadline ({last_error or 'slow replies'})")
+                        raise LLMUnavailable(f"no reply before the deadline ({last_error or 'slow replies'})") from None
                     except groq.RateLimitError as error:
                         last_error = error
                         too_large = TOO_LARGE.search(str(error))

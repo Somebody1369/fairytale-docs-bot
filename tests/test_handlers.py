@@ -824,12 +824,12 @@ def no_pauses(monkeypatch):
 
 async def answered_later(dispatcher):
     """Wait for the questions the bot promised to answer once a model is free."""
-    await asyncio.gather(*[task for tasks in dispatcher["app"].later.values() for task in tasks])
+    await asyncio.gather(*dispatcher["app"].background)
 
 
 async def stop_waiting(dispatcher):
     """Cancel the questions still waiting for a free model, as at the end of a test that keeps it busy."""
-    tasks = [task for waiting in dispatcher["app"].later.values() for task in waiting]
+    tasks = list(dispatcher["app"].background)
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -955,3 +955,191 @@ async def test_error_while_answering_later_still_gets_a_polite_reply(setup, no_p
     await answered_later(dispatcher)  # the task logs and swallows its error
     assert telegram.sent[-1].text == 'На Ваше питання "скільки внесок під дубом?":\n\n' + texts.SOMETHING_WRONG
     assert "later failed" in caplog.text
+
+
+async def test_cancel_stops_a_question_waiting_for_a_free_model(setup, monkeypatch):
+    # The animal no longer waits for the answer promised later: /cancel stops it and names the question.
+    dispatcher, bot, telegram, llm, _ = setup
+    monkeypatch.setattr(handlers, "LATER_PAUSES", (3600,))
+    llm.answers.append(LLMUnavailable("busy"))
+    await dispatcher.feed_update(bot, message(text="скільки внесок\nпід дубом?"))
+    waiting = list(dispatcher["app"].background)
+    await dispatcher.feed_update(bot, message(text="/cancel"))
+    assert telegram.sent[-1].text == (
+        f"{texts.CANCELLED} " + texts.CANCELLED_QUESTIONS.format(questions='"скільки внесок під дубом?"'))
+    await asyncio.gather(*waiting, return_exceptions=True)
+    assert all(task.cancelled() for task in waiting) and not dispatcher["app"].later[USER.id]
+
+
+async def test_start_drops_the_waiting_document_and_question_together(setup, monkeypatch):
+    dispatcher, bot, telegram, llm, store = setup
+    monkeypatch.setattr(handlers, "LATER_PAUSES", (3600,))
+    await send_unclear_document(dispatcher, bot, telegram, llm, store)
+    llm.answers.append(LLMUnavailable("busy"))
+    await dispatcher.feed_update(bot, message(text="скільки внесок під дубом?"))
+    waiting = list(dispatcher["app"].background)
+    await dispatcher.feed_update(bot, message(text="/start"))
+    assert telegram.sent[-2].text == (texts.CANCELLED_DOCS.format(titles='"Report"') + " "
+                                      + texts.CANCELLED_QUESTIONS.format(questions='"скільки внесок під дубом?"'))
+    await asyncio.gather(*waiting, return_exceptions=True)
+    assert all(task.cancelled() for task in waiting) and store.documents_of(USER.id) == []
+
+
+@pytest.mark.parametrize("busy", [False, True])
+async def test_question_cancelled_while_the_model_answers_gets_nothing_after(setup, busy):
+    # /cancel answers at once and names the question; the answer that comes after it, or the promise to
+    # answer later, is not sent.
+    from bot.answering import Reply
+    dispatcher, bot, telegram, _, _ = setup
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def ask(question, now, mitten=None):
+        started.set()
+        await release.wait()
+        return Reply("unavailable") if busy else Reply("answer", "4 жолуді на місяць.")
+
+    dispatcher["app"].answerer.ask = ask
+    asking = asyncio.create_task(dispatcher.feed_update(bot, message(text="скільки внесок під дубом?")))
+    await started.wait()
+    await dispatcher.feed_update(bot, message(text="/cancel"))
+    release.set()
+    await asking
+    assert telegram.sent[-1].text == (
+        f"{texts.CANCELLED} " + texts.CANCELLED_QUESTIONS.format(questions='"скільки внесок під дубом?"'))
+    assert not dispatcher["app"].later[USER.id] and not dispatcher["app"].asking[USER.id]
+
+
+async def test_cancel_names_the_question_being_answered_and_the_one_waiting(setup, monkeypatch):
+    from bot.answering import Reply
+    dispatcher, bot, telegram, _, _ = setup
+    monkeypatch.setattr(handlers, "LATER_PAUSES", (3600,))
+    started, release = asyncio.Event(), asyncio.Event()
+    replies = [Reply("unavailable")]
+
+    async def ask(question, now, mitten=None):
+        if replies:
+            return replies.pop(0)
+        started.set()
+        await release.wait()
+        return Reply("answer", "3 шишки на місяць.")
+
+    dispatcher["app"].answerer.ask = ask
+    await dispatcher.feed_update(bot, message(text="скільки внесок під дубом?"))
+    waiting = list(dispatcher["app"].background)
+    asking = asyncio.create_task(dispatcher.feed_update(bot, message(text="скільки внесок у соснах?")))
+    await started.wait()
+    await dispatcher.feed_update(bot, message(text="/cancel"))
+    release.set()
+    await asking
+    await asyncio.gather(*waiting, return_exceptions=True)
+    assert telegram.sent[-1].text == f"{texts.CANCELLED} " + texts.CANCELLED_QUESTIONS.format(
+        questions='"скільки внесок під дубом?", "скільки внесок у соснах?"')
+
+
+class WatchedLock(asyncio.Lock):
+    """A chat lock that tells when someone has to wait for it."""
+
+    def __init__(self):
+        super().__init__()
+        self.waited = asyncio.Event()
+
+    async def acquire(self):
+        if self.locked():
+            self.waited.set()
+        return await super().acquire()
+
+
+async def test_mitten_question_waiting_for_a_document_is_dropped_at_cancel(setup):
+    # The model wants the mitten while a document is still being placed and holds the chat's lock; /cancel
+    # comes meanwhile and names the question, no mitten buttons follow it and the dialog stays cleared.
+    from bot.answering import Reply
+    dispatcher, bot, telegram, llm, store = setup
+    store.set_user_name(USER.id, "Їжак", datetime.now(timezone.utc))
+    lock = dispatcher["app"].locks[USER.id] = WatchedLock()
+    placing, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_json(system, user, **kwargs):
+        placing.set()
+        await release.wait()
+        return {"kind": "unclear", "value": ""}
+
+    async def ask(question, now, mitten=None):
+        return Reply("need_place")
+
+    llm.json = slow_json
+    dispatcher["app"].answerer.ask = ask
+    telegram.file_bytes = "Білі гриби шукайте під дубом після дощу.".encode()
+    sending = asyncio.create_task(dispatcher.feed_update(bot, document_update("Report.txt", "c4")))
+    await placing.wait()
+    question = asyncio.create_task(dispatcher.feed_update(bot, message(text="скільки внесок?")))
+    await lock.waited.wait()  # the model has answered, and the question waits for the document's lock
+    assert not question.done()
+    await dispatcher.feed_update(bot, message(text="/cancel"))
+    release.set()
+    await asyncio.gather(sending, question)
+    assert telegram.sent[-1].text == (texts.CANCELLED_DOCS.format(titles='"Report"') + " "
+                                      + texts.CANCELLED_QUESTIONS.format(questions='"скільки внесок?"'))
+    assert await flow_state(dispatcher, bot) is None and not dispatcher["app"].asking[USER.id]
+
+
+async def test_question_promised_later_waiting_for_a_document_is_named_at_cancel(setup, monkeypatch):
+    # The same, when the mitten is asked in the answer that comes later.
+    from bot.answering import Reply
+    dispatcher, bot, telegram, llm, store = setup
+    monkeypatch.setattr(handlers, "LATER_PAUSES", (0,))
+    store.set_user_name(USER.id, "Їжак", datetime.now(timezone.utc))
+    lock = dispatcher["app"].locks[USER.id] = WatchedLock()
+    placing, release = asyncio.Event(), asyncio.Event()
+    replies = [Reply("unavailable"), Reply("need_place")]
+
+    async def slow_json(system, user, **kwargs):
+        placing.set()
+        await release.wait()
+        return {"kind": "unclear", "value": ""}
+
+    async def ask(question, now, mitten=None):
+        return replies.pop(0)
+
+    llm.json = slow_json
+    dispatcher["app"].answerer.ask = ask
+    telegram.file_bytes = "Білі гриби шукайте під дубом після дощу.".encode()
+    sending = asyncio.create_task(dispatcher.feed_update(bot, document_update("Report.txt", "c5")))
+    await placing.wait()
+    await dispatcher.feed_update(bot, message(text="скільки внесок?"))
+    assert telegram.sent[-1].text == texts.ANSWER_LATER
+    waiting = list(dispatcher["app"].background)
+    await lock.waited.wait()  # the answer given later waits for the document's lock
+    await dispatcher.feed_update(bot, message(text="/cancel"))
+    release.set()
+    await asyncio.gather(sending, *waiting)
+    assert telegram.sent[-1].text == (texts.CANCELLED_DOCS.format(titles='"Report"') + " "
+                                      + texts.CANCELLED_QUESTIONS.format(questions='"скільки внесок?"'))
+    assert await flow_state(dispatcher, bot) is None
+
+
+async def test_cancel_right_after_a_late_answer_does_not_take_it_back(setup, monkeypatch):
+    # The late answer is out and the bot is reminding about the waiting document when /cancel comes: the
+    # reply names the document, not the question just answered.
+    dispatcher, bot, telegram, llm, store = setup
+    monkeypatch.setattr(handlers, "LATER_PAUSES", (0,))
+    await send_unclear_document(dispatcher, bot, telegram, llm, store)
+    make_request = telegram.make_request
+    reminding, go = asyncio.Event(), asyncio.Event()
+
+    async def slow(bot_, method, timeout=None):
+        if "А для документа" in (getattr(method, "text", "") or "") and not reminding.is_set():
+            reminding.set()
+            await go.wait()
+        return await make_request(bot_, method, timeout)
+
+    llm.answers += [LLMUnavailable("busy"), {"found": True, "answer": "4 жолуді на місяць.", "sources": [1]}]
+    await dispatcher.feed_update(bot, message(text="Скільки внесок під дубом?"))
+    monkeypatch.setattr(telegram, "make_request", slow)
+    waiting = list(dispatcher["app"].background)
+    await reminding.wait()
+    await dispatcher.feed_update(bot, message(text="/cancel"))
+    go.set()
+    await asyncio.gather(*waiting, return_exceptions=True)
+    sent = [sent.text for sent in telegram.sent]
+    assert any(text.startswith('На Ваше питання "Скільки внесок під дубом?":\n\n4 жолуді') for text in sent)
+    assert texts.CANCELLED_DOCS.format(titles='"Report"') in sent and not any("вже не відповім" in text for text in sent)

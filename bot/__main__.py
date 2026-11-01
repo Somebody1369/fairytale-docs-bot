@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BotCommand, FSInputFile, InputProfilePhotoStatic
 
 from .answering import Answerer
-from .archive import DriveArchive, refresh_map, run_periodic_sync, sync_archive
+from .archive import DriveArchive, map_summary, refresh_map, run_periodic_sync, sync_archive
 from .config import load_settings
 from .fsm import SQLiteStorage
 from . import texts
@@ -85,6 +85,7 @@ async def main() -> None:
             await set_avatar(bot, store)
         forest = Forest()
         refresh_map(store, forest)
+        log.info("Forest map: %s", map_summary(forest))
         llm = LLM(settings.groq_api_key, settings.groq_models)
         await llm.check_models()
         archive = DriveArchive(settings.drive_folder_id, settings.google_api_key, settings.ocr_langs)

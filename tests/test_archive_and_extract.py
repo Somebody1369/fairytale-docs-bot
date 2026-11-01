@@ -7,10 +7,10 @@ import docx
 from pathlib import Path
 
 from bot import archive as archive_module
-from bot.archive import DriveFile, parse_folder_page, parse_shown_date, sync_archive
+from bot.archive import DriveFile, parse_folder_page, parse_shown_date, refresh_map, sync_archive
 from bot.classify import SPLIT, classify_document, scope_from_caption
 from bot.extract import _clean_ocr, extract_text, old_word_supported, title_from_filename
-from bot.places import CONIFER, DECIDUOUS, FOREST_SCOPE, Scope
+from bot.places import CONIFER, DECIDUOUS, FOREST_SCOPE, Forest, Scope
 
 from .conftest import FOREST_MAP_TEXT, FakeLLM
 
@@ -95,6 +95,30 @@ async def test_sync_reads_forest_map(store, forest):
     changed = FOREST_MAP_TEXT.replace("Біля мурашника — хвойний ліс.", "Біля мурашника — листяний ліс.")
     await sync_archive(store, forest, FakeArchive({"m": ("Карта лісу.txt", "Oct 13", changed)}))
     assert forest.mitten_parts["Біля мурашника"] == {"deciduous"}
+
+
+async def test_forest_map_is_logged_only_when_it_changes(store, forest, caplog):
+    # The archive is checked every 10 minutes: the same map read again says nothing.
+    caplog.set_level("INFO", logger="bot.archive")
+    archive = FakeArchive({"m": ("Карта лісу.txt", "Oct 13", FOREST_MAP_TEXT)})
+    await sync_archive(store, forest, archive)
+    await sync_archive(store, forest, archive)
+    assert "Forest map" not in caplog.text
+    changed = FOREST_MAP_TEXT.replace("Біля мурашника — хвойний ліс.", "Біля мурашника — листяний ліс.")
+    await sync_archive(store, forest, FakeArchive({"m": ("Карта лісу.txt", "Oct 14", changed)}))
+    await sync_archive(store, forest, FakeArchive({"m": ("Карта лісу.txt", "Oct 14", changed)}))
+    assert caplog.text.count("Forest map changed") == 1 and "'Біля мурашника': ['deciduous']" in caplog.text
+    # After a restart bot/__main__ reads the saved map into a fresh forest, and the first sync finds no change.
+    caplog.clear()
+    restarted = Forest()
+    refresh_map(store, restarted)
+    await sync_archive(store, restarted, FakeArchive({"m": ("Карта лісу.txt", "Oct 14", changed)}))
+    assert "Forest map" not in caplog.text and restarted.mitten_parts["Біля мурашника"] == {"deciduous"}
+    # Only the order changed, but mitten buttons go by position, so that is a change too.
+    first, second = "Під ялиною — хвойний ліс.", "У соснах — хвойний ліс."
+    swapped = changed.replace(first, "@").replace(second, first).replace("@", second)
+    await sync_archive(store, restarted, FakeArchive({"m": ("Карта лісу.txt", "Oct 15", swapped)}))
+    assert caplog.text.count("Forest map changed") == 1 and restarted.mittens[:2] == ["У соснах", "Під ялиною"]
 
 
 def test_txt_in_windows_encoding_and_docx():
