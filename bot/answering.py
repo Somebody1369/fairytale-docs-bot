@@ -4,13 +4,13 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from .llm import LLM, LLMUnavailable
 from .places import PART_NAMES, Forest, Scope, resident_homes, residents_from_statute
 from .search import COMMON_STEMS, STOPWORDS, Hit, Index, expand, looks_like_heading, split_chunks, tokens
-from .storage import Document, Store
+from .storage import Document, Store, norm_title
 from . import texts
 
 log = logging.getLogger(__name__)
@@ -26,17 +26,54 @@ PROMPT_DOC_CHARS = 12000
 LEVEL_LIMIT = {"mitten": 3, "part": 2, "forest": 2}
 LEVEL_CUTOFF = {"mitten": 0.0, "part": 0.3, "forest": 0.3}
 PICK_LIMIT = 4
+# A topic varies by place when some mitten's or forest part's advice on it (the topic in its title) scores at least
+# this share of the
+# whole forest's best: "утеплювати" (the conifer forest says October, the calendar November), but not the hunters'
+# cry, which only the whole forest's memo has ("Біля греблі мисливці!" names where the hunters are).
+PLACE_VARIES = 0.6
 # Seconds an animal waits for an answer at most, rate-limit pauses and slower fallback models included;
 # picking documents by title is a help, not a must, so it gets a short part of them.
 QUESTION_SECONDS = 45
 PICK_SECONDS = 10
+# The pick is only {"ids": [...]}: 47-130 tokens seen, and Groq counts the whole budget against the minute's limit.
+# At least llm.MIN_OUTPUT, so a model whose learned output cap is below that is still skipped instead of being
+# asked for a cut-off reply.
+PICK_TOKENS = 400
 LOCATIVE = {"під", "біля", "коло", "поблизу", "у", "в", "на", "серед", "над", "за", "між"}  # a place at a line's start
 LEVEL_NAMES = {"mitten": "рукавичка", "part": "частина лісу", "forest": "увесь ліс"}
 PICK_ANIMAL_TITLES = 150  # newest animals' documents shown to the model when it picks by title
-# Questions about dates and time need the model to think longer over the calendar.
+# How much of the calendar a question gets. Groq counts the prompt and the reply's budget against the 8000 tokens
+# a minute, and while "коли" brought nearly every question the whole calendar and longer thinking, 10 of 12
+# questions in a row in a live check fell back to weaker models, which answered worse.
+WEEKDAY_STEMS = r"понеділ|вівтор|серед(?:а|и|у|ою|ам|ах)\b|четвер(?:\b|г)|п.?ятниц|субот|неділ|вихідн|будн"
+MONTH_STEMS = r"(?:січ|берез|квіт|трав|черв|лип|серп|верес|жовт|груд)(?:ень|ня|ню|ні|нем)\b|лют(?:ий|ого|ому)\b|листопад"
+SEASON_STEMS = r"зим|весн|\bліт(?:о|а|у|і|ом)\b|[ву]літку|\bлітн|\bв?осін|\bв?осен"
+# Counting from today or by weekdays gets every day of this and next month and longer thinking: "сьогодні",
+# "завтра", "вчора", "зараз", "вже" anywhere in a "чи" question, "можна вже", "вже можна", "вже" before a verb
+# in the past ("толока вже відбулася?"), "чи ще можна", "чи не пізно", "чи скоро", "досі", "скільки днів до",
+# "скільки ще чекати", "скільки (ще) до толоки", "через/за скільки днів" with no "після", "ще буде", "якого
+# (котрого) числа", "дата", "які дати", "до якого часу", "якого (котрого) дня", "тиждень", the weekdays (also
+# "пятниця" with no apostrophe), "наступного місяця", "наступного разу", "минулої осені". Endings and neighbouring words are
+# spelled out where a bare stem would catch others: "серед дубів", "четвертий", "заразитися", "численні",
+# "в тому числі", "дати" (to give), "до якої частини лісу", "що ще можна їсти", "чи ще хтось".
+DATE_WORDS = re.compile(
+    r"сьогодн|завтр|[ву]чора|\bзараз\b|\bдосі\b|\bчи\b[^?]*\b(?:вже|уже)\b"
+    r"|\bчи\s+(?:час|пора|скоро|не\s+пізно|не\s+рано|не\s+запізно|ще\s+(?:можна|не|встиг\w*|час|пора|рано))\b"
+    r"|\b(?:можна|час|пора|пізно|рано|треба)\s+(?:вже|уже)\b"
+    r"|\b(?:вже|уже)\s+(?:(?:можна|час|пора|пізно|рано|треба|скоро)\b|почина|\w+(?:в|ла|ло|ли|ся|сь)\b)"
+    r"|\bскільки\s+(?:ще\s+)?(?:(?:днів|тижнів|місяців|часу|чекати|лишил\w*|залишил\w*)\s+)*до\b"
+    r"|\b(?:ще|довго)\s+чекати\b|\b(?:через|за)\s+скільки\b(?![^?]*\bпісля\b)|\bще\s+буде\b"
+    r"|\bчисл(?:о|а|ом|ах)\b|\bдат(?:а|у|і|ою|ам|ами|ах)?\b|\b(?:як|котр)\w+\s+дати\b"
+    r"|\bдо\s+(?:як|котр)\w*\s+(?:дн|дат|час(?:у|ом)?\b|пор[иуі]\b|термін|місяц|тижн)"
+    r"|\b(?:як|котр)\w*\s+(?:дн[яюі]|день)\b|тижн|тижд|" + WEEKDAY_STEMS
+    + r"|\b(?:наступн|найближч|минул|позаминул)\w*\s+(?:раз|дн|день|тижн|тижд|місяц|рок|рік|сезон|"
+    + "|".join((WEEKDAY_STEMS, MONTH_STEMS, SEASON_STEMS)) + ")")
+# Words that only name a time of year get the first weekdays of last, this and next month: "коли осіння толока?"
+# needs the first Saturday of October to say it already was. Counting days is no date ("через скільки днів після
+# дощу" is a plain fact), nor are the dues "на місяць" and "щомісяця", "терміново" or "літати".
 TIME_WORDS = re.compile(
-    r"коли|дат[аиуі]|числ|день|дня|дні|тижн|тиждень|місяц|сьогодні|завтра|вчора|вже|досі|пор[аиіу]\b|сезон|"
-    r"зим|весн|літ[оа]|осін|осен|понеділ|вівтор|серед[уаи]|четвер|п.ятниц|субот|неділ|годин|термін|до якого")
+    r"\b(?:від|до\s+)?коли\b|\bдоки\b|сезон|\bпор(?:а|и|і|у|ою)\b|\bтермін(?:у|и|ом|ів)?\b"
+    r"|(?<!на\s)(?<!за\s)(?<!що)місяц|\bр(?:ік|оку|оком)\b|" + MONTH_STEMS + "|" + SEASON_STEMS)
 WEEKDAYS = ["понеділок", "вівторок", "середа", "четвер", "пʼятниця", "субота", "неділя"]
 WEEKDAYS_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"]
 MONTHS_NOMINATIVE = ["січень", "лютий", "березень", "квітень", "травень", "червень", "липень", "серпень", "вересень",
@@ -51,12 +88,13 @@ ANSWER_SYSTEM = """Ти бот-помічник звірів лісу. Ти ві
 2. Якщо в документах немає відповіді на питання, поверни "found": false.
 3. Конкретніша порада важливіша за загальну: рівень "рукавичка" важливіший за "частина лісу", а "частина лісу" важливіша за "увесь ліс". Рівень документа написано в рядку "Рівень", і місця, названі в тексті документа, його не змінюють. Якщо в документі для рукавички є хоч щось на тему питання, починай відповідь із нього. Якщо поради суперечать, у "answer" пиши лише конкретнішу, а із загальнішої тільки те, що їй не суперечить. Загальнішу пораду, що радить інакше, не змішуй із відповіддю: коротко перекажи її в полі "other", скажи там, для кого вона і що тут діє конкретніша, і додай її документ у "sources" (наприклад: "Загальна пам'ятка для всього лісу радить збиратися біля бобрової греблі, але для рукавички Під дубом діє конкретніша порада.").
 4. Якщо поради однаково конкретні й написані для того самого місця: документ із Лісового архіву важливіший за документ від звіра. Серед документів архіву, як і серед документів від звірів, важливіший новіший (дата й час у рядку "Звідки"; якщо вони однакові, новіший той, що стоїть у переліку вище). Пораду, що поступилася й радить інакше, коротко перекажи в полі "other", як у правилі 3, і додай її документ у "sources".
-5. Якщо питання про час, пору року, день тижня чи "чи вже можна", враховуй сьогоднішню дату. Дні тижня й дати бери лише з наданого календаря (там уже пораховано, наприклад, яка дата перша субота місяця), не обчислюй їх сам. Порівнюй дату події із сьогоднішньою: якщо вона раніше за сьогодні, пиши в минулому часі, що подія вже була, і не вигадуй дату наступної, якщо її немає в документах.
+5. Якщо питання про час, пору року, день тижня чи "чи вже можна", враховуй сьогоднішню дату. Дні тижня й дати бери лише з наданого календаря (там уже пораховано, наприклад, яка дата перша субота місяця), не обчислюй їх сам. Порівнюй дату події із сьогоднішньою: якщо вона раніше за сьогодні, пиши в минулому часі, що подія вже була, і не вигадуй дату наступної, якщо її немає в документах чи календарі. Про щорічну подію за правилом ("у першу суботу жовтня", "у вересні"), чия дата цього року вже минула, пиши, що цього року вона вже була (з датою з календаря, якщо вона там є), а наступна буде за тим самим правилом наступного року. Про минулу подію ніколи не пиши в майбутньому часі.
 6. Пиши грамотною українською, ввічливо, просто, доброзичливо й по суті, без казковості та без звертань на кшталт "любий звіре". Якщо звертаєшся до звіра, то на "Ви" (з великої літери): "Вам", "здайте", "зверніться". Відповідь коротка (1-5 речень), але переказуй усі пункти документа, що стосуються питання, нічого з них не пропускай: скільки, коли, кому й куди віддавати чи приносити, чим можна замінити, хто звільнений.
 7. Якщо рукавичка належить до кількох частин лісу (як "Під вербою": і листяний ліс, і біля річки), їй підходять поради кожної з цих частин: наведи в "answer" поради всіх її частин лісу, що стосуються питання, навіть якщо вони не суперечать одна одній, і скажи, до якої частини лісу належить кожна. Поради різних частин лісу однієї рукавички одна одній не поступаються, тож жодна з них не йде в "other". Порада самої рукавички, як і завжди, іде першою.
 8. Не згадуй в "answer" та "other" номери й назви документів: джерела бот додасть сам.
 9. Якщо в документі є окремі розділи для різних місць, бери розділ для місця з питання. Але рівень розділу той самий, що й у всього документа (рядок "Рівень"): розділ "Під дубом" у путівнику для всього лісу є порадою рівня "увесь ліс", тож документ для рукавички Під дубом або для її частини лісу важливіший за нього.
-10. Місце в питанні ("під дубом", "біля сосон", "біля верби") означає рукавичку з рядка "Місце з питання", а не саме дерево: відповідай усіма порадами, що підходять цій рукавичці, навіть якщо в них це дерево не згадано.
+10. Місце в питанні ("під дубом", "біля сосон", "біля верби") означає рукавичку з рядка "Місце з питання", а не саме дерево: відповідай усіма порадами, що підходять цій рукавичці, навіть якщо в них це дерево не згадано, а названо інші дерева чи місця ("білі гриби тримаються старих дубів" теж відповідь на "де шукати гриби біля верби").
+11. Якщо в питанні названо рукавичку чи частину лісу, а в рядку "Поради на цю тему різні в різних місцях" стоїть "так", скажи, для якого місця кожна порада ("У хвойному лісі …"), а пораду для всього лісу почни словами "Загальна порада для всього лісу — …". Якщо ж ні для цього місця, ні для його частини лісу поради на тему питання немає й відповідь лише з поради для всього лісу, почни так: "Окремої поради про … для … немає, тож діє загальна порада для всього лісу: …". Якщо там "ні", цих слів не пиши: порада для всього лісу однакова для всіх (усе одно перекажи всі її пункти на тему питання).
 
 Поверни JSON: {"facts": ["кожен пункт документів, з яких відповідаєш, на тему питання, окремим рядком, навіть якщо про нього прямо не питали (на \"скільки внесок\" це й кому та куди віддавати, і чим можна замінити): скільки, коли, кому, куди, чим замінити, хто звільнений; на початку рядка номер документа і його рівень, наприклад [2, частина лісу]"], "found": true або false, "answer": "текст відповіді для місця з питання, у якому є всі ці пункти, крім тих, що пішли в other", "other": "порада, що радить інакше й тут поступається відповіді, з поясненням чому, або \"\"", "sources": [номери документів, з яких узято відповідь, найважливіший перший]}"""
 
@@ -73,7 +111,7 @@ LEVEL_REMINDER = """
 
 PARTS_REMINDER = """
 
-Зверни увагу: рукавичка "{mitten}" належить до кількох частин лісу, і їй підходять поради кожної з них. У відповіді є порада для частини лісу "{cited}", але немає поради для частини "{missing}". Якщо в документі {docs} є щось на тему питання (навіть без дерева, названого в питанні: воно лише вказує на рукавичку), додай це у відповідь, сказавши, що це порада для частини лісу "{missing}", і додай номер документа в "sources"."""
+Зверни увагу: рукавичка "{mitten}" належить до кількох частин лісу, і їй підходять поради кожної з них. У відповіді є порада для частини лісу "{cited}", але немає поради для частини "{missing}". Якщо в документі {docs} є щось на тему питання "{topic}" (навіть без дерева, названого в питанні, чи з іншими деревами: дерево з питання лише вказує на рукавичку), додай у відповідь саме те, що відповідає на цю тему, сказавши, що це порада для частини лісу "{missing}", і додай номер документа в "sources".{quotes}"""
 
 FACTS_REMINDER = """
 
@@ -82,6 +120,11 @@ FACTS_REMINDER = """
 ARCHIVE_REMINDER = """
 
 Зверни увагу: перша порада у відповіді — з документа звіра [{animal}], а документ Лісового архіву {archive} написаний для того самого місця. Якщо в архіві теж є відповідь на питання, за правилом 4 важливіший архів, навіть якщо документ звіра новіший: відповідай за архівом і постав його першим у "sources", а пораду [{animal}], якщо вона радить інакше, перекажи в полі "other". Якщо відповіді в архіві немає, відповідай як раніше."""
+
+# The model, given "Де шукати гриби біля верби?", kept to the willow and skipped the deciduous guide's "Білі гриби
+# тримаються старих дубів" even when reminded of it; quoting the sentences on the topic brought them in.
+QUOTE_NOTE = " На цю тему в документі [{number}] сказано: «{quote}»"
+QUOTE_CHARS = 300
 
 RESIDENT_NOTE = " (місце визначено за звіром {name}, який тут живе; якщо порада однакова для всього лісу, на рукавичці не наголошуй)"
 
@@ -103,30 +146,39 @@ def human_date(moment: datetime, tz: ZoneInfo) -> str:
     return f"{local.day} {MONTHS[local.month - 1]} {local.year}"
 
 
-def calendar_note(moment: datetime, tz: ZoneInfo, full: bool = True) -> str:
-    """Today with its weekday and the days of this and next month, so the model reads
-    "перша субота жовтня" off the calendar instead of counting weekdays itself.
-    Without `full` only today: the month tables cost tokens a question without dates does not need."""
+def calendar_need(question: str) -> str:
+    """How much of the calendar the question needs: "days", "months" or "today" (DATE_WORDS, TIME_WORDS)."""
+    question = question.lower()
+    return "days" if DATE_WORDS.search(question) else "months" if TIME_WORDS.search(question) else "today"
+
+
+def calendar_note(moment: datetime, tz: ZoneInfo, need: str = "days") -> str:
+    """Today with its weekday; for "months" also the first weekdays of last, this and next month, so the model
+    reads "перша субота жовтня" off the calendar instead of counting weekdays itself, and on 1 November sees that
+    it was 3 October; for "days" also every day of this and next month with its weekday."""
     local = moment.astimezone(tz).date()
     lines = [f"Сьогодні: {WEEKDAYS[local.weekday()]}, {local.day} {MONTHS[local.month - 1]} {local.year}."]
-    if not full:
+    if need == "today":
         return lines[0]
-    year, month = local.year, local.month
-    for _ in range(2):
-        first = date(year, month, 1)
-        days = []
-        day = first
-        while day.month == month:
-            days.append(f"{day.day} {WEEKDAYS_SHORT[day.weekday()]}")
-            day += timedelta(days=1)
-        lines.append(f"{MONTHS_NOMINATIVE[month - 1].capitalize()} {year}: " + ", ".join(days))
+    this = local.replace(day=1)
+    last = (this - timedelta(days=1)).replace(day=1)  # in January, December of the year before
+    following = (this + timedelta(days=31)).replace(day=1)
+    for first in (last, this, following):
+        month, label = first.month, f"{MONTHS_NOMINATIVE[first.month - 1]} {first.year}"
+        if need == "days" and first != last:
+            days = []
+            day = first
+            while day.month == month:
+                days.append(f"{day.day} {WEEKDAYS_SHORT[day.weekday()]}")
+                day += timedelta(days=1)
+            lines.append(f"{label.capitalize()}: " + ", ".join(days))
         firsts = []
         for offset in range(7):
             day = first + timedelta(days=offset)
             ordinal = "перша" if day.weekday() in (2, 4, 5, 6) else "перший"
             firsts.append(f"{ordinal} {WEEKDAYS[day.weekday()]} {MONTHS[month - 1]} = {day.day} {MONTHS[month - 1]}")
-        lines.append("Перші дні тижня: " + ", ".join(sorted(firsts, key=lambda line: int(line.split("= ")[1].split()[0]))))
-        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+        # Each line names its month and year, as last month's comes without the list of its days.
+        lines.append(f"Перші дні тижня, {label}: " + ", ".join(firsts))
     return "\n".join(lines)
 
 
@@ -201,10 +253,13 @@ def missing_facts(facts, docs: list[Document], sources: list[Document], text: st
 
 
 def clean_text(value, documents: int) -> str:
-    """The model's text without the document numbers it now and then puts in ("у документі [2]", "[1, рукавичка]");
-    other numbers in brackets ("[2026]") stay."""
+    """The model's text without the document numbers it now and then puts in ("у документі [2]", "[1, рукавичка]")
+    or a bare "(документ)"; other numbers in brackets ("[2026]") stay."""
     text = " ".join(str(part) for part in value) if isinstance(value, list) else str(value or "")
     numbered = lambda match: "" if 1 <= int(match.group(1)) <= documents else match.group(0)
+    # "(документ)", "(у документі [2])", "(з документа «…»)", but not "(у документі сказано: до 10 числа)".
+    text = re.sub(r"\s*\((?:згідно\s+з\s+|див\.\s*|з\s+|із\s+|у\s+|в\s+)?документ\w*"
+                  r"(?:\s*\[[^\]]*\]|\s+\d+|\s*«[^»]{0,80}»|\s*\"[^\"]{0,80}\")?\s*\)", "", text)
     text = re.sub(r"(?:\s+(?:у\s+|в\s+)?документ\w*)?\s*\[(\d+)(?:,[^\]]*)?\]", numbered, text)
     return re.sub(r"\s{2,}", " ", text).strip()
 
@@ -316,6 +371,18 @@ class Answerer:
         picked = await self._pick_by_title(question, candidates, deadline)
         return merge(picked, best_per_level(hits), limit=MAX_DOCS)
 
+    def _varies_by_place(self, question: str) -> bool:
+        """Whether particular places have advice of their own on the topic, as strong as the whole forest's. Then the
+        answer says whose advice is whose, and that the asked place has none of its own ("Окремих порад про утеплення
+        для узлісся немає"); a topic the whole forest shares is answered plainly, as Mishka answered about hunters."""
+        query = self.forest.strip_places(question)
+        topic = expand(set(tokens(query)))
+        best = lambda allowed: max((hit.score for hit in self.index.search(query, allowed, limit=1, cutoff=0)), default=0.0)
+        # A place's own advice on the topic says so in its title ("Як утеплити рукавичку в хвойному лісі"); hunters
+        # only mentioned among a mitten's "Небезпеки поруч із рукавичкою" are no advice of its own on what to do.
+        places = best(lambda doc: doc.scope.kind != "forest" and bool(topic & set(tokens(doc.title))))
+        return places > 0 and places >= PLACE_VARIES * best(lambda doc: doc.scope.kind == "forest")
+
     def _mittens_know(self, question: str, parts: list[str]) -> bool:
         """Whether the advice of the asked part's mittens matches the question, so asking which mitten helps."""
         mittens = set(self.forest.mittens_in(parts))
@@ -342,7 +409,7 @@ class Answerer:
         listing = "\n".join(f"{i}. {self._title_line(doc)}" for i, doc in enumerate(candidates, 1))
         try:
             result = await self.llm.json(PICK_SYSTEM, f"Питання: {question}\n\nДокументи:\n{listing}",
-                                         max_tokens=700, fast=True,
+                                         max_tokens=PICK_TOKENS, fast=True,
                                          deadline=min(deadline, time.monotonic() + PICK_SECONDS))
         except LLMUnavailable:
             return []
@@ -368,18 +435,21 @@ class Answerer:
         docs = sorted(docs, key=lambda d: (-d.scope.level, not d.from_archive, -d.modified_at.timestamp()))
         place = self._place_note(mittens, parts) + (RESIDENT_NOTE.format(name=resident) if resident else "")
         # Thinking longer and the calendar cost Groq tokens (the free tier allows about 8000 a minute),
-        # so only questions about dates and time get them.
-        about_time = bool(TIME_WORDS.search(question.lower()))
-        reasoning, budget = ("medium", 2000) if about_time else ("low", 1500)
+        # so only questions that count dates from today get longer thinking and the days of the months.
+        need = calendar_need(question)
+        reasoning, budget = ("medium", 2000) if need == "days" else ("low", 1500)
         size = self._excerpt_size(docs)
         blocks = [self._doc_block(i, doc, question, mittens, parts, size) for i, doc in enumerate(docs, 1)]
         # "Де шукати гриби біля верби?" is about mushrooms for the mitten, not about willow trees.
         topic = re.sub(r"\s+", " ", self.forest.strip_places(question)).strip(" ?.!,") if mittens or parts else ""
+        # A place found by a resident ("коли Ведмідь лягає спати?") was not asked about: no labels for it.
+        varies = ("так" if self._varies_by_place(question) else "ні") if (mittens or parts) and not resident else ""
         prompt = (
-            f"{calendar_note(now, self.tz, full=about_time)}\n\n"
+            f"{calendar_note(now, self.tz, need)}\n\n"
             f"Питання звіра: {question}\n"
             f"Місце з питання: {place}\n"
             + (f"Тема питання без місця: {topic}\n" if topic else "")
+            + (f"Поради на цю тему різні в різних місцях: {varies}\n" if varies else "")
             + "\nДокументи:\n\n" + "\n\n".join(blocks)
         )
         system = ANSWER_SYSTEM + place_rule
@@ -436,6 +506,12 @@ class Answerer:
             cite = "Джерело: " + source_line(sources[0], self.tz)
         else:
             cite = "Джерела:\n" + "\n".join("- " + source_line(doc, self.tz) for doc in sources)
+        # Mishka: «Окремих порад про утеплення для узлісся немає. Загальна порада для всього лісу — …». Where the
+        # topic differs by place and only the whole forest answers, the bot says so if the model did not.
+        own = self._place_genitive(mittens, parts)
+        if varies == "так" and own and all(doc.scope.kind == "forest" for doc in sources) \
+                and not re.search(r"\bнема|загальн", answer.lower()):
+            answer = texts.NO_OWN_ADVICE.format(place=own) + " " + answer
         # The advice that gives way stands in a paragraph of its own, so it never reads as part of the answer.
         text = f"{answer}\n\n{other[0].upper()}{other[1:]}" if other else answer
         return Reply("answer", f"{text}\n\n{cite}")
@@ -477,7 +553,10 @@ class Answerer:
             reminders.append(PARTS_REMINDER.format(
                 mitten=mittens[0], cited=", ".join(PART_NAMES[p] for p in sorted(cited)),
                 missing=", ".join(PART_NAMES[doc.scope.value] for doc in missing),
-                docs=", ".join(f"[{docs.index(doc) + 1}]" for doc in missing)))
+                docs=", ".join(f"[{docs.index(doc) + 1}]" for doc in missing),
+                topic=re.sub(r"\s+", " ", self.forest.strip_places(question)).strip(" ?.!,"),
+                quotes="".join(QUOTE_NOTE.format(number=docs.index(doc) + 1, quote=quote)
+                               for doc in missing if (quote := self._topic_sentences(doc, question)))))
         faults = len(reminders)
         # The model lists the points of the cited documents in "facts", then now and then drops some of them
         # when it writes the answer ("Кабанові в кошик біля входу" in the customer's own example).
@@ -485,6 +564,37 @@ class Answerer:
         if left_out:
             reminders.append(FACTS_REMINDER.format(facts="; ".join(f'"{fact}"' for fact in left_out)))
         return reminders, faults
+
+    def _topic_sentences(self, doc: Document, question: str) -> str:
+        """The document's sentences on the topic of the question, the ones sharing most words first, up to QUOTE_CHARS
+        and in the document's order: "Білі гриби тримаються старих дубів." for "де шукати гриби біля верби?"."""
+        topic = expand(set(tokens(self.forest.strip_places(question))))
+        lines = []
+        for line in (line.strip() for line in doc.text.splitlines()):
+            if lines and line and not lines[-1].endswith((".", "!", "?", "…", ":", ";")) and line[0].islower():
+                lines[-1] += " " + line  # a PDF line wrapped mid-sentence
+            elif line:
+                lines.append(line)
+        # A sentence counts with its heading and with the question it answers: "Чим? Сухим дубовим листям.",
+        # "Де шукати білі гриби?" over "Білі гриби тримаються старих дубів."; the title line is no heading.
+        scored, heading, asked = [], "", ""
+        for line in lines:
+            if looks_like_heading(line):
+                heading, asked = ("" if norm_title(line) == doc.norm_title else line), ""
+                continue
+            for sentence in re.split(r"(?<=[.!?…])\s+", line):
+                if sentence.endswith("?"):
+                    asked = sentence
+                    continue
+                quote = f"{asked} {sentence}".strip()
+                scored.append((len(topic & set(tokens(f"{heading} {quote}"))), len(scored), quote))
+                asked = ""
+        chosen, used = [], 0
+        for score, i, quote in sorted(scored, key=lambda item: (-item[0], item[1])):
+            if score and used + len(quote) <= QUOTE_CHARS:
+                chosen.append((i, quote))
+                used += len(quote) + 1
+        return " ".join(quote for _, quote in sorted(chosen))
 
     def _missing_parts(self, mittens: list[str], docs: list[Document], sources: list[Document], answer: str,
                        question: str) -> list[Document]:
@@ -515,6 +625,15 @@ class Answerer:
             if isinstance(number, int) and 1 <= number <= len(docs) and docs[number - 1] not in sources:
                 sources.append(docs[number - 1])
         return sources
+
+    @staticmethod
+    def _place_genitive(mittens: list[str], parts: list[str]) -> str | None:
+        """ "для рукавички "На узліссі"", "для хвойного лісу": one place asked, else None."""
+        if len(mittens) == 1:
+            return f'рукавички "{mittens[0]}"'
+        if not mittens and len(parts) == 1:
+            return {"conifer": "хвойного лісу", "deciduous": "листяного лісу", "river": "частини лісу біля річки"}[parts[0]]
+        return None
 
     def _place_note(self, mittens: list[str], parts: list[str]) -> str:
         if mittens:

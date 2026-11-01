@@ -101,11 +101,6 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
-        columns = {row[1] for row in self.db.execute("PRAGMA table_info(members)")}
-        if "invited_by" not in columns:
-            self.db.execute("ALTER TABLE members ADD COLUMN invited_by INTEGER")
-        if "tg_name" not in columns:
-            self.db.execute("ALTER TABLE members ADD COLUMN tg_name TEXT")
         self.revision = 0  # bumped on every change so the search index knows to rebuild
 
     # Users
@@ -155,12 +150,10 @@ class Store:
         return self.db.execute("SELECT 1 FROM members LIMIT 1").fetchone() is not None
 
     def first_invite(self, now: datetime) -> str:
-        """The invite for the very first animal: reuse a still valid unused one, so restarts don't pile them up."""
-        since = (now - timedelta(days=INVITE_DAYS)).isoformat()
+        """The invite for the very first animal: reuse an unused one (they do not expire), so restarts
+        don't pile them up and the link already handed out keeps working."""
         row = self.db.execute(
-            "SELECT token FROM invites WHERE created_by IS NULL AND used_by IS NULL AND created_at > ? "
-            "ORDER BY created_at DESC LIMIT 1",
-            (since,),
+            "SELECT token FROM invites WHERE created_by IS NULL AND used_by IS NULL ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
         return row["token"] if row else self.create_invite(None, now)
 
@@ -205,13 +198,16 @@ class Store:
         return removed
 
     def use_invite(self, token: str, tg_id: int, now: datetime, tg_name: str | None = None) -> bool:
-        """Let the animal in if the invite exists, is unused and not older than INVITE_DAYS."""
+        """Let the animal in if the invite exists and is unused; a member's invite also must not be older
+        than INVITE_DAYS."""
         row = self.db.execute("SELECT * FROM invites WHERE token = ?", (token,)).fetchone()
         if not row or row["used_by"] is not None:
             return False
-        if now - datetime.fromisoformat(row["created_at"]) > timedelta(days=INVITE_DAYS):
-            return False
         creator = row["created_by"]
+        # The operator's invites (the start log, `python -m bot.invite`) never expire: Mishka's, sent on
+        # 29 October (02:35), was said to hold on 30 October (14:43) and would have died on 5 November.
+        if creator is not None and now - datetime.fromisoformat(row["created_at"]) > timedelta(days=INVITE_DAYS):
+            return False
         if creator is not None and (creator == tg_id or not self.is_member(creator)):
             return False  # one's own spare link, or a link from someone whose access was closed
         self.db.execute("UPDATE invites SET used_by = ?, used_at = ? WHERE token = ?", (tg_id, now.isoformat(), token))

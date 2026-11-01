@@ -19,7 +19,7 @@ from aiogram.types import CallbackQuery, ErrorEvent, InlineKeyboardButton, Inlin
 from aiogram.utils.chat_action import ChatActionSender
 
 from . import texts
-from .answering import Answerer, format_date
+from .answering import Answerer, Reply, format_date
 from .classify import SPLIT, WHOLE_FOREST_CAPTION, classify_document, scope_from_caption
 from .config import Settings
 from .extract import (MAX_OCR_PAGES, SUPPORTED_EXTENSIONS, TooManyScannedPages, extension, extract_text,
@@ -42,10 +42,18 @@ class App:
     tz: ZoneInfo
     locks: defaultdict = field(default_factory=lambda: defaultdict(asyncio.Lock))
     archive_ready: asyncio.Event | None = None  # set once the archive is read; None means ready
+    # Questions each chat waits for while every model is busy, asked again in the background. The tasks
+    # are kept here so they are not garbage-collected half way.
+    later: defaultdict = field(default_factory=lambda: defaultdict(set))
 
 
 BIG_PDF_BYTES = 1024 * 1024  # a scan this big takes a while to read, so the sender is told
 FOLLOW_UP_MINUTES = 30
+# When every Groq model rests after its rate limit for longer than a question may take, the bot does not
+# give up: Telegram lets it answer whenever it likes, so it asks again after each of these pauses (seconds),
+# about 10 minutes in all.
+LATER_PAUSES = (30, 60, 90, 120, 150, 150)
+LATER_PER_CHAT = 3  # beyond this many waiting questions the animal is asked to try again itself
 
 
 NAME_PREFIX = re.compile(r"^(?:мене\s+(?:звати|звуть)|моє\s+ім'?я|я\s*[-–:]?|це)\s+", re.IGNORECASE)
@@ -216,18 +224,18 @@ def place_keyboard(forest: Forest, prefix: str) -> InlineKeyboardMarkup:
 
 def doc_place_keyboard(forest: Forest, pending: dict) -> InlineKeyboardMarkup:
     """Buttons for one waiting document: an old keyboard must not file the next document."""
-    return place_keyboard(forest, f"dp:{pending['id']}" if pending.get("id") else "dp")
+    return place_keyboard(forest, f"dp:{pending['id']}")
 
 
 def answered(data: dict) -> dict:
     """FSM data once the waiting question is answered: its buttons then answer nothing more."""
-    done = {data["question_id"]: None} if data.get("question_id") else {}
-    return {"question": None, "question_id": None, "questions": data.get("questions", {}) | done}
+    return {"question": None, "question_id": None,
+            "questions": data.get("questions", {}) | {data["question_id"]: None}}
 
 
 def question_prefix(data: dict) -> str:
     """Mitten buttons for the waiting question only: buttons under an older question must not answer it."""
-    return f"qp:{data['question_id']}" if data.get("question_id") else "qp"
+    return f"qp:{data['question_id']}"
 
 
 def scope_from_callback(forest: Forest, kind: str, value: str) -> Scope | None:
@@ -238,6 +246,16 @@ def scope_from_callback(forest: Forest, kind: str, value: str) -> Scope | None:
     if kind == "f":
         return FOREST_SCOPE
     return None
+
+
+def place_button(forest: Forest, data: str) -> tuple[str | None, Scope | None]:
+    """ "dp:<document>:m:3" or "qp:<question>:m:3" -> (the document or question, the place). The place is
+    None for a mitten no longer on the map, which still belongs to its document or question; a button not
+    made this way belongs to nothing."""
+    fields = data.split(":")
+    if len(fields) != 4:
+        return None, None
+    return fields[1], scope_from_callback(forest, fields[2], fields[3])
 
 
 # Commands
@@ -551,7 +569,8 @@ async def remind_document(message: Message, state: FSMContext, app: App) -> None
     elif current == Flow.waiting_name.state:
         await message.answer(texts.ASK_NAME_STILL if data.get("queue") else texts.ASK_NEW_NAME)  # or /name
     elif data.get("queue") and current not in DOCUMENT_STATES and not app.locks[message.chat.id].locked():
-        # Left by the old code, which could lose the dialog state while a document waited.
+        # The queue is stored before the model places the document, so a restart (or an error) meanwhile
+        # leaves it waiting with nothing asked about it. The lock is held while it is being placed now.
         if app.store.user_name(message.chat.id):
             await state.set_state(Flow.waiting_doc_place)
             await message.answer(texts.DOC_STILL_WAITING.format(title=data["queue"][0]["title"]),
@@ -570,13 +589,8 @@ async def file_pending(message: Message, state: FSMContext, app: App, user_id: i
         title=pending["title"], filename=pending["filename"], scope=scope, author_id=user_id,
         author_name=name, text=pending["text"], now=datetime.fromisoformat(pending["sent_at"]),
     )
-    saved = (await state.get_data()).get("saved", {})
-    if pending.get("id"):
-        saved = dict(list(saved.items())[-19:]) | {pending["id"]: doc.id}
-    # Documents queued by the old code have no ids: give them ids now, so an old keyboard pressed again
-    # cannot file the next one.
-    rest = [{"id": uuid.uuid4().hex[:8], **waiting} if not waiting.get("id") else waiting for waiting in queue[1:]]
-    await state.update_data(queue=rest, saved=saved)
+    saved = dict(list((await state.get_data()).get("saved", {}).items())[-19:]) | {pending["id"]: doc.id}
+    await state.update_data(queue=queue[1:], saved=saved)
     reply = texts.DOC_SAVED.format(name=name, title=doc.title, scope=scope.describe(),
                                    date=format_date(doc.created_at, app.tz))
     if replaced:
@@ -588,17 +602,13 @@ async def file_pending(message: Message, state: FSMContext, app: App, user_id: i
 
 @router.callback_query(F.data.startswith("dp:"))
 async def doc_place_chosen(callback: CallbackQuery, state: FSMContext, app: App) -> None:
-    fields = callback.data.split(":")
-    key = fields[1] if len(fields) == 4 else None  # "dp:<document>:m:3"; buttons sent before ids were "dp:m:3"
-    scope = scope_from_callback(app.forest, fields[-2], fields[-1])
+    key, scope = place_button(app.forest, callback.data)  # "dp:<document>:m:3"
     await callback.answer()
-    if scope is None:
-        return
     await callback.message.edit_reply_markup(reply_markup=None)
     async with app.locks[callback.from_user.id]:
         data = await state.get_data()
         queue = data.get("queue", [])
-        saved = data.get("saved", {}).get(key or "")
+        saved = data.get("saved", {}).get(key)
         if saved:  # a second keyboard for a document already saved: where it is now (after "Змінити місце")
             doc = app.store.get(saved) if isinstance(saved, int) else None
             await callback.message.answer(texts.DOC_ALREADY_SAVED.format(title=doc.title, scope=doc.scope.describe())
@@ -609,15 +619,18 @@ async def doc_place_chosen(callback: CallbackQuery, state: FSMContext, app: App)
                 await state.set_state(None)
             await callback.message.answer(texts.DOC_LOST)
             return
-        if key != queue[0].get("id"):
-            # Buttons under an earlier document's question, or sent before documents had ids.
+        if key != queue[0]["id"]:
+            # Buttons under an earlier document's question, or not made by the bot: this document's again.
             await callback.message.answer(texts.DOC_PLACE_OLD_BUTTONS.format(title=queue[0]["title"]),
                                           reply_markup=doc_place_keyboard(app.forest, queue[0]))
             return
         if await state.get_state() in (Flow.waiting_name.state, Flow.confirming_name.state):
             await remind_document(callback.message, state, app)  # /name in between: the name comes first
             return
-        # Waiting for its place, or left in the queue by the old code that lost the dialog state.
+        if scope is None:  # its own button, for a mitten no longer on the map
+            await callback.message.answer(texts.DOC_PLACE_GONE.format(title=queue[0]["title"]),
+                                          reply_markup=doc_place_keyboard(app.forest, queue[0]))
+            return
         await file_pending(callback.message, state, app, callback.from_user.id, queue, scope)
         await state.set_state(None)
         await process_queue(callback.message, state, app, callback.from_user.id)
@@ -664,30 +677,29 @@ async def place_changed(callback: CallbackQuery, app: App) -> None:
 
 @router.callback_query(F.data.startswith("qp:"))
 async def question_place_chosen(callback: CallbackQuery, state: FSMContext, app: App, bot: Bot) -> None:
-    fields = callback.data.split(":")
-    key = fields[1] if len(fields) == 4 else None  # "qp:<question>:m:3"; buttons sent before ids were "qp:m:3"
-    scope = scope_from_callback(app.forest, fields[-2], fields[-1])
+    key, scope = place_button(app.forest, callback.data)  # "qp:<question>:m:3"
     await callback.answer()
-    if not scope:
-        return
     await callback.message.edit_reply_markup(reply_markup=None)
     async with app.locks[callback.from_user.id]:  # a double tap answers once
         data = await state.get_data()
-        # Each keyboard answers its own question, also under an older one; old buttons had no id.
+        # Each keyboard answers its own question, also under an older one.
         questions = data.get("questions", {})
-        question = questions.get(key) if key else data.get("question")
+        question = questions.get(key)
         if key in questions and question is None:
             return  # the same question's buttons pressed again: the answer is already above
-        if not question:
+        if not question:  # forgotten, or not a button the bot makes
             await callback.message.answer(texts.QUESTION_LOST)
             return
-        if not key or key == data.get("question_id"):
+        if scope is None:  # a mitten no longer on the map: the question is still known, so the mittens there are now
+            await callback.message.answer(texts.QUESTION_PLACE_GONE,
+                                          reply_markup=mitten_keyboard(app.forest, f"qp:{key}"))
+            return
+        if key == data.get("question_id"):
             # A document may have come in between and wait for a name or a place: its state stays.
             if await state.get_state() == Flow.waiting_question_place.state:
                 await state.set_state(None)
             await state.update_data(question=None, question_id=None)
-        if key:
-            await state.update_data(questions=questions | {key: None})
+        await state.update_data(questions=questions | {key: None})
     await answer_question(callback.message, state, app, bot, question, mitten=scope.value)
     await remind_document(callback.message, state, app)
 
@@ -745,25 +757,86 @@ async def answer_question(message: Message, state: FSMContext, app: App, bot: Bo
             await message.answer(texts.ARCHIVE_LOADING)
             await app.archive_ready.wait()
         reply = await app.answerer.ask(text, now_utc(), mitten=mitten)
+    if reply.kind == "unavailable":
+        await answer_later(message, state, app, text, mitten)
+    else:
+        await deliver(message, state, app, text, reply, keep_state)
+
+
+async def deliver(message: Message, state: FSMContext, app: App, question: str, reply: Reply,
+                  keep_state: bool = False, lead: str = "") -> None:
+    """Send the answer, or the mitten buttons when the answer depends on the mitten.
+    `lead`: an answer given later starts with the question it answers (see later_lead)."""
     if reply.kind == "need_place":
-        # The answer took a few seconds: a document may have come meanwhile and now waits for a name
-        # or a place, and typed words go to it. Then the question is asked again with its mitten.
+        # The answer took a few seconds, or minutes when it came later: a document may have come meanwhile
+        # and now waits for a name or a place, and typed words go to it. Then the question is asked again
+        # with its mitten.
         async with app.locks[message.chat.id]:
             busy = keep_state or await state.get_state() in DOCUMENT_STATES
             if not busy:
                 key = uuid.uuid4().hex[:8]
-                questions = dict(list((await state.get_data()).get("questions", {}).items())[-9:]) | {key: text}
+                questions = dict(list((await state.get_data()).get("questions", {}).items())[-9:]) | {key: question}
                 await state.set_state(Flow.waiting_question_place)
-                await state.update_data(question=text, question_id=key, questions=questions,
+                await state.update_data(question=question, question_id=key, questions=questions,
                                         question_at=now_utc().isoformat())
         if busy:
-            await message.answer(texts.ASK_PLACE_IN_TEXT)  # the callers then remind about the document
+            await message.answer(lead + texts.ASK_PLACE_IN_TEXT)  # the callers then remind about the document
         else:
-            await message.answer(reply.text or texts.ASK_PLACE, reply_markup=mitten_keyboard(
+            await message.answer(lead + (reply.text or texts.ASK_PLACE), reply_markup=mitten_keyboard(
                 app.forest, question_prefix(await state.get_data()), reply.mittens or None))
         return
-    await state.update_data(last_question=text, last_at=now_utc().isoformat())
-    await message.answer(reply.text)
+    await state.update_data(last_question=question, last_at=now_utc().isoformat())
+    await message.answer(lead + reply.text)
+
+
+def later_lead(question: str, mitten: str | None, limit: int = 200) -> str:
+    """The start of a message sent later: other messages may have come in between, so it names its question
+    (and the mitten chosen with a button). A long question is cut, so the answer still fits one message."""
+    question = " ".join(question.split())
+    if len(question) > limit:
+        question = question[:limit].rstrip() + "…"
+    if mitten:
+        return texts.ANSWER_LATER_LEAD_MITTEN.format(question=question, mitten=mitten)
+    return texts.ANSWER_LATER_LEAD.format(question=question)
+
+
+async def answer_later(message: Message, state: FSMContext, app: App, question: str, mitten: str | None) -> None:
+    """No model answered in time, as all rest after their rate limits: promise the answer and ask again
+    in the background."""
+    waiting = app.later[message.chat.id]
+    if len(waiting) >= LATER_PER_CHAT:
+        await message.answer(texts.LLM_UNAVAILABLE)
+        return
+    # The task counts before the first await: questions forwarded together are handled at once and would
+    # all pass the check above. It pauses before it asks, so the promise still comes first.
+    task = asyncio.create_task(ask_later(message, state, app, question, mitten))
+    waiting.add(task)
+    task.add_done_callback(waiting.discard)
+    await message.answer(texts.ANSWER_LATER)
+
+
+async def ask_later(message: Message, state: FSMContext, app: App, question: str, mitten: str | None) -> None:
+    """Ask again after each pause. The first reply is delivered as it would have been at once, and then the
+    bot's last word is again about what still waits for a typed answer. The router's error handler does not
+    see this task, so it logs its own errors and still tells the animal."""
+    lead = later_lead(question, mitten)
+    try:
+        for pause in LATER_PAUSES:
+            await asyncio.sleep(pause)
+            reply = await app.answerer.ask(question, now_utc(), mitten=mitten)
+            if reply.kind != "unavailable":
+                await deliver(message, state, app, question, reply, lead=lead)
+                break
+        else:
+            log.warning("No model was free for a question of chat %s in %s s", message.chat.id, sum(LATER_PAUSES))
+            await message.answer(lead + texts.ANSWER_LATER_FAILED)
+        await remind_document(message, state, app)
+    except Exception:
+        log.exception("Answering a question of chat %s later failed", message.chat.id)
+        try:
+            await message.answer(lead + texts.SOMETHING_WRONG)
+        except TelegramAPIError:
+            pass
 
 
 @router.message()

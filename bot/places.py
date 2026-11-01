@@ -28,23 +28,39 @@ DEFAULT_MAP: dict[str, frozenset[str]] = {
 }
 
 # How animals refer to each mitten in questions: "під дубом", "біля сосон", "в ліщині"...
+# Only the tree itself names a mitten: "соснові шишки" and "вербові котики" are things, "у сосновому лісі"
+# and "у сосняку" are the conifer forest (Mishka, 30 Oct, 14:18: a mitten only when it is named).
 MITTEN_PATTERNS = {
     "Біля бобрової греблі": r"бобров\w*\s+гребл|\b(?:біля|коло|поблизу|від|до|під|на|у|в)\s+гребл",
     "Біля мурашника": r"мурашник",
     "На узліссі": r"узлісс",
-    "Під вербою": r"\bверб(?:а|и|і|у|ою|ові)\b",
-    "Під дубом": r"\bдуб(?:ом|а|і|у|ові)?\b",
+    "Під вербою": r"\bверб(?:а|и|і|у|ою)\b",
+    "Під дубом": r"\bдуб(?:ом|а|і|у)?\b",
     "Під ялиною": r"\bялин(?:а|и|і|у|ою|ка|ки|ці|ку|кою)\b",
     "У ліщині": r"ліщин",
-    "У соснах": r"\bсосн\w*|\bсосон\b|\bсосен\b",
+    "У соснах": r"\bсосн(?:а|и|і|у|ою|ам|ами|ах)\b|\bсосон\b|\bсосен\b",
 }
 
 # "хвойний ліс", "у хвойному", "хвойного та листяного лісу", but not "хвойні гілки" or "листяна підстилка";
 # "біля річки", "річкою", but not "порічки".
-AS_PLACE = r"\b{0}\w*\s+(?:\w+\s+){{0,2}}(?:ліс|частин)|\b(?:у|в|на|серед|для)\s+{0}"
+# "хвойно-листяний ліс" is both parts: the first half of a mixed forest is followed by its second, not a space.
+AS_PLACE = r"\b{0}\w*(?:-\w+)?\s+(?:\w+\s+){{0,2}}(?:ліс|частин)|\b(?:у|в|на|серед|для)\s+{0}"
+# A tree's adjective is a place only with its forest: "у сосновому лісі", "соснового й дубового лісу",
+# "у дубовому гаю", but "для соснових шишок", "дубовий стіл", "соснове борошно" or "дубовий лісник" is a thing.
+# A mixed forest names both trees: "сосново-дубовий ліс" is asked about like "соснового й дубового лісу".
+TREE_FOREST = (r"\b{0}\w*(?:-\w+|\s+(?:і|й|та|чи|або)\s+\w+)?\s+"
+               r"(?:ліс(?:у|і|ом|и|ах|ами|ів|ам|ок|ку|ком)?\b|бір\b|бор(?:у|і|ові|ом|и|ів|ам|ами|ах)\b|га(?:й|ю|єві|єм|ї|їв|ям|ями|ях)\b|частин)")
 PART_PATTERNS = {
-    CONIFER: AS_PLACE.format("хвойн") + r"|\bялин(?:ами|ах|ам)\b",
-    DECIDUOUS: AS_PLACE.format("листян") + r"|\bдуб(?:и|ів|ами|ах|ам)\b",
+    # "серед ялин", "між ялинок", "у ялиннику", "у сосняку", "у бору", but not "вибір"; one "ялинка" is a mitten.
+    # "ялин" and "ялинок" alone are trees ("гілки ялин", "не рубайте ялинок", "чи у ялин є шишки?"): a place only
+    # after "серед", "між", "біля", "під"; "ялинками" only after "під", "між"... ("прикрасити ялинками" is a thing).
+    # "борів" alone may be a hog: only "соснових борів" is the forest.
+    CONIFER: AS_PLACE.format("хвойн") + "|" + TREE_FOREST.format("(?:соснов|ялинов)")
+    + r"|\bялин(?:ами|ах|ам)\b|\b(?:серед|між|біля|коло|поблизу|під)\s+ялин(?:ок)?\b"
+    + r"|\b(?:серед|між|під|у|в|на)\s+ялинк(?:ами|ах)\b"
+    + r"|\bялинник|\bсосняк|\bбір\b|\bбор(?:у|і|ом|и|ах|ами)\b",
+    DECIDUOUS: AS_PLACE.format("листян") + "|" + TREE_FOREST.format("(?:дубов|березов)")
+    + r"|\bдуб(?:и|ів|ами|ах|ам)\b|\bдубняк|\bдібров|\bберезняк",
     RIVER: r"\b(?:при)?річк|\bрічц|прибереж|\b(?:біля|коло|поблизу)\s+вод(?:и|і)\b",
 }
 
@@ -122,9 +138,17 @@ class Forest:
     def strip_places(self, text: str) -> str:
         """The question without place words, so search looks for the topic, not the address."""
         low = normalize(text)
-        for pattern in [*MITTEN_PATTERNS.values(), *PART_PATTERNS.values()]:
-            low = re.sub(rf"(?:\b(?:під|біля|коло|у|в|на|серед)\s+)?(?:{pattern})\w*", " ", low)
-        return low
+        # All places are found in the question as it is, then cut out together: "у дубовому й сосновому лісі"
+        # is the deciduous forest's match whole, though the conifer one alone would leave "у дубовому й" behind.
+        # "у дубово-сосновому лісі" goes whole too, though the conifer forest is found from its second half.
+        found = sorted(match.span() for pattern in [*MITTEN_PATTERNS.values(), *PART_PATTERNS.values()]
+                       for match in re.finditer(rf"(?:\b(?:під|біля|коло|у|в|на|серед|між)\s+)?(?:\b\w+-)?(?:{pattern})\w*", low))
+        kept, done = [], 0
+        for start, end in found:
+            if end > done:  # overlapping matches are cut as one
+                kept.append(low[done:max(start, done)])
+                done = end
+        return " ".join(kept + [low[done:]])
 
     def detect_parts(self, text: str) -> list[str]:
         low = normalize(text)

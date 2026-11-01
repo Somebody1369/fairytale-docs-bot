@@ -2,7 +2,8 @@
 
     docker compose run --rm bot python -m bot.invite
 
-Every run prints a new link for one animal, who can then invite neighbours with /invite.
+Every run prints a new link for one animal, who can then invite neighbours with /invite. Unlike the links
+members make with /invite, it does not expire.
 """
 
 import asyncio
@@ -12,7 +13,7 @@ from aiogram import Bot
 
 from .config import load_settings
 from .handlers import invite_link
-from .storage import INVITE_DAYS, Store
+from .storage import Store
 
 
 async def main() -> None:
@@ -23,7 +24,7 @@ async def main() -> None:
         me = await bot.get_me()
     finally:
         await bot.session.close()
-    print(f"{invite_link(me.username, token)}\n(one use, valid for {INVITE_DAYS} days)")
+    print(f"{invite_link(me.username, token)}\n(one use, does not expire)")
     if not settings.invites_only:
         print("Note: INVITES_ONLY is off, so the bot answers everyone and the invite is not needed.")
 

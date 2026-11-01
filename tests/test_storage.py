@@ -59,9 +59,22 @@ def test_first_invite_is_reused_until_someone_joins(store):
     assert not store.has_members()
     token = store.first_invite(NOW)
     assert store.first_invite(NOW + timedelta(hours=1)) == token  # a restart does not make a new one
-    assert store.use_invite(token, 7, NOW)
+    assert store.first_invite(NOW + timedelta(days=30)) == token  # nor a restart weeks later: it never expires
+    assert store.use_invite(token, 7, NOW + timedelta(days=30))
     assert store.has_members() and store.first_invite(NOW) != token
     assert not store.use_invite(store.create_invite(7, NOW), 8, NOW + timedelta(days=8))  # expired
+
+
+def test_operators_invite_never_expires_but_a_members_does(store):
+    # Mishka's invite from the start log of 29 October must still work after 5 November.
+    mishka = store.create_invite(None, NOW)                                    # the start log or python -m bot.invite
+    assert store.use_invite(mishka, 1, NOW + timedelta(days=60))
+    assert not store.use_invite(mishka, 2, NOW + timedelta(days=60))           # still one use only
+    assert store.use_invite(store.create_invite(1, NOW), 2, NOW + timedelta(days=7))   # /invite: 7 days
+    assert not store.use_invite(store.create_invite(1, NOW), 3, NOW + timedelta(days=8))
+    assert not store.use_invite(store.create_invite(1, NOW), 1, NOW)           # not one's own link
+    store.revoke_member(2, by_id=1)
+    assert not store.use_invite(store.create_invite(2, NOW), 4, NOW)           # the inviter must still be a member
 
 
 def test_bot_is_closed_unless_switched_off(monkeypatch):

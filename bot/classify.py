@@ -174,7 +174,7 @@ async def classify_document(title: str, text: str, forest: Forest, llm: LLM) -> 
             f"Назва файлу: {title}\n\nМісця, згадані в документі: {', '.join(places) or 'жодного'}\n"
             f"Можливі відповіді: {'; '.join(choices)}; або \"unclear\", якщо з тексту це не зрозуміло."
             f"\n\nТекст:\n{text[:EXCERPT_CHARS]}",
-            max_tokens=700, fast=True,
+            max_tokens=400, fast=True,  # a short {"kind", "value"}: the budget counts against the minute
         )
     except LLMUnavailable:
         log.warning("Groq unavailable, asking the sender about %r", title)
