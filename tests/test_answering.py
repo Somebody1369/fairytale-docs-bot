@@ -9,7 +9,7 @@ import pytest
 
 from bot import texts
 from bot.answering import (ANSWER_SYSTEM, DOC_CHARS, PICK_SECONDS, PICK_SYSTEM, PICK_TOKENS, PLACE_UNKNOWN_RULE,
-                           QUESTION_SECONDS, Answerer, by_number, calendar_need, calendar_note, clean_text,
+                           QUESTION_SECONDS, SPARE_TOKENS, Answerer, by_number, calendar_need, calendar_note, clean_text,
                            prompt_chars)
 from bot.extract import extract_text
 from bot.llm import LLM, LLMUnavailable
@@ -934,7 +934,7 @@ async def test_long_guides_leave_the_minute_room_for_the_reply(store, forest, qu
     await Answerer(store, forest, llm, TZ).ask(question, NOW)
     system, prompt = llm.prompts[0]
     assert len(document_texts(prompt)) == 7 and llm.budgets[-1] == ("answer", budget)
-    assert groq_tokens(system, prompt) + budget <= 8000 - 200
+    assert groq_tokens(system, prompt) + budget <= 8000 - SPARE_TOKENS
 
 
 async def test_archive_documents_go_whole_in_the_usual_case(store, forest):
@@ -961,7 +961,7 @@ async def test_archive_documents_go_whole_with_no_place_and_the_whole_calendar(s
     system, prompt = llm.prompts[0]
     assert system == ANSWER_SYSTEM + PLACE_UNKNOWN_RULE and llm.budgets[-1] == ("answer", 2000)
     assert sorted(document_texts(prompt)) == sorted(texts)
-    assert groq_tokens(system, prompt) + 2000 <= 8000 - 200
+    assert groq_tokens(system, prompt) + 2000 <= 8000 - SPARE_TOKENS
 
 
 LATE = " Це важливо, бо зима довга, а весна приходить пізно."

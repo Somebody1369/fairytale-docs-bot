@@ -23,7 +23,7 @@ INPUT_TOKENS_PER_MINUTE = 7000
 CHARS_PER_TOKEN = 2.5
 # Left free for a count a little off. A second try's reminders may still go over: llm.py then asks with a smaller
 # reply budget, and if that fails too, the first answer holds.
-SPARE_TOKENS = 200
+SPARE_TOKENS = 150
 # Keyword search keeps the best documents of every level (mitten, each forest part, whole forest)
 # separately, so a strong whole-forest match cannot push the mitten's own advice out. A mitten has
 # only a handful of documents and they matter most, so any of them that matches at all may go.
@@ -97,7 +97,7 @@ ANSWER_SYSTEM = """Ти бот-помічник звірів лісу. Ти ві
 7. Якщо рукавичка належить до кількох частин лісу (як "Під вербою": і листяний ліс, і біля річки), їй підходять поради кожної з цих частин: наведи в "answer" поради всіх її частин лісу, що стосуються питання, навіть якщо вони не суперечать одна одній, і скажи, до якої частини лісу належить кожна. Поради різних частин лісу однієї рукавички одна одній не поступаються, тож жодна з них не йде в "other". Порада самої рукавички, як і завжди, іде першою.
 8. Не згадуй в "answer" та "other" номери й назви документів: джерела бот додасть сам.
 9. Якщо в документі є окремі розділи для різних місць, бери розділ для місця з питання. Але рівень розділу той самий, що й у всього документа (рядок "Рівень"): розділ "Під дубом" у путівнику для всього лісу є порадою рівня "увесь ліс", тож документ для рукавички Під дубом або для її частини лісу важливіший за нього.
-10. Місце в питанні ("під дубом", "біля сосон", "біля верби") означає рукавичку з рядка "Місце з питання", а не саме дерево: відповідай усіма порадами, що підходять цій рукавичці, навіть якщо в них це дерево не згадано, а названо інші дерева чи місця ("білі гриби тримаються старих дубів" теж відповідь на "де шукати гриби біля верби").
+10. Місце в питанні ("під дубом", "біля сосон", "біля верби") означає рукавичку з рядка "Місце з питання", а не саме дерево: відповідай усіма порадами, що підходять цій рукавичці, навіть якщо в них це дерево не згадано, а названо інші дерева чи місця ("білі гриби тримаються старих дубів" теж відповідь на "де шукати гриби біля верби"). Звір не обов'язково живе в місці, про яке питає: не пиши "Ваша рукавичка", а називай місце з рядка "Для кого" документа ("у хвойному лісі", навіть коли питали про «У соснах»).
 11. Якщо в питанні названо рукавичку чи частину лісу, а в рядку "Поради на цю тему різні в різних місцях" стоїть "так", скажи, для якого місця кожна порада ("У хвойному лісі …"), а пораду для всього лісу почни словами "Загальна порада для всього лісу — …". Якщо ж ні для цього місця, ні для його частини лісу поради на тему питання немає й відповідь лише з поради для всього лісу, почни так: "Окремої поради про … для … немає, тож діє загальна порада для всього лісу: …". Якщо там "ні", цих слів не пиши: порада для всього лісу однакова для всіх (усе одно перекажи всі її пункти на тему питання).
 
 Поверни JSON: {"facts": ["кожен пункт документів, з яких відповідаєш, на тему питання, окремим рядком, навіть якщо про нього прямо не питали (на \"скільки внесок\" це й кому та куди віддавати, і чим можна замінити): скільки, коли, кому, куди, чим замінити, хто звільнений; на початку рядка номер документа і його рівень, наприклад [2, частина лісу]"], "found": true або false, "answer": "текст відповіді для місця з питання, у якому є всі ці пункти, крім тих, що пішли в other", "other": "порада, що радить інакше й тут поступається відповіді, з поясненням чому, або \"\"", "sources": [номери документів, з яких узято відповідь, найважливіший перший]}"""
@@ -519,10 +519,12 @@ class Answerer:
         )
         headers = [self._doc_header(i, doc) for i, doc in enumerate(docs, 1)]
         # The documents' text gets what Groq's minute leaves after the rules, the calendar, the question and the reply.
-        room = prompt_chars(budget) - len(system) - len(head) - sum(map(len, headers))
+        separator = "\n\n"
+        room = (prompt_chars(budget) - len(system) - len(head) - sum(map(len, headers))
+                - len(separator) * (len(docs) - 1))
         size = self._excerpt_size(docs, room)
-        prompt = head + "\n\n".join(header + self._excerpt(doc, question, mittens, parts, size)
-                                    for header, doc in zip(headers, docs, strict=True))
+        prompt = head + separator.join(header + self._excerpt(doc, question, mittens, parts, size)
+                                       for header, doc in zip(headers, docs, strict=True))
         asked_sources = False
         kept: Draft | None = None  # the answer so far, kept while the model is asked once to put it right
         # At most three calls: the answer, once more when it forgot its sources, and once more to put it right.
