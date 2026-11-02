@@ -115,7 +115,7 @@ LEVEL_REMINDER = """
 
 PARTS_REMINDER = """
 
-Зверни увагу: рукавичка "{mitten}" належить до кількох частин лісу, і їй підходять поради кожної з них. У відповіді є порада для частини лісу "{cited}", але немає поради для частини "{missing}". Якщо в документі {docs} є щось на тему питання "{topic}" (навіть без дерева, названого в питанні, чи з іншими деревами: дерево з питання лише вказує на рукавичку), додай у відповідь саме те, що відповідає на цю тему, сказавши, що це порада для частини лісу "{missing}", і додай номер документа в "sources".{quotes}"""
+Зверни увагу: рукавичка "{mitten}" належить до кількох частин лісу, і їй підходять поради кожної з них. У відповіді {cited}немає поради для {missing}. Якщо в документі {docs} є щось на тему питання "{topic}" (навіть без дерева, названого в питанні, чи з іншими деревами: дерево з питання лише вказує на рукавичку), додай у відповідь саме те, що відповідає на цю тему, сказавши, {label}, і додай номер документа в "sources".{quotes}"""
 
 FACTS_REMINDER = """
 
@@ -128,6 +128,10 @@ ARCHIVE_REMINDER = """
 SOURCES_REMINDER = """
 
 Зверни увагу: у "sources" немає номерів документів, з яких узято відповідь. Без них бот відповідь не покаже: постав у "sources" номери документів, з яких відповідаєш, найважливіший перший."""
+
+OTHER_REMINDER = """
+
+Зверни увагу: у "sources" лише один документ, а "other" переказує пораду з іншого документа. Без нього бот цю пораду не покаже: додай у "sources" після джерел відповіді номер документа, пораду з якого переказує "other". Якщо такого документа немає, поверни "other": ""."""
 
 # The model, given "Де шукати гриби біля верби?", kept to the willow and skipped the deciduous guide's "Білі гриби
 # тримаються старих дубів" even when reminded of it; quoting the sentences on the topic brought them in.
@@ -560,12 +564,15 @@ class Answerer:
             reminders, faults = self._review(question, docs, mittens, named, answer, other, sources, facts)
             draft = Draft(answer, other, sources, faults, facts)
             if kept:
-                # The one second try is taken unless it came out worse: more broken rules, or more of the points
-                # both answers listed left out (a weaker fallback model may answer it worse than the first).
+                # The one second try is taken unless it came out worse: more broken rules, the advice that gives way
+                # still without its document, or more of the points both answers listed left out (a weaker fallback
+                # model may answer it worse than the first). A new "other" without its document is dropped anyway.
                 every = kept.facts + facts
-                before = (kept.faults,
+                unsourced = bool(kept.other) and len(kept.sources) == 1 and len(docs) > 1
+                before = (kept.faults, unsourced,
                           len(missing_facts(every, docs, kept.sources, f"{kept.answer} {kept.other}", question)))
-                after = (faults, len(missing_facts(every, docs, sources, f"{answer} {other}", question)))
+                after = (faults, unsourced and bool(other) and len(sources) == 1,
+                         len(missing_facts(every, docs, sources, f"{answer} {other}", question)))
                 if after <= before:
                     kept = draft
                 break
@@ -586,6 +593,9 @@ class Answerer:
             sources, other = [doc for doc in sources if doc not in gone], ""
         if len(sources) == 1:
             cite = "Джерело: " + source_line(sources[0], self.tz)
+            # The document the advice that gives way retells is not among the sources: the animal would not see where
+            # that advice comes from, nor who sent it and when (Mishka, 20:46).
+            other = ""
         else:
             cite = "Джерела:\n" + "\n".join("- " + source_line(doc, self.tz) for doc in sources)
         # Mishka: «Окремих порад про утеплення для узлісся немає. Загальна порада для всього лісу — …». Where the
@@ -628,18 +638,31 @@ class Answerer:
             reminders.append(ARCHIVE_REMINDER.format(archive=", ".join(f"[{docs.index(doc) + 1}]" for doc in archived),
                                                      animal=docs.index(sources[0]) + 1))
         # Mishka: "для «Під вербою» підходять поради і листяного лісу, і річки". When the answer took one
-        # part's advice on the topic and left the other part's document out, the model is reminded of it.
+        # part's advice on the topic and left the other part's document out, or took neither part's guide on the
+        # topic, the model is reminded of it.
         missing = self._missing_parts(mittens, docs, sources, answer, question)
         if missing:
-            cited = {doc.scope.value for doc in sources if doc.scope.kind == "part"} - {doc.scope.value for doc in missing}
+            cited = ", ".join(PART_NAMES[p] for p in sorted(
+                {doc.scope.value for doc in sources if doc.scope.kind == "part"} - {doc.scope.value for doc in missing}))
+            names = [f'"{PART_NAMES[doc.scope.value]}"' for doc in missing]
+            if len(missing) == 1:
+                absent, label = f"частини {names[0]}", f"що це порада для частини лісу {names[0]}"
+            else:  # each part with its own document, or the model takes them for one part (rule 7)
+                absent = "частин " + ", ".join(f"{name} (документ [{docs.index(doc) + 1}])"
+                                               for name, doc in zip(names, missing, strict=True))
+                label = "до якої частини лісу належить кожна порада"
             reminders.append(PARTS_REMINDER.format(
-                mitten=mittens[0], cited=", ".join(PART_NAMES[p] for p in sorted(cited)),
-                missing=", ".join(PART_NAMES[doc.scope.value] for doc in missing),
-                docs=", ".join(f"[{docs.index(doc) + 1}]" for doc in missing),
+                mitten=mittens[0], cited=f'є порада для частини лісу "{cited}", але ' if cited else "",
+                missing=absent, label=label, docs=", ".join(f"[{docs.index(doc) + 1}]" for doc in missing),
                 topic=re.sub(r"\s+", " ", self.forest.strip_places(question)).strip(" ?.!,"),
                 quotes="".join(QUOTE_NOTE.format(number=docs.index(doc) + 1, quote=quote)
                                for doc in missing if (quote := self._topic_sentences(doc, question)))))
         faults = len(reminders)
+        # Mishka (20:46): the advice that gives way is mentioned with who sent it and when, so its document must be
+        # among the sources; with the answer's alone there, it is not. With one document given there is no other to
+        # add, and the paragraph goes anyway.
+        if other and len(sources) == 1 and len(docs) > 1:
+            reminders.append(OTHER_REMINDER)
         # The model lists the points of the cited documents in "facts", then now and then drops some of them
         # when it writes the answer ("Кабанові в кошик біля входу" in the customer's own example).
         left_out = missing_facts(facts, docs, sources, f"{answer} {other}", question)
@@ -680,20 +703,23 @@ class Answerer:
 
     def _missing_parts(self, mittens: list[str], docs: list[Document], sources: list[Document], answer: str,
                        question: str) -> list[Document]:
-        """For a mitten in several forest parts, with one part's advice in the answer: the best document of
-        each of its other parts that was given to the model but left out of the answer. A part counts only
-        when its advice is in the answer itself, not just in the paragraph of advice that gives way."""
+        """For a mitten in several forest parts: the best document of each of its parts that was given to the model
+        but left out of the answer. A part counts only when its advice is in the answer itself, not just in the
+        paragraph of advice that gives way. With no part's advice in the answer, only a part's document whose title
+        is on the topic is left out: "Грибний путівник листяного лісу" for mushrooms, none for the mitten's dues."""
         if len(mittens) != 1:
             return []
+        parts = self.forest.mitten_parts.get(mittens[0], frozenset())
+        if len(parts) < 2:
+            return []  # a mitten in one forest part needs no advice of its part beside its own
         said = fact_terms(answer) - fact_terms(question)
         answered = {doc.scope.value for doc in sources
                     if doc.scope.kind == "part" and len(fact_terms(doc.text) & said) >= 2}
-        if not answered:
-            return []  # the answer needs no forest part's advice at all, e.g. the mitten's own dues
+        topic = expand(set(tokens(self.forest.strip_places(question))))
+        fits = lambda doc: bool(answered) or bool(topic & set(tokens(doc.title)))
         missing = []
-        for part in sorted(self.forest.mitten_parts.get(mittens[0], frozenset()) - answered):
-            doc = next((doc for doc in sources if doc.scope == Scope("part", part)), None) or \
-                next((doc for doc in docs if doc.scope == Scope("part", part)), None)
+        for part in sorted(parts - answered):
+            doc = next((doc for doc in sources + docs if doc.scope == Scope("part", part) and fits(doc)), None)
             if doc:
                 missing.append(doc)
         return missing

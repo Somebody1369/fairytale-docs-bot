@@ -121,6 +121,31 @@ async def test_configured_models_stay_as_they_are_and_defaults_stand_in_only_for
     assert await checked(DEFAULT_GROQ_MODELS.split(",")) == DEFAULT_GROQ_MODELS.split(",")
 
 
+async def test_key_groq_does_not_accept_stops_the_bot_at_start():
+    # Otherwise every question looked like a busy model, and the bot apologised ten minutes later.
+    import groq
+    import httpx
+    import pytest
+
+    request = httpx.Request("GET", "https://api.groq.com/openai/v1/models")
+    llm = LLM("gsk_typo", ["openai/gpt-oss-120b"])
+
+    async def failing(error):
+        async def models_list():
+            raise error
+        llm.client = SimpleNamespace(models=SimpleNamespace(list=models_list))
+        await llm.check_models()
+
+    with pytest.raises(SystemExit, match="GROQ_API_KEY"):
+        await failing(groq.AuthenticationError("Invalid API Key", response=httpx.Response(401, request=request),
+                                               body=None))
+    # Groq or the network failing says nothing about the key: the bot starts with the configured models.
+    await failing(groq.InternalServerError("Service Unavailable", response=httpx.Response(503, request=request),
+                                           body=None))
+    await failing(groq.APIConnectionError(request=request))
+    assert llm.models == ["openai/gpt-oss-120b"]
+
+
 async def test_qwen_is_asked_for_no_more_output_than_its_minute_allows():
     llm = LLM("x", ["qwen/qwen3.8-27b"])
     used = []

@@ -1,3 +1,4 @@
+import ctypes
 import io
 import zipfile
 
@@ -7,6 +8,7 @@ from datetime import datetime, timezone
 
 import docx
 import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_c
 import pytesseract
 from pathlib import Path
 from PIL import Image
@@ -281,6 +283,20 @@ def test_caption_names_the_place(forest):
     assert scope_from_caption("для всіх від сусідів з Під вербою", forest) is None
 
 
+def test_caption_for_two_mittens_asks_to_split_the_document(forest):
+    # The sender says the document is for two mittens: two documents in one (Mishka, 30 October, 14:18).
+    assert scope_from_caption("для Під дубом і Під вербою", forest) == Scope(SPLIT, "Під дубом, Під вербою")
+    assert scope_from_caption("це для Під вербою та біля сосон", forest) == Scope(SPLIT, "Під вербою, У соснах")
+    # The sender's own mitten named too, or "з" said again before the second mitten, changes nothing.
+    assert scope_from_caption("для Під дубом і Під вербою, я з Під вербою", forest) == \
+        Scope(SPLIT, "Під дубом, Під вербою")
+    assert scope_from_caption("для звірів з Під дубом і з Під вербою", forest) == Scope(SPLIT, "Під дубом, Під вербою")
+    # A mitten negated, named as somewhere else or as the sender's own leaves one place, or none: the text decides.
+    assert scope_from_caption("для Під дубом, а не Під вербою", forest) is None
+    assert scope_from_caption("від Під вербою для Під дубом", forest) is None
+    assert scope_from_caption("я з Під вербою, це для Під дубом", forest) is None
+
+
 async def test_empty_drive_listing_keeps_the_archive(store, forest):
     archive = FakeArchive({"1": ("Календар сезонів.txt", "Oct 13", "Цей календар для всіх мешканців лісу.")})
     await sync_archive(store, forest, archive)
@@ -439,10 +455,44 @@ def test_blank_pages_are_not_scans(monkeypatch):
     assert len(read) == 1  # the picture only
 
 
+def one_object_pdf(make) -> bytes:
+    """A one-page PDF holding the page object `make(pdf)` returns."""
+    pdf = pdfium.PdfDocument.new()
+    page = pdf.new_page(200, 200)
+    pdfium_c.FPDFPage_InsertObject(page.raw, make(pdf))
+    page.gen_content()
+    data = io.BytesIO()
+    pdf.save(data)
+    return data.getvalue()
+
+
+def test_blank_pdf_is_empty_and_a_scan_read_as_nothing_is_unreadable(monkeypatch):
+    # A blank PDF is an empty file, like an empty .txt, and is told so; a scan gets the request for a text layer.
+    def spaces(pdf):  # a blank text file printed to PDF holds text objects of spaces alone
+        text = pdfium_c.FPDFPageObj_NewTextObj(pdf.raw, b"Helvetica", 12.0)
+        wide = ctypes.create_string_buffer("      \0".encode("utf-16-le"))
+        pdfium_c.FPDFText_SetText(text, ctypes.cast(wide, ctypes.POINTER(pdfium_c.FPDF_WCHAR)))
+        return text
+
+    def curves(pdf):  # text turned into curves: a drawing, not a blank page
+        rect = pdfium_c.FPDFPageObj_CreateNewRect(20, 20, 100, 10)
+        pdfium_c.FPDFPath_SetDrawMode(rect, pdfium_c.FPDF_FILLMODE_WINDING, False)
+        return rect
+
+    assert extract_text(scan_pdf(0, blank=2), "blank.pdf") == ""
+    assert extract_text(one_object_pdf(spaces), "blank.pdf") == ""
+    with pytest.raises(extract.UnreadableScan):
+        extract_text(one_object_pdf(curves), "curves.pdf")
+    monkeypatch.setattr(extract, "_ocr_page", lambda page, langs: "")
+    with pytest.raises(extract.UnreadableScan):
+        extract_text(scan_pdf(1, blank=1), "scan.pdf")
+    assert not extract.PDFIUM.locked()
+
+
 def test_pdf_is_read_inside_the_pdfium_lock(monkeypatch):
     # Two PDFs read by two threads at once crash the process, PDFs with a text layer as much as scans, so a PDF
     # is opened, read, OCR'd and closed under the lock.
-    scan, opening = scan_pdf(1), pdfium.PdfDocument
+    scan, blank, opening = scan_pdf(1), scan_pdf(0, blank=1), pdfium.PdfDocument
 
     def opened(*args, **kwargs):
         if not extract.PDFIUM.locked():
@@ -457,8 +507,7 @@ def test_pdf_is_read_inside_the_pdfium_lock(monkeypatch):
     monkeypatch.setattr(pdfium, "PdfDocument", opened)
     monkeypatch.setattr(extract, "_ocr_page", ocr_page)
     assert extract_text(scan, "scan.pdf") == "Рижики ростуть під ялиною."
-    monkeypatch.setattr(extract, "MIN_PAGE_TEXT", 0)  # the page now counts as text: no OCR, only the text layer
-    assert extract_text(scan, "text.pdf") == ""
+    assert extract_text(blank, "text.pdf") == ""  # no OCR, only the text layer
     assert not extract.PDFIUM.locked()
 
 
@@ -553,10 +602,11 @@ async def test_advice_for_several_mittens_is_not_filed_under_one(forest):
     llm = FakeLLM({"kind": "part", "value": "листяний ліс"})  # both are in the deciduous forest
     assert await classify_document("Гриби", "Білі гриби шукайте під дубом, а опеньки в ліщині.", forest, llm) \
         == Scope("part", DECIDUOUS)
-    # Mittens of different forest parts and no word on who the guide is for: the sender is asked.
+    # Sections headed by mittens and no word on who the guide is for: the sender is asked to split it.
     llm = FakeLLM({"kind": "part", "value": "хвойний ліс"})
     guide = "Осінній путівник.\nПід дубом: жолуді.\nУ ліщині: горіхи.\nБіля сосон: шишки."
-    assert await classify_document("Путівник", guide, forest, llm) is None and llm.prompts == []
+    assert await classify_document("Путівник", guide, forest, llm) == Scope(SPLIT, "Під дубом, У ліщині")
+    assert llm.prompts == []
 
 
 async def test_places_after_the_first_pages_count(forest):

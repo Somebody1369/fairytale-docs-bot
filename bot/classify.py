@@ -49,9 +49,10 @@ CAPTION_ELSEWHERE = re.compile(
     rf"\b(?:не|крім|окрім|без|від|до|повз|з|із|зі)\s+(?:для\s+)?(?:рукавич\w*\s+)?{QUOTE}?{PLACE_PREPOSITION}$")
 # ... but "(я) з Під дубом" is where the sender lives, as typed in answer to "Про яку рукавичку?",
 SENDER_FROM = re.compile(rf"(?:^|\b(?:я|ми)\s+)(?:з|із|зі)\s+(?:рукавич\w*\s+)?{QUOTE}?{PLACE_PREPOSITION}$")
-# ... and "для звірів з Під дубом", "для мешканців з листяного лісу" say who the advice is for, unless negated.
+# ... and "для звірів з Під дубом", "для мешканців з листяного лісу" say who the advice is for, unless negated,
+# the next place too: "для звірів з Під дубом і з Під вербою".
 FOR_FROM = re.compile(rf"(?<!\bне\s)(?<!крім\s)(?<!без\s)\bдля\s+(?:(?!(?:не|крім|окрім|без|від|до|повз)\b)[\w']+\s+){{1,3}}"
-                      rf"(?:з|із|зі)\s+(?:рукавич\w*\s+)?{QUOTE}?{PLACE_PREPOSITION}$")
+                      rf"(?:(?:з|із|зі)\s+[^,;.]+?\s(?:і|й|та)\s+)?(?:з|із|зі)\s+(?:рукавич\w*\s+)?{QUOTE}?{PLACE_PREPOSITION}$")
 # Who the advice is for, at the opening: "Порада для листяного лісу:", "Мешканцям рукавички Під вербою:",
 # and, as a greeting only, "Шановні мешканці лісу!" or "Мешканці лісу під ялинами!" at the start of a line.
 # "Звірі під ялиною ховаються від дощу" is a sentence about animals, not an address.
@@ -113,7 +114,8 @@ def _split(mittens: list[str], low: str) -> Scope:
 
 
 def scope_from_caption(caption: str | None, forest: Forest) -> Scope | None:
-    """A caption on the file like "це для Під вербою" or "для хвойного лісу" names the place."""
+    """A caption on the file like "це для Під вербою" or "для хвойного лісу" names the place.
+    "для Під дубом і Під вербою" is two documents in one: a scope of kind SPLIT, as for such a text."""
     if not caption:
         return None
     low = normalize(caption)
@@ -127,6 +129,11 @@ def scope_from_caption(caption: str | None, forest: Forest) -> Scope | None:
     whole = any(re.search(pattern, low) for pattern in whole_patterns)
     if len(mittens) == 1 and not parts and not whole:
         return Scope("mitten", mittens[0])
+    # Two mittens, not counting where the sender lives: "я з Під вербою, це для Під дубом" is one place.
+    targets = [m for m in mittens
+               if any(not SENDER_FROM.search(low[:found.start()]) for found in re.finditer(mitten_pattern(m), low))]
+    if len(targets) >= 2 and not parts and not whole:
+        return _split(targets, low)
     if len(parts) == 1 and not mittens and not whole:
         return Scope("part", parts[0])
     if whole and not mittens and not parts:
@@ -140,7 +147,8 @@ async def classify_document(title: str, text: str, forest: Forest, llm: LLM) -> 
     advice ("білі гриби шукайте під дубом") is not clear: the model chooses between the places that cover
     the whole document, and when it cannot tell, or the text names no place, the sender is asked.
     Signals that disagree, or a document addressed to several places, also mean asking. Advice for two
-    or more mittens, each named as a mitten, gives a scope of kind SPLIT: the sender splits the document."""
+    or more mittens, each named as a mitten or heading a section ("Під дубом: ..."), gives a scope of kind
+    SPLIT: the sender splits the document."""
     # The words are looked for in the whole text, seconds for a file of megabytes: in a thread, so the bot keeps
     # answering everyone else. On a copy of the map, which the archive sync may re-read meanwhile.
     found = await asyncio.to_thread(_classify_by_words, title, text, Forest(dict(forest.mitten_parts)))
@@ -167,9 +175,11 @@ def _classify_by_words(title: str, text: str, forest: Forest) -> Scope | ModelCh
     if addressee and addressee.kind == SPLIT:
         return addressee
     if addressee and addressee.kind == "mitten":
-        # "Мешканцям рукавички Під дубом: ..." and further on "У рукавичці У соснах внески 3 шишки": two documents.
-        low = normalize(text)
-        others = [m for m in forest.mittens if m != addressee.value and _named_as_mitten(m, low, own=True)]
+        # "Мешканцям рукавички Під дубом: ..." and further on "У рукавичці У соснах внески 3 шишки" or
+        # "Під вербою: внесок 3 горіхи": two documents.
+        low, sections = normalize(text), _sections(text, forest)
+        others = [m for m in forest.mittens
+                  if m != addressee.value and (m in sections or _named_as_mitten(m, low, own=True))]
         if others:
             return _split([addressee.value, *others], low)
     if addressee and title_scope:
@@ -180,16 +190,18 @@ def _classify_by_words(title: str, text: str, forest: Forest) -> Scope | ModelCh
         return addressee  # "Порада для листяного лісу: ...": the rest of the text cannot change it
     low, head = normalize(text), normalize(text[:EXCERPT_CHARS])
     own_anywhere = [m for m in forest.mittens if _named_as_mitten(m, low, own=True)]
-    # "У рукавичці Під дубом внесок 4 жолуді, у рукавичці Під вербою 3 горіхи": two documents in one, unless
-    # the file name or the opening says it is for a forest part or the whole forest (Mishka, 22:05: a guide's
-    # section about a mitten weighs as the whole guide).
+    sections = _sections(text, forest)
+    advised = [m for m in forest.mittens if m in own_anywhere or m in sections]
+    # "У рукавичці Під дубом внесок 4 жолуді, у рукавичці Під вербою 3 горіхи", or the lines "Під дубом: 4 жолуді."
+    # and "Під вербою: 3 горіхи.": two documents in one, unless the file name or the opening says it is for a forest
+    # part or the whole forest (Mishka, 22:05: a guide's section about a mitten weighs as the whole guide).
     whole_doc = bool(re.search(WHOLE_FOREST_FOR, head) or re.search(WHOLE_FOREST_TEXT, head)
                      or WHOLE_GREETING.match(low) or re.search(EVERY_MITTEN, f"{normalize(title)} {head}"))
-    if len(own_anywhere) >= 2 and not whole_doc and not (title_scope and title_scope.kind != "mitten"):
-        return _split(own_anywhere, low)
+    if len(advised) >= 2 and not whole_doc and not (title_scope and title_scope.kind != "mitten"):
+        return _split(advised, low)
     if title_scope:
         # "Внески Під дубом" with "У рукавичці У соснах внески 3 шишки": the text names another mitten.
-        clash = title_scope.kind == "mitten" and any(m != title_scope.value for m in own_anywhere)
+        clash = title_scope.kind == "mitten" and any(m != title_scope.value for m in advised)
         return None if clash else title_scope
 
     # The whole text rules a decision out (a guide may get to other places on its third page),
@@ -255,6 +267,25 @@ def _named_as_mitten(mitten: str, low: str, own: bool = False) -> bool:
         starts = [start for start in starts
                   if not _elsewhere(low, start) and not re.search(NEAR_MITTEN + "$", low[max(0, start - 40):start])]
     return bool(starts)
+
+
+def _sections(text: str, forest: Forest) -> list[str]:
+    """The mittens whose own name heads a line: "Під дубом: внесок 4 жолуді.", "• «У ліщині» — 3 горіхи",
+    "1) Під вербою -- 3 горіхи". Not a tree, "Під ялинами: рижики", nor a longer word, "Під дубом-велетнем ростуть
+    гриби", nor a line a PDF broke off a sentence, "під дубом — після дощу": a heading starts with a capital.
+    A dash also says "is", "Біля бобрової греблі — глибоко", so a dash heads a section only beside another mitten's
+    heading. One search of the text as it is: a file of megabytes is not cut into lines, and the lead before the name
+    stays within its line."""
+    names = "|".join(r"[^\S\n]+".join(map(re.escape, normalize(m).split())) for m in forest.mittens)
+    # Before the name any bullet or a list number, after it a colon or a dash, "--" in plain text too.
+    found = re.finditer(rf"^(?:[^\w\n]|\d{{1,3}}[.)])*({names})(?:[^\S\n]|[{QUOTES}])*(:|--?\s|[—–])",
+                        text, re.MULTILINE | re.IGNORECASE)
+    colon, dash = set(), set()
+    for match in found:
+        if match.group(1)[0].isupper():
+            (colon if match.group(2) == ":" else dash).add(normalize(match.group(1)))
+    headings = colon | dash if len(colon | dash) >= 2 else colon
+    return [m for m in forest.mittens if normalize(m) in headings]
 
 
 def _elsewhere(text: str, start: int) -> bool:

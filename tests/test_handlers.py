@@ -1,10 +1,12 @@
 """Whole conversations through aiogram with a fake Telegram server."""
 
 import asyncio
+import io
 from datetime import datetime, timezone
 from itertools import count
 from zoneinfo import ZoneInfo
 
+import pypdfium2 as pdfium
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
@@ -12,7 +14,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import AnswerCallbackQuery, EditMessageReplyMarkup, EditMessageText, GetFile, GetMe, SendMessage
 from aiogram.types import CallbackQuery, Chat, Document, File, InaccessibleMessage, Message, Update, User
 
-from bot.answering import Answerer, Reply
+from bot.answering import QUESTION_SECONDS, Answerer, Reply
 from bot.config import Settings
 from bot.extract import UnreadableScan
 from bot.fsm import SQLiteStorage
@@ -158,6 +160,20 @@ async def test_caption_sets_document_place(setup):
         file_id="f3", file_unique_id="u3", file_name="Опеньки.txt", file_size=40)))
     assert 'рукавичка "Під вербою"' in telegram.sent[-1].text
     assert llm.prompts == []
+
+
+async def test_caption_for_two_mittens_asks_to_split_the_document(setup):
+    # The text names one mitten, but the sender says the document is for two: it is not filed for either.
+    dispatcher, bot, telegram, llm, store = setup
+    store.set_user_name(USER.id, "Їжак", datetime.now(timezone.utc))
+    telegram.file_bytes = "У рукавичці Під дубом внесок 4 жолуді.".encode()
+    await dispatcher.feed_update(bot, document_update("Внески.txt", "c2", caption="для Під дубом і Під вербою"))
+    assert telegram.sent[-1].text == texts.DOC_SPLIT.format(title="Внески", mittens="Під дубом, Під вербою")
+    # Typed in answer, two mittens are no one place for the whole document either.
+    await dispatcher.feed_update(bot, message(text="Під дубом і Під вербою"))
+    assert store.documents_of(USER.id) == [] and await flow_state(dispatcher, bot) == Flow.waiting_doc_place.state
+    await dispatcher.feed_update(bot, message(text="Під дубом"))
+    assert [doc.scope.describe() for doc in store.documents_of(USER.id)] == ['рукавичка "Під дубом"']
 
 
 async def test_invites_let_neighbours_in(setup):
@@ -1158,6 +1174,25 @@ async def test_empty_file_is_not_taken_for_a_scan(setup):
     telegram.file_bytes = b"   \n"
     await dispatcher.feed_update(bot, document_update("Порада.txt", "e1"))
     assert telegram.sent[-1].text == texts.DOC_NO_TEXT.format(filename="Порада.txt")
+
+
+async def test_blank_pdf_is_an_empty_file_not_a_scan(setup):
+    # Mishka was told an empty file is not saved and the bot says it is empty: a PDF with blank pages too.
+    dispatcher, bot, telegram, _, store = setup
+    pdf = pdfium.PdfDocument.new()
+    pdf.new_page(595, 842)
+    blank = io.BytesIO()
+    pdf.save(blank)
+    telegram.file_bytes = blank.getvalue()
+    await dispatcher.feed_update(bot, document_update("Порада.pdf", "e2"))
+    assert telegram.sent[-1].text == texts.DOC_NO_TEXT.format(filename="Порада.pdf")
+    assert store.documents_of(USER.id) == [] and await flow_state(dispatcher, bot) is None
+
+
+def test_answer_promised_later_comes_within_about_ten_minutes():
+    # Mishka was told the answer promised later comes within about 10 minutes; each try may take a question's time.
+    worst = sum(handlers.LATER_PAUSES) + len(handlers.LATER_PAUSES) * QUESTION_SECONDS
+    assert 9 * 60 < worst <= 11 * 60
 
 
 @pytest.fixture

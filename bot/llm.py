@@ -83,7 +83,10 @@ class LLM:
         the known free-tier models it can use take their place."""
         try:
             available = {model.id for model in (await self.client.models.list()).data}
-        except groq.APIError as error:
+        except groq.AuthenticationError as error:
+            # With a wrong key every question would look like a busy model: better to stop now and say why.
+            raise SystemExit(f"Groq does not accept GROQ_API_KEY ({error}). Check the key, see .env.example.") from None
+        except groq.APIError as error:  # Groq or the network down: the key may be fine, the bot starts anyway
             log.warning("Could not list Groq models: %s", error)
             return
         # The known free-tier models stand in only when none of the configured ones is offered any more:

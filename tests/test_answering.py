@@ -676,6 +676,41 @@ async def test_willow_answer_without_one_of_its_forest_parts_is_asked_again(stor
     assert len(llm.prompts) == 1
 
 
+async def test_willow_answer_with_neither_forest_part_is_asked_again(store, forest):
+    # Mishka's reference answer to "Де шукати гриби біля верби?" takes both parts' guides and the mitten's own advice.
+    add_archive(store, forest, "Грибний путівник біля річки", "Цей путівник для тих, хто живе біля річки. "
+                                                               "Опеньки ростуть на старих вербах і пеньках біля води.")
+    add_archive(store, forest, "Грибний путівник листяного лісу", "Любі сусіди з листяного лісу! "
+                                                                   "Білі гриби тримаються старих дубів.")
+    add_archive(store, forest, "Чим поживитись поруч із рукавичкою Під вербою", "Опеньки ростуть на корінні верби.")
+    full = ("Біля рукавички опеньки ростуть на корінні верби. Біля річки опеньки — на старих вербах і пеньках біля "
+            "води, у листяному лісі білі гриби тримаються старих дубів.")
+    llm = FakeLLM({"found": True, "answer": "Опеньки ростуть на корінні верби.", "sources": [1]},
+                  {"found": True, "answer": full, "sources": [1, 2, 3]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Де шукати гриби біля верби?", NOW)
+    second = llm.prompts[1][1]
+    # Each part is named with its own document, so the model does not take the two for one part.
+    order = [line for line in llm.prompts[0][1].splitlines() if line.startswith("[")]
+    deciduous = next(i for i, line in enumerate(order, 1) if "листяного" in line)
+    river = next(i for i, line in enumerate(order, 1) if "біля річки" in line)
+    assert ('У відповіді немає поради для частин "листяний ліс" (документ [%d]), "біля річки" (документ [%d]).'
+            % (deciduous, river)) in second and "сказавши, до якої частини лісу належить кожна порада" in second
+    assert "«Білі гриби тримаються старих дубів.»" in second and "«Опеньки ростуть на старих вербах" in second
+    assert reply.text.startswith(full) and "Грибний путівник листяного лісу" in reply.text
+    assert "Грибний путівник біля річки" in reply.text
+    # The statute answers who lives there: a part's document on another topic is nothing left out.
+    add_archive(store, forest, "Статут ОСМД Під вербою", "Мешканці. У рукавичці живуть Жабка, Качка і Горобець.")
+    add_archive(store, forest, "Що їсти біля річки", "Ця пам'ятка для звірів, що живуть біля річки. Рогіз і очерет.")
+    llm = FakeLLM({"found": True, "answer": "Жабка, Качка і Горобець.", "sources": [1]})
+    await Answerer(store, forest, llm, TZ).ask("Хто живе під вербою?", NOW)
+    assert len(llm.prompts) == 1
+    # A mitten in one forest part needs no advice of its part beside its own.
+    add_archive(store, forest, "Чим поживитись поруч із рукавичкою Під дубом", "Білі гриби під самим дубом.")
+    llm = FakeLLM({"found": True, "answer": "Білі гриби під самим дубом.", "sources": [1]})
+    await Answerer(store, forest, llm, TZ).ask("Де шукати гриби під дубом?", NOW)
+    assert len(llm.prompts) == 1
+
+
 DUES_FACTS = ["[1, рукавичка] Внесок 4 жолуді з дорослого звіра на місяць, здавати до 10 числа.",
               "[1, рукавичка] Внески віддають Кабанові в кошик біля входу.",
               "[1, рукавичка] Замість 4 жолудів можна віддати 2 лісові горіхи."]
@@ -858,6 +893,58 @@ async def test_advice_that_gives_way_stands_in_its_own_paragraph(store, forest):
     assert cite.startswith("Джерела:") and "автор: Їжачок" in cite and '"Що робити при пожежі"' in cite
     system = llm.prompts[0][0]
     assert 'коротко перекажи її в полі "other"' in system and '"other":' in system
+
+
+async def test_advice_that_gives_way_is_never_shown_without_its_document(store, forest):
+    # Mishka (20:46): the advice that gives way is mentioned with who sent it and when. With the answer's document
+    # alone among the sources, the one it retells is missing.
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць.")
+    add_animal(store, "Нові внески", "Для рукавички Під дубом: внесок тепер 5 жолудів.", Scope("mitten", "Під дубом"),
+               name="Білочка")
+    other = "Білочка пише, що внесок тепер 5 жолудів, але тут діє архів."
+    alone = {"facts": ["[1, рукавичка] Внесок 4 жолуді на місяць.", "[2, рукавичка] Внесок тепер 5 жолудів."],
+             "found": True, "answer": "4 жолуді на місяць.", "other": other, "sources": [1]}
+    # Asked to add it, the model does, though the facts of the document now cited are left out of the answer.
+    llm = FakeLLM(alone, dict(alone, other="Білочка пише інакше.", sources=[1, 2]))
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert len(llm.prompts) == 2 and 'додай у "sources" після джерел відповіді номер документа' in llm.prompts[1][1]
+    answer, note, cite = reply.text.split("\n\n")
+    assert note == "Білочка пише інакше." and "Лісовий архів" in cite and "автор: Білочка" in cite
+    # Still without it, the paragraph goes; and the reminder rides in the one second try with the others.
+    basket = alone["facts"] + ["[1, рукавичка] Внески віддають Кабанові в кошик біля входу."]
+    llm = FakeLLM(dict(alone, facts=basket), dict(alone))
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert len(llm.prompts) == 2 and "пункти, яких немає" in llm.prompts[1][1] and '"other": ""' in llm.prompts[1][1]
+    assert reply.text == ('4 жолуді на місяць.\n\nДжерело: "Членські внески рукавички Під дубом" (Лісовий архів, '
+                          'місце: рукавичка "Під дубом")')
+    # With one document given there is none to add: no second try, and the paragraph goes.
+    add_archive(store, forest, "Членські внески рукавички У соснах", "Внесок 3 шишки на місяць.")
+    llm = FakeLLM({"found": True, "answer": "3 шишки на місяць.", "other": "Під дубом платять жолудями.",
+                   "sources": [1]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок у соснах?", NOW)
+    assert len(llm.prompts) == 1 and reply.text.startswith("3 шишки на місяць.\n\nДжерело:")
+
+
+async def test_advice_that_gives_way_without_its_document_weighs_less_than_the_places_rules(store, forest):
+    # Dropped anyway without its document, the paragraph that gives way never keeps the first try over a second one
+    # that puts the archive first (20:46) or brings back a point it left out.
+    add_archive(store, forest, "Членські внески рукавички Під дубом",
+                "Внесок 4 жолуді на місяць. Віддавати Кабанові в кошик біля входу.")
+    add_animal(store, "Нові внески", "Для рукавички Під дубом: внесок тепер 5 жолудів.", Scope("mitten", "Під дубом"),
+               name="Білочка")
+    dues = ["[1, рукавичка] Внесок 4 жолуді на місяць.", "[1, рукавичка] Внески віддають Кабанові в кошик біля входу."]
+    other = "Білочка пише про 5 жолудів, але тут діє архів."
+    llm = FakeLLM({"facts": ["[2, рукавичка] Внесок тепер 5 жолудів."], "found": True,
+                   "answer": "5 жолудів на місяць.", "sources": [2]},
+                  {"facts": dues, "found": True, "answer": "4 жолуді на місяць.", "other": other, "sources": [1]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert "документ Лісового архіву [1]" in llm.prompts[1][1]
+    assert reply.text.startswith("4 жолуді на місяць.\n\nДжерело:") and "Лісовий архів" in reply.text
+    full = "4 жолуді на місяць, Кабанові в кошик біля входу."
+    llm = FakeLLM({"facts": dues, "found": True, "answer": "4 жолуді на місяць.", "sources": [1]},
+                  {"facts": dues, "found": True, "answer": full, "other": other, "sources": [1]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert len(llm.prompts) == 2 and reply.text.startswith(full + "\n\nДжерело:")
 
 
 def word_text(paragraphs: list[str]) -> str:

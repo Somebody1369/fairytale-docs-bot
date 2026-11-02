@@ -10,9 +10,9 @@ import time
 import pytest
 
 from bot import classify
-from bot.classify import CLASSIFY_SECONDS, classify_document
+from bot.classify import CLASSIFY_SECONDS, SPLIT, classify_document
 from bot.llm import LLMUnavailable
-from bot.places import FOREST_SCOPE
+from bot.places import FOREST_SCOPE, Scope
 
 from .conftest import FakeLLM
 
@@ -116,6 +116,37 @@ CASES = [
     ('s15', 'Порада', 'Для мешканців хвойно-дубового лісу: жолуді збирайте після морозу.', 'ask'),
     # The sender sees the mittens in the text's order, also one named by its tree ("біля сосон" is У соснах).
     ('s16', 'Порада', 'Для мешканців Під дубом і біля сосон: збори в суботу.', 'split:Під дубом, У соснах'),
+    # A line headed by a mitten's own name is that mitten's section, though the mitten is not called one.
+    ('s17', 'Внески', 'Під дубом: внесок 4 жолуді.\nПід вербою: внесок 3 горіхи.', 'split:Під дубом, Під вербою'),
+    ('s18', 'Внески', 'Під ялиною — 2 шишки\nУ соснах — 3 шишки', 'split:Під ялиною, У соснах'),
+    ('s19', 'Внески на листопад', 'Внески на листопад\n- Під дубом: 4 жолуді.\n- «У ліщині» - 3 горіхи.',
+     'split:Під дубом, У ліщині'),
+    ('s20', 'Внески', 'Під дубом: внесок 4 жолуді.\nУ рукавичці Під вербою внесок 3 горіхи.', 'split:Під дубом, Під вербою'),
+    ('s21', 'Внески', 'Шановні мешканці рукавички Під дубом! Внесок 4 жолуді.\nПід вербою: внесок 3 горіхи.',
+     'split:Під дубом, Під вербою'),
+    # ... but a guide for a forest part or the whole forest is not split by its sections (Mishka, 29 October, 22:05).
+    ('s22', 'Внески листяного лісу', 'Під дубом: 4 жолуді.\nПід вербою: 3 горіхи.', 'part:deciduous'),
+    ('s23', 'Внески', 'Внески для всього лісу.\nПід дубом: 4 жолуді.\nПід вербою: 3 горіхи.', 'forest:'),
+    ('s24', 'Внески в кожній рукавичці', 'Під дубом: 4 жолуді.\nПід вербою: 3 горіхи.', 'ask'),
+    # A tree heading a line is no mitten's section, nor is a mitten's name inside a longer word.
+    ('s25', 'Гриби', 'Під ялинами: рижики.\nПід дубом: білі гриби.', 'ask'),
+    ('s26', 'Гриби', 'Під дубом-велетнем ростуть білі гриби.\nПід вербою-старою ростуть опеньки.', 'ask'),
+    # Lists as Word, PDFs and plain text write them: bullets, numbers, "--", a non-breaking space before the dash.
+    ('s27', 'Внески', 'Внески:\n• Під дубом: 4 жолуді.\n• Під вербою: 3 горіхи.', 'split:Під дубом, Під вербою'),
+    ('s28', 'Внески', 'Внески:\n1. Під дубом: 4 жолуді.\n2) Під вербою -- 3 горіхи.', 'split:Під дубом, Під вербою'),
+    ('s29', 'Внески', ' Під ялиною — 2 шишки\n У соснах — 3 шишки', 'split:Під ялиною, У соснах'),
+    # A dash after a landmark beside no other section is a sentence: the note stays its mitten's.
+    ('s30', 'Правила', 'Шановні мешканці рукавички Під вербою!\nБіля бобрової греблі — глибоко, малечу туди не пускайте.',
+     'mitten:Під вербою'),
+    ('s31', 'Правила', 'Мешканцям рукавички Під дубом:\nНа узліссі — суниці, збирайте в червні.', 'mitten:Під дубом'),
+    ('s32', 'Правила', 'У рукавичці Під дубом нові правила.\nБіля мурашника — не ходіть, мурахи кусаються.',
+     'mitten:Під дубом'),
+    ('s33', 'Правила Під вербою', 'Біля бобрової греблі — глибоко, малечу туди не пускайте.', 'mitten:Під вербою'),
+    # Nor does a line a PDF broke inside a sentence head a section.
+    ('s34', 'Правила', 'У рукавичці На узліссі нові правила. Жолуді, що лежать\nпід дубом — не чіпайте, це запас Кабана.',
+     'mitten:На узліссі'),
+    ('s35', 'Гриби', 'Порада про гриби. Білі гриби ростуть\nпід дубом — після теплого дощу, а лисички\nу ліщині — у вересні.',
+     'part:deciduous'),
     ('k10', 'Лісник', 'Дубовий лісник приходить щосуботи, зустрічайте його привітно.', 'ask'),
     ('k11', 'Утеплення', 'Гілки ялин кладіть на рукавичку шаром у дві лапи.', 'ask'),
     ('k1', 'Варення', 'Порічки збирайте в липні, коли вони зовсім червоні.', 'ask'),
@@ -132,6 +163,7 @@ CASES = [
     ('t3', 'Гриби для всього лісу', 'Збирайте гриби зранку.', 'forest:'),
     ('t4', 'Внески біля річки', 'Шановні мешканці рукавички Під вербою! Внески до 10 числа.', 'mitten:Під вербою'),
     ('t5', 'Внески Під дубом', 'У рукавичці У соснах внески 3 шишки з дорослого звіра.', 'ask'),
+    ('t9', 'Внески Під дубом', 'У соснах: внески 3 шишки з дорослого звіра.', 'ask'),
     ('t6', 'Звірі лісу та їхні рукавички', 'У рукавичці Під дубом живуть Кабан, Сова і Їжак.', 'ask'),
     ('t7', 'Стежки до всіх рукавичок', 'Від рукавички У соснах до інших рукавичок ведуть стежки.', 'ask'),
     ('t8', 'Гриби під дубом і в соснах', 'Збирайте після дощу.', 'ask'),
@@ -205,6 +237,25 @@ async def test_place_is_never_guessed(forest, case_id, title, text, expected):
         assert scope is not None and scope.encode() == expected
     else:
         assert scope is None if expected == "ask" else scope is None or scope.encode() == expected
+
+
+async def test_sections_of_two_mittens_are_not_filed_for_the_forest_part_they_share(forest):
+    # "Під дубом: ...", "Під вербою: ...": advice for two mittens, so the model is not offered the deciduous forest.
+    llm = FakeLLM({"kind": "part", "value": "листяний ліс"})
+    text = "Під дубом: внесок 4 жолуді з дорослого звіра.\nПід вербою: внесок 3 горіхи з дорослого звіра."
+    assert await classify_document("Внески", text, forest, llm) == Scope(SPLIT, "Під дубом, Під вербою")
+    assert llm.prompts == []
+
+
+LANDMARK_CASES = [case for case in CASES if case[0] in {"s30", "s31", "s32", "s33", "s34"}]
+
+
+@pytest.mark.parametrize("case_id, title, text, expected", LANDMARK_CASES, ids=[case[0] for case in LANDMARK_CASES])
+async def test_mitten_as_a_landmark_heads_no_section(forest, case_id, title, text, expected):
+    # Neither split nor asked about: the note is filed for its mitten, without the model.
+    llm = FakeLLM({"kind": "unclear", "value": ""})
+    scope = await classify_document(title, text, forest, llm)
+    assert scope is not None and scope.encode() == expected and llm.prompts == []
 
 
 TREE_CASES = [case for case in CASES if case[0] in {"p12", "p13", "p14", "p15", "p16"}]

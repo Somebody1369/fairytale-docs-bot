@@ -42,7 +42,7 @@ class TooManyScannedPages(ValueError):
 
 
 class UnreadableScan(ValueError):
-    """Tesseract did not finish a scanned page in OCR_PAGE_SECONDS."""
+    """Tesseract did not finish a scanned page in OCR_PAGE_SECONDS, or pages with pictures or drawings gave no text."""
 
 
 class OcrFailed(UnreadableScan):
@@ -142,11 +142,21 @@ def _pdf_text(data: bytes, ocr_langs: str) -> str:
             raise TooManyScannedPages(len(scanned))
         for index in scanned:
             pages[index] = _ocr_page(pdf[index], ocr_langs) or pages[index]
+        # No text at all: a blank PDF is just an empty file, but pages with pictures or drawings are a scan
+        # (or text turned into curves) the bot could not read, and the sender is asked for a text layer.
+        if not any(text.strip() for text in pages) and any(_has_drawing(pdf[index]) for index in range(len(pdf))):
+            raise UnreadableScan("no text on any page")
     return "\n\n".join(pages)
 
 
 def _has_image(page) -> bool:
     return next(page.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_IMAGE]), None) is not None
+
+
+def _has_drawing(page) -> bool:
+    # Text objects already gave their text: spaces alone, as in a blank text file printed to PDF, are no content.
+    drawn = [pdfium_c.FPDF_PAGEOBJ_PATH, pdfium_c.FPDF_PAGEOBJ_IMAGE, pdfium_c.FPDF_PAGEOBJ_SHADING]
+    return next(page.get_objects(filter=drawn), None) is not None
 
 
 def _ocr_page(page, ocr_langs: str) -> str:

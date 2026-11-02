@@ -60,9 +60,10 @@ class App:
 BIG_PDF_BYTES = 1024 * 1024  # a scan this big takes a while to read, so the sender is told
 FOLLOW_UP_MINUTES = 30
 # When every Groq model rests after its rate limit for longer than a question may take, the bot does not
-# give up: Telegram lets it answer whenever it likes, so it asks again after each of these pauses (seconds),
-# about 10 minutes in all.
-LATER_PAUSES = (30, 60, 90, 120, 150, 150)
+# give up: Telegram lets it answer whenever it likes, so it asks again after each of these pauses (seconds).
+# The tries count too, each up to QUESTION_SECONDS: 7 minutes of pauses and 5 tries keep the answer within
+# the promised "about 10 minutes" even when every try takes all its time.
+LATER_PAUSES = (30, 60, 90, 120, 120)
 LATER_PER_CHAT = 3  # beyond this many waiting questions the animal is asked to try again itself
 # Documents waiting for their sender's name or place keep their whole text in the dialog state, and /cancel
 # lists their titles in one message: beyond this many the animal is asked to send the file again later.
@@ -145,7 +146,7 @@ def typed_place(text: str, forest: Forest) -> Scope | None:
     rest = re.findall(r"[а-яіїєґ']+", forest.strip_places(re.sub(WHOLE_FOREST_CAPTION, " ", normalize(text))))
     if any(word not in STOPWORDS | PLACE_REPLY_WORDS for word in rest):
         return None
-    return scope_from_caption(text, forest)
+    return scope if (scope := scope_from_caption(text, forest)) and scope.kind != SPLIT else None
 
 
 QUESTION_WORDS = {"скільки", "що", "де", "коли", "як", "хто", "чому", "навіщо", "нащо", "який", "яка", "яке", "які", "чи",
@@ -550,9 +551,8 @@ async def document(message: Message, state: FSMContext, app: App, bot: Bot) -> N
         log.warning("Cannot read %s: %s", filename, error, exc_info=True)
         await message.answer(texts.DOC_UNREADABLE.format(filename=filename))
         return
-    if not text.strip():
-        # A PDF without text is a scan that could not be read; any other file is just empty.
-        await message.answer((texts.DOC_EMPTY if ext == ".pdf" else texts.DOC_NO_TEXT).format(filename=filename))
+    if not text.strip():  # a PDF with a picture or drawing but no text came as UnreadableScan: this file is empty
+        await message.answer(texts.DOC_NO_TEXT.format(filename=filename))
         return
 
     pending = {"id": uuid.uuid4().hex[:8], "filename": filename, "title": title_from_filename(filename),
