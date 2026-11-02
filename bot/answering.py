@@ -4,6 +4,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 from .llm import LLM, LLMUnavailable
@@ -14,9 +15,15 @@ from . import texts
 
 MAX_DOCS = 7  # documents in one answer prompt; archive documents are short (under 1100 characters)
 DOC_CHARS = 2500  # a long guide from an animal is cut to the parts that match the question
-# All documents' text in one prompt. Groq's free tier takes about 8000 tokens a minute, which is
-# about 20000 characters of Ukrainian, and the rules, the calendar and the question need their share.
-PROMPT_DOC_CHARS = 12000
+# Groq's free tier admits a request only when its prompt plus max_completion_tokens fits the model's 8000 tokens
+# a minute; qwen also takes at most 7000 for the prompt alone. Measured on 2 November 2026, these prompts are
+# 2.55 characters a token on gpt-oss, and qwen counted the same prompt 1% longer: 2.5 fits both.
+TOKENS_PER_MINUTE = 8000
+INPUT_TOKENS_PER_MINUTE = 7000
+CHARS_PER_TOKEN = 2.5
+# Left free for a count a little off. A second try's reminders may still go over: llm.py then asks with a smaller
+# reply budget, and if that fails too, the first answer holds.
+SPARE_TOKENS = 200
 # Keyword search keeps the best documents of every level (mitten, each forest part, whole forest)
 # separately, so a strong whole-forest match cannot push the mitten's own advice out. A mitten has
 # only a handful of documents and they matter most, so any of them that matches at all may go.
@@ -38,7 +45,7 @@ PICK_SECONDS = 10
 PICK_TOKENS = 400
 LOCATIVE = {"під", "біля", "коло", "поблизу", "у", "в", "на", "серед", "над", "за", "між"}  # a place at a line's start
 LEVEL_NAMES = {"mitten": "рукавичка", "part": "частина лісу", "forest": "увесь ліс"}
-PICK_ANIMAL_TITLES = 150  # newest animals' documents shown to the model when it picks by title
+PICK_ANIMAL_TITLES = 150  # newest animals' documents shown to the model when it picks by title, as many as fit
 # How much of the calendar a question gets. Groq counts the prompt and the reply's budget against the 8000 tokens
 # a minute, and while "коли" brought nearly every question the whole calendar and longer thinking, 10 of 12
 # questions in a row in a live check fell back to weaker models, which answered worse.
@@ -135,6 +142,22 @@ class Reply:
     kind: str  # "answer" | "not_found" | "need_place" | "unavailable"
     text: str = ""
     mittens: list[str] = field(default_factory=list)  # need_place: the mittens to choose from, empty means all
+
+
+class Draft(NamedTuple):
+    """The model's answer with its sources, kept while the model is asked to put it right."""
+    answer: str
+    other: str
+    sources: list[Document]
+    faults: int  # how many of the places' rules it breaks
+    facts: list  # the points the model listed from the documents
+
+
+def prompt_chars(max_tokens: int) -> int:
+    """How many characters a prompt, system prompt included, may take for Groq's free tier to admit it with
+    this budget for the reply, on every model."""
+    tokens = min(TOKENS_PER_MINUTE - max_tokens, INPUT_TOKENS_PER_MINUTE) - SPARE_TOKENS
+    return int(tokens * CHARS_PER_TOKEN)
 
 
 def format_date(moment: datetime, tz: ZoneInfo) -> str:
@@ -308,17 +331,30 @@ def by_number(numbers, items: list) -> list:
     return chosen
 
 
-def best_per_level(hits: list[Hit]) -> list[Document]:
-    """The best keyword matches of each place separately: the mitten, each of its forest parts, the whole forest."""
+def best_per_level(hits: list[Hit]) -> tuple[list[Document], list[Document]]:
+    """The best keyword matches of each place separately: the mitten, each of its forest parts, the whole forest.
+    Each place's best match comes apart from the others, so it can be given a seat in the prompt first."""
     groups: dict[str, list[Hit]] = {}
     for hit in hits:
         groups.setdefault(hit.doc.scope.encode(), []).append(hit)
-    chosen: list[Hit] = []
+    firsts: list[Hit] = []
+    others: list[Hit] = []
     for group in groups.values():
         kind, best = group[0].doc.scope.kind, group[0].score
-        chosen += [hit for hit in group if hit.score >= LEVEL_CUTOFF[kind] * best][:LEVEL_LIMIT[kind]]
-    # The mitten's own documents first, so they survive when the prompt is full.
-    return [hit.doc for hit in sorted(chosen, key=lambda hit: (-hit.doc.scope.level, -hit.score))]
+        matching = [hit for hit in group if hit.score >= LEVEL_CUTOFF[kind] * best]
+        kept = matching[:LEVEL_LIMIT[kind]]
+        # Between animals' documents for one place the newer advice wins: with an animal's document kept, the newest
+        # animal's match comes too, however it scores, in a seat of its own, so no archive document gives way to it.
+        # Archive files stay as they are: one edited later is another document, not a newer version of the others.
+        animals = [hit for hit in matching if not hit.doc.from_archive]
+        newest = max(animals, key=lambda hit: hit.doc.created_at, default=None)
+        if newest and newest not in kept and any(not hit.doc.from_archive for hit in kept):
+            kept.append(newest)
+        firsts.append(kept[0])
+        others += kept[1:]
+    # The mitten's documents first, then the forest parts', then the whole forest's.
+    by_level = lambda chosen: [hit.doc for hit in sorted(chosen, key=lambda hit: (-hit.doc.scope.level, -hit.score))]
+    return by_level(firsts), by_level(others)
 
 
 def merge(first: list[Document], second: list[Document], limit: int) -> list[Document]:
@@ -389,10 +425,15 @@ class Answerer:
     async def _docs_for_place(self, question: str, allowed, deadline: float) -> list[Document]:
         """Keyword matches level by level, plus what the model picks by title: "що їсти" finds
         "Чим поживитись поруч із рукавичкою" that shares no word with the question."""
-        hits = self.index.search(self.forest.strip_places(question), allowed, limit=60, cutoff=0)
+        # All matches: a mitten's own documents count however low they score, so none is cut before grouping.
+        hits = self.index.search(self.forest.strip_places(question), allowed, limit=None, cutoff=0)
         candidates = [doc for doc in self.index.documents if allowed(doc)]
         picked = await self._pick_by_title(question, candidates, deadline)
-        return merge(picked, best_per_level(hits), limit=MAX_DOCS)
+        # Each place's best match before the picks: four deciduous and whole-forest picks once left "Під вербою"
+        # without its river part's guide. The mitten's own other matches too, so they survive when the prompt is full.
+        firsts, others = best_per_level(hits)
+        own = [doc for doc in others if doc.scope.kind == "mitten"]
+        return merge(firsts + own + picked, others, limit=MAX_DOCS)
 
     def _varies_by_place(self, question: str) -> bool:
         """Whether particular places have advice of their own on the topic, as strong as the whole forest's. Then the
@@ -426,13 +467,21 @@ class Answerer:
         """A light model chooses documents by their titles; keyword search alone misses synonyms."""
         archive = [doc for doc in candidates if doc.from_archive]
         animals = sorted((doc for doc in candidates if not doc.from_archive), key=lambda d: d.created_at, reverse=True)
-        candidates = archive + animals[:PICK_ANIMAL_TITLES]
+        head = f"Питання: {question}\n\nДокументи:\n"
+        # Every archive title, then the newest animals' titles while the prompt still fits Groq's minute.
+        room = prompt_chars(PICK_TOKENS) - len(PICK_SYSTEM) - len(head)
+        candidates, lines = [], []
+        for doc in archive + animals[:PICK_ANIMAL_TITLES]:
+            line = f"{len(lines) + 1}. {self._title_line(doc)}"
+            room -= len(line) + 1
+            if room < 0 and not doc.from_archive:
+                break
+            candidates.append(doc)
+            lines.append(line)
         if not candidates:
             return []
-        listing = "\n".join(f"{i}. {self._title_line(doc)}" for i, doc in enumerate(candidates, 1))
         try:
-            result = await self.llm.json(PICK_SYSTEM, f"Питання: {question}\n\nДокументи:\n{listing}",
-                                         max_tokens=PICK_TOKENS, fast=True,
+            result = await self.llm.json(PICK_SYSTEM, head + "\n".join(lines), max_tokens=PICK_TOKENS, fast=True,
                                          deadline=min(deadline, time.monotonic() + PICK_SECONDS))
         except LLMUnavailable:
             return []
@@ -455,31 +504,33 @@ class Answerer:
         # so only questions that count dates from today get longer thinking and the days of the months.
         need = calendar_need(question)
         reasoning, budget = ("medium", 2000) if need == "days" else ("low", 1500)
-        size = self._excerpt_size(docs)
-        blocks = [self._doc_block(i, doc, question, mittens, parts, size) for i, doc in enumerate(docs, 1)]
         # "Де шукати гриби біля верби?" is about mushrooms for the mitten, not about willow trees.
         topic = re.sub(r"\s+", " ", self.forest.strip_places(question)).strip(" ?.!,") if named else ""
         # A place found by a resident ("коли Ведмідь лягає спати?") was not asked about: no labels for it.
         varies = ("так" if self._varies_by_place(question) else "ні") if named and not resident else ""
-        prompt = (
+        system = ANSWER_SYSTEM + place_rule
+        head = (
             f"{calendar_note(now, self.tz, need)}\n\n"
             f"Питання звіра: {question}\n"
             f"Місце з питання: {place}\n"
             + (f"Тема питання без місця: {topic}\n" if topic else "")
             + (f"Поради на цю тему різні в різних місцях: {varies}\n" if varies else "")
-            + "\nДокументи:\n\n" + "\n\n".join(blocks)
+            + "\nДокументи:\n\n"
         )
-        system = ANSWER_SYSTEM + place_rule
+        headers = [self._doc_header(i, doc) for i, doc in enumerate(docs, 1)]
+        # The documents' text gets what Groq's minute leaves after the rules, the calendar, the question and the reply.
+        room = prompt_chars(budget) - len(system) - len(head) - sum(map(len, headers))
+        size = self._excerpt_size(docs, room)
+        prompt = head + "\n\n".join(header + self._excerpt(doc, question, mittens, parts, size)
+                                    for header, doc in zip(headers, docs, strict=True))
         asked_sources = False
-        # The first answer with sources, (answer, other, sources, faults, facts), while the model is asked once
-        # to put it right.
-        first = None
-        while True:
+        kept: Draft | None = None  # the answer so far, kept while the model is asked once to put it right
+        # At most three calls: the answer, once more when it forgot its sources, and once more to put it right.
+        for _ in range(3):
             try:
                 result = await self.llm.json(system, prompt, max_tokens=budget, reasoning=reasoning, deadline=deadline)
             except LLMUnavailable:
-                if first:  # no time or no model left for the second try: the first answer still holds
-                    answer, other, sources = first[:3]
+                if kept:  # no time or no model left for the second try: the first answer still holds
                     break
                 return Reply("unavailable", texts.LLM_UNAVAILABLE)
             answer = clean_text(result.get("answer"), len(docs))
@@ -491,9 +542,8 @@ class Answerer:
             # A flag written as a string: "false" is no, as for "found".
             needs_place = bool(place_rule) and result.get("needs_place") in (True, "true")
             gave_up = needs_place or result.get("found") in (False, "false") or not answer
-            if first and (gave_up or not sources):
-                answer, other, sources = first[:3]  # asked to put it right, the model lost the answer: keep the first
-                break
+            if kept and (gave_up or not sources):
+                break  # asked to put it right, the model lost the answer: keep the first
             if needs_place:
                 return Reply("need_place")
             if gave_up:
@@ -506,22 +556,32 @@ class Answerer:
                 continue
             facts = result.get("facts") if isinstance(result.get("facts"), list) else []
             reminders, faults = self._review(question, docs, mittens, named, answer, other, sources, facts)
-            if first:
+            draft = Draft(answer, other, sources, faults, facts)
+            if kept:
                 # The one second try is taken unless it came out worse: more broken rules, or more of the points
                 # both answers listed left out (a weaker fallback model may answer it worse than the first).
-                every = first[4] + facts
-                before = (first[3], len(missing_facts(every, docs, first[2], f"{first[0]} {first[1]}", question)))
+                every = kept.facts + facts
+                before = (kept.faults,
+                          len(missing_facts(every, docs, kept.sources, f"{kept.answer} {kept.other}", question)))
                 after = (faults, len(missing_facts(every, docs, sources, f"{answer} {other}", question)))
-                if after > before:
-                    answer, other, sources = first[:3]
+                if after <= before:
+                    kept = draft
                 break
+            kept = draft
             if not reminders:
                 break
             # Everything to put right goes in one second try: each try costs a Groq request, and the free tier
             # allows only so many tokens a minute.
-            first = (answer, other, sources, faults, facts)
             prompt += "".join(reminders)
 
+        answer, other, sources = kept.answer, kept.other, kept.sources
+        # A document deleted, replaced or revoked while the model was answering is no source any more, nor is what it
+        # says. The answer comes from the first source; the advice that gives way retells a later one.
+        gone = [doc for doc in sources if (current := self.store.get(doc.id)) is None or current.status != "active"]
+        if gone:
+            if sources[0] in gone:
+                return Reply("not_found", texts.NOT_FOUND)
+            sources, other = [doc for doc in sources if doc not in gone], ""
         if len(sources) == 1:
             cite = "Джерело: " + source_line(sources[0], self.tz)
         else:
@@ -657,8 +717,8 @@ class Answerer:
             return ", ".join(PART_NAMES[p] for p in parts)
         return "не вказано"
 
-    def _doc_block(self, number: int, doc: Document, question: str, mittens: list[str], parts: list[str],
-                   size: int) -> str:
+    def _doc_header(self, number: int, doc: Document) -> str:
+        """The lines over a document's text in the prompt: its number, place, level and origin."""
         if doc.from_archive:
             origin = f"Лісовий архів (стандартний документ лісу), версія від {human_date(doc.modified_at, self.tz)}"
         else:
@@ -669,15 +729,15 @@ class Answerer:
             f"Для кого: {doc.scope.describe()}\n"
             f"Рівень: {LEVEL_NAMES[doc.scope.kind]}\n"
             f"Звідки: {origin}\n"
-            f"Текст:\n{self._excerpt(doc, question, mittens, parts, size)}"
+            f"Текст:\n"
         )
 
     @staticmethod
-    def _excerpt_size(docs: list[Document]) -> int:
+    def _excerpt_size(docs: list[Document], room: int) -> int:
         """One cut for all documents: the shorter ones go whole, the longer ones are cut to an equal share,
-        and together they stay within PROMPT_DOC_CHARS. Archive documents (under 1100 characters) are
-        never cut: with at most eight documents a share is at least 1500."""
-        left, count = PROMPT_DOC_CHARS, len(docs)
+        and together they stay within `room` characters. Archive documents (under 1100 characters) go whole
+        in the usual case, eight of 650-750 characters even with no place named and the whole calendar."""
+        left, count = max(room, 0), len(docs)
         for length in sorted(len(doc.text) for doc in docs):
             share = left // count
             if length > share:

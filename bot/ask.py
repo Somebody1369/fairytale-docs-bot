@@ -7,7 +7,7 @@ Uses the same database as the bot, so the archive and animals' documents are alr
 
 import asyncio
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from .answering import Answerer
@@ -26,7 +26,7 @@ async def main(question: str) -> None:
     forest = Forest()
     await sync_archive(store, forest, DriveArchive(settings.drive_folder_id, settings.google_api_key, settings.ocr_langs))
     answerer = Answerer(store, forest, LLM(settings.groq_api_key, settings.groq_models), ZoneInfo(settings.timezone))
-    reply = await answerer.ask(question, datetime.now(timezone.utc))
+    reply = await answerer.ask(question, datetime.now(UTC))
     print("Потрібно уточнити рукавичку." if reply.kind == "need_place" else reply.text)
 
 

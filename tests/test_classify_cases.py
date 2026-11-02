@@ -3,12 +3,16 @@
 by itself, nor file a clear one somewhere else. A clear one may still go to the model or be asked about.
 "split:..." is advice for several mittens: Mishka wants one document per place, so the sender splits it."""
 
+import asyncio
+import threading
 import time
 
 import pytest
 
+from bot import classify
 from bot.classify import CLASSIFY_SECONDS, classify_document
 from bot.llm import LLMUnavailable
+from bot.places import FOREST_SCOPE
 
 from .conftest import FakeLLM
 
@@ -67,6 +71,16 @@ CASES = [
     ('w6', 'Збори', 'Усі звірі нашої рукавички: чергування вночі по черзі.', 'ask'),
     ('w7', 'Запаси', 'Звірі лісу збирають жолуді під дубом після першого морозу.', 'ask'),
     ('w8', 'Стежки', 'Стежка від нашої рукавички веде до всіх рукавичок лісу.', 'ask'),
+    # "для лісу", "для всіх", "для річки" inside a sentence are not who the advice is for.
+    ('w9', 'Вогнища', 'У рукавичці Під дубом не паліть вогнищ: це небезпечно для лісу.', 'mitten:Під дубом'),
+    ('w10', 'Вогнища', 'У рукавичці Під дубом не паліть вогнищ, бо вогонь страшний для всіх.', 'mitten:Під дубом'),
+    ('w11', 'Сміття', 'Сміття шкідливе для річки, тож не кидайте його у воду.', 'ask'),
+    # Whatever ends the sentence: a one-line .txt has no final period.
+    ('w12', 'Вогнища', 'У рукавичці Під дубом не паліть вогнищ: це небезпечно для лісу', 'mitten:Під дубом'),
+    ('w13', 'Вогнища', 'У рукавичці Під дубом не паліть вогнищ, бо вогонь страшний для всіх!', 'mitten:Під дубом'),
+    ('w14', 'Вогнища', 'У рукавичці Під дубом не паліть вогнищ: це небезпечно для всього лісу.', 'mitten:Під дубом'),
+    ('w15', 'Сміття', 'Сміття шкідливе для річки', 'ask'),
+    ('w16', 'Сміття', 'Сміття шкідливе для річки й риби, тож не кидайте його у воду.', 'ask'),
     ('e1', 'Рижики', 'Рижики ростуть під ялиною, де багато моху.', 'ask'),
     ('e2', 'Рижики', 'Під ялиною ростуть рижики, де багато моху.', 'ask'),
     ('e3', 'Суниці', 'На узліссі багато суниць у червні.', 'ask'),
@@ -80,6 +94,9 @@ CASES = [
     ('e11', 'Стежки до сусідів', 'До рукавички Під дубом іти 200 кроків на схід, повз старий пень.', 'ask'),
     ('e12', 'Порада', 'Мешканці рукавички Під дубом попросили мене написати пораду для хвойного лісу: шишки збирайте в жовтні.', 'part:conifer'),
     ('e13', 'Вода', 'Порада для всіх, хто живе далеко від річки: воду носіть зранку.', 'ask'),
+    # A tree after "звірам" or "мешканцям" is an address only when nothing but places follows.
+    ('e14', 'Гроза', "Звірам під дубом у грозу стояти небезпечно: блискавка б'є у високі дерева.", 'ask'),
+    ('e15', 'Гроза', 'Мешканцям під ялиною варто знати: у грозу не ховайтеся під деревами.', 'ask'),
     ('s1', 'Порада', 'Порада для хвойного та листяного лісу: утеплюйте рукавички в жовтні.', 'ask'),
     ('s2', 'Порада', 'Шановні мешканці хвойного лісу та біля річки! Збори в суботу.', 'ask'),
     ('s3', 'Порада', 'Для мешканців рукавичок Під дубом і У ліщині: горіхи ділимо порівну.', 'split:Під дубом, У ліщині'),
@@ -135,6 +152,19 @@ CASES = [
     ('a4', 'Горіхи', 'Порада для Під дубом та У ліщині: горіхи ділимо порівну.', 'split:Під дубом, У ліщині'),
     ('a5', 'Утеплення', 'Порада для хвойного лісу, а також для листяного: утеплюйте рукавички в жовтні.', 'ask'),
     ('a6', 'Тиша', 'Мешканцям Під ялиною і Біля мурашника: не шуміть уночі.', 'split:Під ялиною, Біля мурашника'),
+    # Every line of the opening counts, not only the first one addressed.
+    ('a7', 'Внески', 'Для мешканців рукавички Під дубом: внесок 4 жолуді.\nДля мешканців рукавички Під вербою: внесок 3 горіхи.',
+     'split:Під дубом, Під вербою'),
+    ('a8', 'Поради', 'Порада для листяного лісу: збирайте жолуді.\nПорада для хвойного лісу: збирайте шишки.', 'ask'),
+    ('a9', 'Внески', 'Шановні мешканці рукавички Під дубом! Внесок 4 жолуді.\nУ рукавичці У соснах внесок 3 шишки.',
+     'split:Під дубом, У соснах'),
+    # ... and every addressee of a line, also where a PDF breaks the line inside one.
+    ('a10', 'Поради', 'Порада для листяного лісу: збирайте жолуді. Порада для хвойного лісу: збирайте шишки.', 'ask'),
+    ('a11', 'Поради', 'Для мешканців рукавички Під дубом: внесок 4 жолуді. Порада для хвойного лісу: шишки збирайте в жовтні.',
+     'ask'),
+    ('a12', 'Поради', 'Мешканцям біля річки: не ходіть по льоду. Мешканцям хвойного лісу: не паліть вогнищ.', 'ask'),
+    ('a13', 'Поради', 'Порада для листяного лісу: збирайте жолуді після морозу. Порада для\nхвойного лісу: шишки в жовтні.',
+     'ask'),
     ('b1', 'Жолуді', 'Порада для всіх, хто любить відпочивати під ялиною: беріть килимок.', 'ask'),
     ('b2', 'Вода', "Для всіх, хто носить воду з річки: кип'ятіть її.", 'ask'),
     ('b3', 'Мурахи', 'Для всіх, хто проходить повз мурашник: не наступайте на мурах.', 'ask'),
@@ -161,6 +191,7 @@ CASES = [
     ('d5', 'Осінні справи в кожній рукавичці', 'У рукавичці «Під дубом» лагодимо дах.\nУ рукавичці «У соснах» чистимо вхід.',
      'ask'),
     ('o2', 'Стежки до сусідів', 'Повз стару рукавичку Під вербою йдіть до броду.', 'ask'),
+    ('o4', 'Пожежа', 'У рукавичці Під дубом при пожежі збираємося біля рукавички Під вербою.', 'mitten:Під дубом'),
     ('o3', 'Від Під дубом', 'Від нас, рукавички Під дубом: просимо не шуміти.', 'mitten:Під дубом'),
     ('q1', 'Як дійти до Під дубом', 'Від нашої рукавички йдіть на схід 200 кроків.', 'ask'),
     ('q2', 'Подарунок для рукавички Під вербою', 'Ми спекли пиріг і віднесемо його в суботу.', 'mitten:Під вербою'),
@@ -185,6 +216,21 @@ async def test_forest_part_named_by_its_trees_needs_no_model(forest, case_id, ti
     assert scope is not None and scope.encode() == expected
 
 
+@pytest.mark.parametrize("text", [
+    "Порада для всіх.\nГриби збирайте зранку.",
+    "Ця пам'ятка для всіх мешканців.\nГриби збирайте зранку.",
+    "Порада для кожного звіра. Гриби збирайте зранку.",
+    "Коротка пам'ятка для всіх\nГриби збирайте зранку.",
+    "Привіт! Пишу для всіх: не смітіть на стежках.",
+    # The archive's own "Карта лісу": the quoted «для хвойного лісу» further on is cited words, not an address.
+    "Ця карта для всіх мешканців лісу. Коли в пораді сказано «для хвойного лісу» чи «для листяного лісу», "
+    "дивіться на карту.",
+])
+async def test_address_to_everyone_opening_the_sentence_needs_no_model(forest, text):
+    # Inside a sentence "для всіх" is said of anything; opening it, it is the address, whatever ends the sentence.
+    assert await classify_document("Порада", text, forest, FakeLLM()) == FOREST_SCOPE
+
+
 async def test_busy_model_does_not_keep_the_sender_waiting(forest):
     # The sender's next files, and a question that needs the mitten, wait behind this document:
     # when Groq is busy, the sender is asked.
@@ -192,6 +238,22 @@ async def test_busy_model_does_not_keep_the_sender_waiting(forest):
     started = time.monotonic()
     assert await classify_document("Рижики", "Рижики ростуть під ялиною, де багато моху.", forest, llm) is None
     assert llm.deadlines[0] is not None and started < llm.deadlines[0] <= time.monotonic() + CLASSIFY_SECONDS
+
+
+async def test_words_are_checked_while_the_bot_answers_others(forest, monkeypatch):
+    # The words are looked for in the whole text, 10 seconds for 20 MB: other animals must not wait for it.
+    loop_free = threading.Event()
+    addressee = classify._addressee
+
+    def checked_slowly(text, forest):
+        assert loop_free.wait(5), "the words were checked on the event loop"
+        return addressee(text, forest)
+
+    monkeypatch.setattr(classify, "_addressee", checked_slowly)
+    checking = asyncio.create_task(classify_document("Нотатка", "Збирайте гриби після дощу.", forest, FakeLLM()))
+    await asyncio.sleep(0)
+    loop_free.set()  # runs only while the loop is free
+    assert await checking is None
 
 
 async def test_model_is_not_asked_when_no_answer_could_be_taken(forest):

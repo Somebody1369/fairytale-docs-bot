@@ -28,8 +28,8 @@ DEFAULT_MAP: dict[str, frozenset[str]] = {
 }
 
 # How animals refer to each mitten in questions: "під дубом", "біля сосон", "в ліщині"...
-# Only the tree itself names a mitten: "соснові шишки" and "вербові котики" are things, "у сосновому лісі"
-# and "у сосняку" are the conifer forest (Mishka, 30 Oct, 14:18: a mitten only when it is named).
+# Only the tree itself names a mitten: "соснові шишки", "вербові котики" and "ліщинові горіхи" are things,
+# "у сосновому лісі" and "у сосняку" are the conifer forest (Mishka, 30 Oct, 14:18: a mitten only when it is named).
 MITTEN_PATTERNS = {
     "Біля бобрової греблі": r"бобров\w*\s+гребл|\b(?:біля|коло|поблизу|від|до|під|на|у|в)\s+гребл",
     "Біля мурашника": r"мурашник",
@@ -37,7 +37,7 @@ MITTEN_PATTERNS = {
     "Під вербою": r"\bверб(?:а|и|і|у|ою)\b",
     "Під дубом": r"\bдуб(?:ом|а|і|у)?\b",
     "Під ялиною": r"\bялин(?:а|и|і|у|ою|ка|ки|ці|ку|кою)\b",
-    "У ліщині": r"ліщин",
+    "У ліщині": r"\bліщин(?:а|и|і|у|ою|ам|ами|ах|ка|ки|ці|ку|кою|ник\w*)?\b",
     "У соснах": r"\bсосн(?:а|и|і|у|ою|ам|ами|ах)\b|\bсосон\b|\bсосен\b",
 }
 

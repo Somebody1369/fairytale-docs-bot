@@ -158,28 +158,44 @@ class Store:
         return row["token"] if row else self.create_invite(None, now)
 
     def invited_by_chain(self, inviter_id: int) -> list[tuple[int, str | None, datetime, int]]:
-        """Everyone this member brought in, directly or through the animals they invited:
-        (id, the name they gave the bot or else their Telegram name, when they joined, who invited them)."""
-        found, queue = [], [inviter_id]
-        while queue:
-            current = queue.pop(0)
-            rows = self.db.execute(
-                "SELECT m.tg_id, COALESCE(u.name, m.tg_name), m.joined_at, m.invited_by "
-                "FROM members m LEFT JOIN users u ON u.tg_id = m.tg_id "
-                "WHERE m.invited_by = ? ORDER BY m.joined_at",
-                (current,),
-            ).fetchall()
-            for row in rows:
-                found.append((row[0], row[1], datetime.fromisoformat(row[2]), row[3]))
-                queue.append(row[0])
-        return found
+        """Everyone this member brought in, directly or through the animals they invited, in the order they
+        joined: (id, the name they gave the bot or else their Telegram name, when they joined, who invited them)."""
+        rows = self.db.execute(
+            "WITH RECURSIVE chain(tg_id) AS ("
+            "SELECT tg_id FROM members WHERE invited_by = ? "
+            "UNION SELECT m.tg_id FROM members m JOIN chain c ON m.invited_by = c.tg_id) "
+            "SELECT m.tg_id, COALESCE(u.name, m.tg_name), m.joined_at, m.invited_by "
+            "FROM chain c JOIN members m ON m.tg_id = c.tg_id LEFT JOIN users u ON u.tg_id = m.tg_id "
+            "ORDER BY m.joined_at, m.tg_id",
+            (inviter_id,),
+        ).fetchall()
+        return [(row[0], row[1], datetime.fromisoformat(row[2]), row[3]) for row in rows]
+
+    def in_invite_chain(self, member_id: int, inviter_id: int) -> bool:
+        """Whether `inviter_id` brought this member in, directly or through the animals they invited."""
+        return self.db.execute(
+            "WITH RECURSIVE up(tg_id) AS ("
+            "SELECT invited_by FROM members WHERE tg_id = ? "
+            "UNION SELECT m.invited_by FROM members m JOIN up ON m.tg_id = up.tg_id) "
+            "SELECT 1 FROM up WHERE tg_id = ?",
+            (member_id, inviter_id),
+        ).fetchone() is not None
+
+    def member_name(self, tg_id: int) -> str | None:
+        """The name the member gave the bot, or else their Telegram name."""
+        row = self.db.execute(
+            "SELECT COALESCE(u.name, m.tg_name) FROM members m LEFT JOIN users u ON u.tg_id = m.tg_id "
+            "WHERE m.tg_id = ?",
+            (tg_id,),
+        ).fetchone()
+        return row[0] if row else None
 
     def revoke_member(self, member_id: int, by_id: int) -> list[int] | None:
         """Close access for an animal brought in by `by_id` (directly or further down the invite chain),
         and for everyone that animal invited in turn. Their documents stop being used in answers
         (kept with status "revoked") and their unused invites stop working. No admins are needed:
         whoever stands above in the chain can do it, so a sleeping inviter does not leave a stranger in."""
-        if member_id not in {member[0] for member in self.invited_by_chain(by_id)}:
+        if not self.in_invite_chain(member_id, by_id):
             return None
         removed = [member_id] + [member[0] for member in self.invited_by_chain(member_id)]
         for tg_id in removed:
@@ -203,8 +219,8 @@ class Store:
         # 29 October (02:35), was said to hold on 30 October (14:43) and would have died on 5 November.
         if creator is not None and now - datetime.fromisoformat(row["created_at"]) > timedelta(days=INVITE_DAYS):
             return False
-        if creator is not None and (creator == tg_id or not self.is_member(creator)):
-            return False  # one's own spare link, or a link from someone whose access was closed
+        if creator is not None and not self.is_member(creator):
+            return False  # a link from someone whose access was closed
         self.db.execute("UPDATE invites SET used_by = ?, used_at = ? WHERE token = ?", (tg_id, now.isoformat(), token))
         self.db.execute("INSERT OR IGNORE INTO members (tg_id, joined_at, invited_by, tg_name) VALUES (?, ?, ?, ?)",
                         (tg_id, now.isoformat(), creator, tg_name))
@@ -235,21 +251,23 @@ class Store:
         return [self._doc(row) for row in rows]
 
     def add_animal_document(
-        self, *, title: str, filename: str, scope: Scope, author_id: int, author_name: str, text: str, now: datetime
+        self, *, title: str, filename: str, scope: Scope, author_id: int, author_name: str, text: str, now: datetime,
+        status: str = "active",
     ) -> tuple[Document, Document | None]:
         """Save an animal's document. The same animal sending a document with the same
-        title for the same place replaces its previous version."""
+        title for the same place replaces its previous version. A document whose author lost access while
+        it was read is saved "revoked", like their other documents, so a new invite brings back one version."""
         replaced_row = self.db.execute(
-            "SELECT * FROM documents WHERE source = 'animal' AND status = 'active' "
+            "SELECT * FROM documents WHERE source = 'animal' AND status = ? "
             "AND author_id = ? AND norm_title = ? AND scope = ?",
-            (author_id, norm_title(title), scope.encode()),
+            (status, author_id, norm_title(title), scope.encode()),
         ).fetchone()
         replaced = self._doc(replaced_row) if replaced_row else None
         if replaced:
             self.db.execute("UPDATE documents SET status = 'superseded' WHERE id = ?", (replaced.id,))
         doc_id = self._insert(
             source="animal", title=title, filename=filename, scope=scope, author_id=author_id,
-            author_name=author_name, text=text, created_at=now, modified_at=now,
+            author_name=author_name, text=text, created_at=now, modified_at=now, status=status,
         )
         self._changed()
         return self.get(doc_id), replaced
@@ -304,17 +322,21 @@ class Store:
         )
 
     def mark_missing_archive_files(self, present_ids: set[str]) -> int:
-        rows = self.db.execute(
-            "SELECT DISTINCT drive_file_id FROM documents WHERE source = 'archive' AND present = 1"
-        ).fetchall()
-        missing = [row["drive_file_id"] for row in rows if row["drive_file_id"] not in present_ids]
-        for file_id in missing:
-            self.db.execute("UPDATE documents SET present = 0 WHERE drive_file_id = ?", (file_id,))
-        return len(missing)
+        """The number of files gone from Drive: only a file's latest version is present, so one row per file."""
+        ids = list(present_ids)
+        cursor = self.db.execute(
+            "UPDATE documents SET present = 0 WHERE source = 'archive' AND present = 1 "
+            f"AND drive_file_id NOT IN ({', '.join('?' * len(ids))})",
+            ids,
+        )
+        return cursor.rowcount
 
     def recompute_archive_status(self) -> None:
         """One active version per document: the newest present file with that title and place."""
-        rows = self.db.execute("SELECT * FROM documents WHERE source = 'archive'").fetchall()
+        # Not the texts: every version of every archive file is read here at each sync.
+        rows = self.db.execute(
+            "SELECT id, norm_title, scope, present, modified_at, status FROM documents WHERE source = 'archive'"
+        ).fetchall()
         best: dict[tuple[str, str], sqlite3.Row] = {}
         for row in rows:
             if not row["present"]:

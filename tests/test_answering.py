@@ -8,11 +8,12 @@ import docx
 import pytest
 
 from bot import texts
-from bot.answering import (DOC_CHARS, PICK_SECONDS, PICK_SYSTEM, PICK_TOKENS, PROMPT_DOC_CHARS, QUESTION_SECONDS,
-                           Answerer, by_number, calendar_need, calendar_note, clean_text)
+from bot.answering import (ANSWER_SYSTEM, DOC_CHARS, PICK_SECONDS, PICK_SYSTEM, PICK_TOKENS, PLACE_UNKNOWN_RULE,
+                           QUESTION_SECONDS, Answerer, by_number, calendar_need, calendar_note, clean_text,
+                           prompt_chars)
 from bot.extract import extract_text
 from bot.llm import LLM, LLMUnavailable
-from bot.places import CONIFER, Scope
+from bot.places import CONIFER, DECIDUOUS, Scope
 from bot.storage import Store
 
 from .conftest import NOW, FakeLLM, add_animal, add_archive
@@ -139,6 +140,32 @@ async def test_answers_follow_documents_sent_and_deleted_after_the_first_questio
     assert "Нові внески" not in llm.prompts[2][1]
 
 
+async def test_document_deleted_while_the_model_answers_is_not_cited(store, forest):
+    # The documents are chosen once, and the model may take up to 45 seconds to answer.
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць.")
+    doc, _ = add_animal(store, "Нові внески", "Внесок під дубом тепер 5 жолудів.", Scope("mitten", "Під дубом"))
+
+    class DeletingLLM(FakeLLM):
+        async def json(self, system, user, *args, **options):
+            if system != PICK_SYSTEM:
+                store.delete_animal_document(doc.id, doc.author_id)
+            return await super().json(system, user, *args, **options)
+
+    llm = DeletingLLM({"found": True, "answer": "4 жолуді на місяць.",
+                       "other": "Звір Зайчик пише, що внесок тепер 5 жолудів.", "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert "Нові внески" in llm.prompts[0][1] and reply.kind == "answer"
+    # The advice that gives way retold the deleted document, so it goes with it.
+    assert reply.text == ('4 жолуді на місяць.\n\nДжерело: "Членські внески рукавички Під дубом" (Лісовий архів, '
+                          'місце: рукавичка "Під дубом")')
+    # The answer comes from its first source: with that one gone, it is not given, though the archive's stays.
+    doc, _ = add_animal(store, "Внески з листопада", "Внесок під дубом з листопада 5 жолудів.",
+                        Scope("mitten", "Під дубом"))
+    llm = DeletingLLM({"found": True, "answer": "З листопада 5 жолудів.", "sources": [2, 1]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert '"Внески з листопада"' in llm.prompts[0][1] and reply.kind == "not_found" and reply.text == texts.NOT_FOUND
+
+
 async def test_animal_source_shows_author_and_time(store, forest):
     add_animal(store, "Гриби під ялинами", "Під ялинами ростуть рижики після дощу.", Scope("part", CONIFER),
                name="Білочка", when=NOW - timedelta(hours=3))
@@ -214,6 +241,97 @@ async def test_mitten_advice_is_not_pushed_out_by_stronger_general_matches(store
     assert "Чим поживитись поруч із рукавичкою Під дубом" in prompt
     # The mitten's documents go first: they are the most specific.
     assert prompt.index("Чим поживитись") < prompt.index("Коли падають жолуді")
+
+
+async def test_mitten_advice_is_found_among_many_better_matches(store, forest):
+    # Search kept only the 60 best matches before grouping them by place, and the mitten's own rules, which
+    # mention acorns once, fell out behind the deciduous forest's guides.
+    for i in range(61):
+        add_animal(store, f"Жолуді {i}", "Жолуді збирайте, жолуді сушіть, жолуді зберігайте.", Scope("part", DECIDUOUS),
+                   author_id=i)
+    add_archive(store, forest, "Правила рукавички Під дубом", "Жолуді до комори носить Кабан. " + FILLER * 3)
+    llm = FakeLLM({"found": True, "answer": "x", "sources": [1]})
+    await Answerer(store, forest, llm, TZ).ask("Коли збирати жолуді під дубом?", NOW)
+    assert "Правила рукавички Під дубом" in llm.prompts[0][1]
+
+
+async def test_every_place_keeps_its_best_match_beside_the_title_pick(store, forest):
+    # "Коли під вербою збирають гриби і горіхи?": four deciduous and whole-forest picks and the mitten's own
+    # documents filled the prompt, and the river part's guide was left out.
+    add_archive(store, forest, "Грибний путівник біля річки", "Цей путівник для тих, хто живе біля річки. "
+                                                               "Опеньки ростуть на старих вербах.")
+    add_archive(store, forest, "Грибний путівник листяного лісу", "Любі сусіди з листяного лісу! "
+                                                                   "Білі гриби тримаються старих дубів.")
+    add_archive(store, forest, "Коли падають жолуді й горіхи", "Для мешканців листяного лісу. "
+                                                                "Горіхи збирайте у вересні.")
+    add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Гриби збирають у вересні.")
+    add_archive(store, forest, "Їстівне й отруйне", "Ця пам'ятка для всіх мешканців лісу. Збирайте лише знайомі гриби.")
+    for title in ("Чим поживитись поруч із рукавичкою Під вербою", "Статут ОСМД Під вербою",
+                  "Стежки до сусідів від рукавички Під вербою"):
+        add_archive(store, forest, title, "Горіхи й гриби шукайте з сусідами.")
+    llm = FakeLLM({"found": True, "answer": "x", "sources": [1]}, picks=[{"ids": [2, 3, 4, 5]}])
+    await Answerer(store, forest, llm, TZ).ask("Коли під вербою збирають гриби і горіхи?", NOW)
+    assert "Грибний путівник біля річки" in llm.prompts[0][1]
+
+
+async def test_newest_advice_for_the_place_is_not_cut(store, forest):
+    # Four animals' documents on the dues of one mitten: for one place the newer advice wins, so the newest one
+    # reaches the model, though it mentions the dues only once.
+    for i in range(3):
+        add_animal(store, f"Внески {i}", "Внесок 4 жолуді. Внесок здають Кабанові. Внески до 10 числа.",
+                   Scope("mitten", "Під дубом"), author_id=i, when=NOW - timedelta(days=3 - i))
+    add_animal(store, "Що вирішили на зборах", "На зборах біля дупла Сови говорили про зиму, комору й нічні "
+               "чергування. Тепер внесок 6 жолудів.", Scope("mitten", "Під дубом"), author_id=9)
+    llm = FakeLLM({"found": True, "answer": "6 жолудів.", "sources": [1]})
+    await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert "Що вирішили на зборах" in llm.prompts[0][1]
+
+
+async def test_newest_animal_advice_takes_no_archive_documents_seat(store, forest):
+    # The archive beats animals for one place: the newest animal's weak match comes beside it, not instead of it.
+    for i in range(2):
+        add_animal(store, f"Жолуді {i}", "Жолуді збирайте. Жолуді сушіть. Жолуді зберігайте.",
+                   Scope("mitten", "Під дубом"), author_id=i, when=NOW - timedelta(days=3))
+    add_archive(store, forest, "Чим поживитись поруч із рукавичкою Під дубом", "Жолуді збирайте після першого морозу.")
+    add_animal(store, "Що вирішили на зборах", "На зборах біля дупла Сови говорили про зиму, комору й нічні "
+               "чергування. Жолуді теж згадали.", Scope("mitten", "Під дубом"), author_id=9)
+    llm = FakeLLM({"found": True, "answer": "Після першого морозу.", "sources": [1]})
+    await Answerer(store, forest, llm, TZ).ask("Коли збирати жолуді під дубом?", NOW)
+    assert "Чим поживитись поруч із рукавичкою Під дубом" in llm.prompts[0][1]
+    assert "Що вирішили на зборах" in llm.prompts[0][1]
+
+
+async def test_archive_document_edited_last_is_no_newer_advice(store, forest):
+    # An archive file edited on Drive later is another document, not a newer version of the others: the mitten's
+    # rules, matching once, took the seat of "Чим поживитись поруч із рукавичкою Під дубом".
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді. Жолуді здають Кабанові.")
+    add_archive(store, forest, "Чим поживитись поруч із рукавичкою Під дубом", "Жолуді збирайте після першого морозу.")
+    add_archive(store, forest, "Чергування в рукавичці Під дубом", "Черговий стежить, щоб жолуді в коморі не намокли.")
+    add_archive(store, forest, "Правила співжиття в рукавичці Під дубом", "Не несіть у рукавичку зайвого, жолуді теж. "
+                + FILLER * 3, modified=NOW - timedelta(days=1))
+    llm = FakeLLM({"found": True, "answer": "Після першого морозу.", "sources": [1]})
+    await Answerer(store, forest, llm, TZ).ask("Коли збирати жолуді під дубом?", NOW)
+    assert "Чим поживитись поруч із рукавичкою Під дубом" in llm.prompts[0][1]
+    assert "Правила співжиття" not in llm.prompts[0][1]
+
+
+async def test_mitten_matches_keep_their_seats_beside_the_title_pick(store, forest):
+    # Four picks from the forest part and the whole forest, with each place's best match, filled the prompt, and
+    # the mitten's own second and third matches were left out.
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді. Жолуді здають Кабанові.")
+    add_archive(store, forest, "Чим поживитись поруч із рукавичкою Під дубом", "Жолуді збирайте після першого морозу.")
+    add_archive(store, forest, "Чергування в рукавичці Під дубом", "Черговий стежить, щоб жолуді в коморі не намокли.")
+    add_archive(store, forest, "Коли падають жолуді й горіхи", "Для мешканців листяного лісу. Жолуді падають у вересні.")
+    add_archive(store, forest, "Що їсти в листяному лісі", "Для мешканців листяного лісу. Горіхи, ягоди й гриби.")
+    add_archive(store, forest, "Як утеплити рукавичку в листяному лісі", "Для мешканців листяного лісу. Сухим листям.")
+    add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Жолуді збирають у вересні.")
+    add_archive(store, forest, "Осінній путівник лісу", "Цей путівник для всіх мешканців лісу. Готуйтеся до зими.")
+    add_archive(store, forest, "Їстівне й отруйне", "Ця пам'ятка для всіх мешканців лісу. Збирайте знайомі гриби.")
+    llm = FakeLLM({"found": True, "answer": "x", "sources": [1]}, picks=[{"ids": [5, 6, 8, 9]}])
+    await Answerer(store, forest, llm, TZ).ask("Коли збирати жолуді під дубом?", NOW)
+    prompt = llm.prompts[0][1]
+    assert "Чим поживитись поруч із рукавичкою Під дубом" in prompt and "Чергування в рукавичці Під дубом" in prompt
+    assert "Членські внески рукавички Під дубом" in prompt and "Коли падають жолуді" in prompt
 
 
 async def test_title_pick_finds_advice_with_other_words(store, forest):
@@ -351,17 +469,39 @@ async def test_title_pick_asks_for_a_small_budget(forest_docs, forest):
     llm = BudgetLLM({"found": True, "answer": "4 жолуді.", "sources": [1]})
     await Answerer(forest_docs, forest, llm, TZ).ask("скільки внесок під дубом?", NOW)
     assert PICK_TOKENS == 400 and llm.budgets == [("pick", 400), ("answer", 1500)]
-    # No model is skipped as capped below the smallest reply, qwen with its 900 neither.
+    # No model is skipped as capped below the smallest reply, qwen with its 900 neither; the first model's minute
+    # is left to the answer.
     real, asked = LLM("x", ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]), []
 
     async def create(model, **options):
         asked.append((model, options["max_completion_tokens"]))
-        content = '{"ids": [1]}' if len(asked) == 3 else "не JSON"
+        content = '{"ids": [1]}' if len(asked) == 2 else "не JSON"
         return SimpleNamespace(usage=None, choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
     real.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     assert await real.json(PICK_SYSTEM, "x", max_tokens=PICK_TOKENS, fast=True) == {"ids": [1]}
-    assert [tokens for _, tokens in asked] == [400, 400, 400]
+    assert asked == [("openai/gpt-oss-20b", 400), ("qwen/qwen3.8-27b", 400)]
+
+
+# Measured on Groq: these prompts are 2.55 characters a token, and a request is admitted only when the prompt and
+# max_completion_tokens together fit the model's 8000 tokens a minute.
+def groq_tokens(*texts: str) -> float:
+    return sum(map(len, texts)) / 2.55
+
+
+async def test_title_pick_lists_all_archive_titles_and_the_newest_animals_that_fit(store, forest):
+    # 150 animals' titles made a listing of about 20000 characters, and every model refused it.
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць.")
+    for i in range(150):
+        add_animal(store, f"Поради сусідам про запаси горіхів, жолудів і сушених грибів на довгу зиму, частина {i}",
+                   "Запаси робіть восени.", Scope("forest"), author_id=i, when=NOW - timedelta(hours=i))
+    llm = FakeLLM()
+    await Answerer(store, forest, llm, TZ).ask("Що робити взимку?", NOW)
+    listing = llm.pick_prompts[0]
+    assert groq_tokens(PICK_SYSTEM, listing) + PICK_TOKENS < 8000
+    assert groq_tokens(PICK_SYSTEM, listing) * 1.01 < 7000  # qwen counts 1% more and takes 7000 for the prompt alone
+    assert "Членські внески рукавички Під дубом" in listing
+    assert "частина 0 (" in listing and "частина 149 (" not in listing  # the newest are listed, the oldest left out
 
 
 def test_prompt_labels_the_level_of_the_advice():
@@ -778,7 +918,50 @@ async def test_documents_together_fit_one_prompt(store, forest, lengths):
     llm = FakeLLM({"found": True, "answer": "x", "sources": [1]}, picks=[{"ids": picks}])
     await Answerer(store, forest, llm, TZ).ask("Коли запасати жолуді під дубом?", NOW)
     texts = document_texts(llm.prompts[0][1])
-    assert len(texts) >= 5 and all(texts) and sum(map(len, texts)) <= PROMPT_DOC_CHARS
+    system, prompt = llm.prompts[0]
+    assert len(texts) >= 5 and all(texts) and len(system) + len(prompt) <= prompt_chars(1500)
+
+
+@pytest.mark.parametrize("question, budget", [("Коли запасати жолуді під дубом?", 1500),
+                                              ("Чи вже час запасати жолуді під дубом?", 2000)])
+async def test_long_guides_leave_the_minute_room_for_the_reply(store, forest, question, budget):
+    # Seven long guides took 12000 characters, and with the rules and the reply's budget every model answered
+    # "Request too large". A little stays free for a count a little off.
+    for i in range(7):
+        add_animal(store, f"Поради про жолуді {i}", ("Під дубом жолуді. " + FILLER * 70)[:6000],
+                   Scope("mitten", "Під дубом"), author_id=i, when=NOW - timedelta(hours=i))
+    llm = BudgetLLM({"found": True, "answer": "x", "sources": [1]}, picks=[{"ids": [4, 5, 6, 7]}])
+    await Answerer(store, forest, llm, TZ).ask(question, NOW)
+    system, prompt = llm.prompts[0]
+    assert len(document_texts(prompt)) == 7 and llm.budgets[-1] == ("answer", budget)
+    assert groq_tokens(system, prompt) + budget <= 8000 - 200
+
+
+async def test_archive_documents_go_whole_in_the_usual_case(store, forest):
+    # Seven documents as long as the archive's longest ones, which take 5722 characters together.
+    texts = [f"Внесок {i} жолуді на місяць. " + FILLER * 9 for i in range(7)]
+    for i, text in enumerate(texts):
+        add_archive(store, forest, f"Членські внески рукавички Під дубом {i}", text)
+    llm = FakeLLM({"found": True, "answer": "x", "sources": [1]}, picks=[{"ids": [4, 5, 6, 7]}])
+    await Answerer(store, forest, llm, TZ).ask("Коли здавати внесок під дубом?", NOW)
+    assert sorted(document_texts(llm.prompts[0][1])) == sorted(texts) and sum(map(len, texts)) > 5722
+
+
+async def test_archive_documents_go_whole_with_no_place_and_the_whole_calendar(store, forest):
+    # The biggest prompt: the rule for no place named, every day of two months and eight documents. With 600 tokens
+    # kept free for a second try, all eight archive documents were cut, and the date of the acorns with them.
+    titles = [f"Чим поживитись поруч із рукавичкою {mitten}" for mitten in ("Під дубом", "У ліщині", "Під вербою",
+                                                                          "На узліссі")]
+    titles += ["Календар сезонів", "Осінній путівник лісу", "Коли падають жолуді", "Правила толоки"]
+    texts = [(f"Жолуді збирають восени, порада {i}. " + FILLER * 8)[:650 + 14 * i] for i in range(8)]
+    for title, text in zip(titles, texts, strict=True):
+        add_archive(store, forest, title, text)
+    llm = BudgetLLM({"found": True, "answer": "x", "sources": [1]}, picks=[{"ids": [5, 6, 7, 8]}])
+    await Answerer(store, forest, llm, TZ).ask("Чи вже можна збирати жолуді?", NOW)
+    system, prompt = llm.prompts[0]
+    assert system == ANSWER_SYSTEM + PLACE_UNKNOWN_RULE and llm.budgets[-1] == ("answer", 2000)
+    assert sorted(document_texts(prompt)) == sorted(texts)
+    assert groq_tokens(system, prompt) + 2000 <= 8000 - 200
 
 
 LATE = " Це важливо, бо зима довга, а весна приходить пізно."
@@ -1047,6 +1230,23 @@ def test_text_without_blank_lines_is_cut_into_chunks():
         assert len(chunks) > 1 and all(len(chunk) <= CHUNK_CHARS + 81 for chunk in chunks)
         assert "".join(chunks).replace("\n", "").replace(" ", "") == text.replace("\n", "").replace(" ", "")
     assert split_chunks("Календар сезонів\nУтеплюйте в листопаді.") == ["Календар сезонів\nУтеплюйте в листопаді."]
+
+
+def test_long_guide_does_not_make_its_words_look_common(store, forest):
+    # Counted per chunk, a guide of 16 chunks about mushrooms made "гриби" a common word, and the deciduous
+    # forest's mushroom guide fell under the search cutoff for "Де шукати гриби?".
+    from bot.search import Index, split_chunks
+    add_archive(store, forest, "Грибний путівник листяного лісу", "Любі сусіди з листяного лісу! "
+                                                                   "Білі гриби тримаються старих дубів.")
+    add_archive(store, forest, "Їстівне й отруйне", "Ця пам'ятка для всіх мешканців лісу. Шукайте лише знайомі гриби.")
+    add_archive(store, forest, "Що робити при пожежі", "Ця пам'ятка для всіх мешканців лісу. Біжіть до річки.")
+    places = ["Під ялиною", "У соснах", "Під дубом", "У ліщині", "Під вербою", "На узліссі", "Біля греблі",
+              "Біля мурашника"]
+    guide = "\n".join(f"{place}: гриби ростуть після дощу. " + FILLER * 6 for place in places * 2)
+    add_animal(store, "Поради Сови на осінь", guide, Scope("forest"), name="Сова")
+    assert len(split_chunks(guide)) == 16
+    hits = Index(store.active_documents()).search("Де шукати гриби?")
+    assert "Грибний путівник листяного лісу" in [hit.doc.title for hit in hits]
 
 
 async def test_part_question_keeps_the_whole_forest_advice(store, forest):

@@ -131,23 +131,26 @@ class Index:
     def __init__(self, documents: list[Document]):
         self.documents = documents
         self.chunks: list[tuple[Document, Counter, int]] = []
+        # Documents are ranked, each by its best chunk, so a word counts once per document: a long guide cut into
+        # twenty chunks would otherwise make its words look common and lower every other document's score.
+        self.df = Counter()
         for doc in documents:
             title_tokens = tokens(doc.title) * 2
+            doc_terms = set()
             for chunk in split_chunks(doc.text):
                 terms = Counter(title_tokens + tokens(chunk))
                 self.chunks.append((doc, terms, sum(terms.values())))
+                doc_terms.update(terms)
+            self.df.update(doc_terms)
         self.avg_len = sum(length for *_, length in self.chunks) / max(len(self.chunks), 1)
-        self.df = Counter()
-        for _, terms, _ in self.chunks:
-            self.df.update(terms.keys())
 
-    def search(self, query: str, allowed=None, limit: int = 5, cutoff: float = RELATIVE_CUTOFF) -> list[Hit]:
+    def search(self, query: str, allowed=None, limit: int | None = 5, cutoff: float = RELATIVE_CUTOFF) -> list[Hit]:
         """Best documents for the query; `allowed(doc)` filters by place, `cutoff` drops
-        documents scoring under that share of the best one."""
+        documents scoring under that share of the best one, `limit=None` keeps all of them."""
         query_terms = expand(set(tokens(query)))
         if not query_terms:
             return []
-        n = len(self.chunks)
+        n = len(self.documents)
         best: dict[int, Hit] = {}
         for doc, terms, length in self.chunks:
             if allowed and not allowed(doc):

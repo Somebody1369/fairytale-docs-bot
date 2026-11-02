@@ -29,9 +29,9 @@ MIN_ATTEMPT = 3  # seconds a request needs at least: with less time to the deadl
 # Groq's free tier gives qwen 1000 output tokens a minute and refuses a request whose
 # max_completion_tokens alone is above that ("Request too large"). Other caps are learned from that error.
 OUTPUT_CAPS = {"qwen/qwen3.8-27b": 900}
-CAP_MARGIN = 100  # tokens kept below a learned cap
+CAP_MARGIN = 100  # tokens kept below a learned cap, or below the minute's limit when a request is made smaller
 MIN_OUTPUT = 400  # an answer needs at least this much; a model capped lower is skipped
-TOO_LARGE = re.compile(r"Request too large.*?\((\w+)\):\s*Limit (\d+)", re.S)
+TOO_LARGE = re.compile(r"Request too large.*?\((\w+)\):\s*Limit (\d+)(?:,\s*Requested (\d+))?", re.S)
 
 
 class LLMUnavailable(Exception):
@@ -97,16 +97,19 @@ class LLM:
         log.info("Groq models in use: %s", ", ".join(self.models))
 
     def order(self, fast: bool) -> list[str]:
-        """Answers go down the configured list; simple choices start from the smallest model."""
-        return sorted(self.models, key=model_size) if fast else self.models
+        """Answers go down the configured list; simple choices start from the smallest model and leave out the
+        first one, whose minute's tokens the answer right after them needs."""
+        if not fast:
+            return self.models
+        return sorted(self.models[1:] or self.models, key=model_size)
 
     async def json(self, system: str, user: str, max_tokens: int = 1500, reasoning: str = "low",
                    fast: bool = False, deadline: float | None = None) -> dict:
-        """`fast`: a simple choice (documents by title, a document's place) goes to the smallest model
-        first, which also keeps the strong model's token budget for answers. `deadline`: the
-        time.monotonic() by which the reply is needed. A rate-limited model rests for as long as Groq says;
-        a short wait on it is waited out once, and when no model answers in a round, the bot waits for
-        the first one to free up and goes round again, as long as the deadline allows."""
+        """`fast`: a simple choice (documents by title, a document's place) goes to the smallest model first,
+        and not to the first configured one while there are others: its token budget is kept for answers.
+        `deadline`: the time.monotonic() by which the reply is needed. A rate-limited model rests for as long
+        as Groq says; a short wait on it is waited out once, and when no model answers in a round, the bot
+        waits for the first one to free up and goes round again, as long as the deadline allows."""
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         last_error: Exception | None = None
         failed: set[str] = set()  # models that cannot answer this request at all
@@ -114,17 +117,20 @@ class LLM:
             for model in self.order(fast):
                 if model in failed or self.resting.get(model, 0) > time.monotonic():
                     continue
-                strict, waited, effort = True, False, reasoning
+                strict, waited, effort, budget = True, False, reasoning, max_tokens
                 while True:
                     left = None if deadline is None else deadline - time.monotonic()
                     if left is not None and left < MIN_ATTEMPT:
                         raise LLMUnavailable(f"no time left for the reply ({last_error or 'slow replies'})")
-                    limit = min(max_tokens, self.output_caps.get(model, max_tokens))
+                    limit = min(budget, self.output_caps.get(model, budget))
                     if limit < MIN_OUTPUT <= max_tokens:
                         failed.add(model)  # its output cap is too small for this request
                         break
                     try:
                         async with asyncio.timeout(left), self.queues[model]:
+                            # The wait for this model's queue may have used up the time; a request cut off is charged.
+                            if deadline is not None and deadline - time.monotonic() < MIN_ATTEMPT:
+                                raise LLMUnavailable(f"no time left after waiting for {model}")
                             response = await self.client.chat.completions.create(
                                 model=model,
                                 messages=messages,
@@ -139,32 +145,6 @@ class LLM:
                         return parse_json(response.choices[0].message.content or "")
                     except TimeoutError:
                         raise LLMUnavailable(f"no reply before the deadline ({last_error or 'slow replies'})") from None
-                    except groq.RateLimitError as error:
-                        last_error = error
-                        too_large = TOO_LARGE.search(str(error))
-                        if too_large:
-                            # One request above a per-minute limit: waiting will not help. An output cap can be
-                            # met with a smaller max_completion_tokens; a prompt too big for the model cannot.
-                            cap = int(too_large.group(2)) - CAP_MARGIN
-                            if too_large.group(1) == "OTPM" and cap < limit:
-                                self.output_caps[model] = cap
-                                log.info("Groq model %s takes at most %d output tokens, asking with that", model, cap)
-                                continue
-                            log.warning("Groq model %s cannot take this request (%s), trying the next one",
-                                        model, too_large.group(0)[-60:])
-                            failed.add(model)
-                            break
-                        wait = _retry_after(error)
-                        # Other requests skip the model while it rests, instead of queueing behind it.
-                        self.resting[model] = time.monotonic() + min(wait if wait is not None else UNKNOWN_REST, MAX_REST)
-                        fits = left is None or (wait is not None and wait <= left - MIN_ATTEMPT)
-                        if waited or wait is None or wait > MAX_RATE_LIMIT_WAIT or not fits:
-                            log.warning("Groq model %s is rate-limited (%s), trying the next one", model,
-                                        f"{wait:.0f} s" if wait is not None else str(error)[:200])
-                            break
-                        waited = True  # a short wait for the preferred model is worth it, once
-                        log.info("Groq model %s: token limit for this minute reached, waiting %.0f s", model, wait)
-                        await asyncio.sleep(wait)
                     except groq.BadRequestError as error:
                         last_error = error
                         # It thought so long that the reply was cut off: think less. That is retried only when
@@ -179,19 +159,55 @@ class LLM:
                         log.warning("Groq model %s failed: %s", model, error)
                         failed.add(model)
                         break
+                    # 429 (RateLimitError), 413 "Request too large" (a bare APIStatusError) or any other failure.
+                    except groq.APIError as error:
+                        last_error = error
+                        too_large = TOO_LARGE.search(str(error))
+                        if too_large:
+                            # One request above a per-minute limit: waiting will not help. An output cap can be
+                            # met with a smaller max_completion_tokens; a prompt too big for the model cannot.
+                            kind, allowed, requested = too_large.group(1), int(too_large.group(2)), too_large.group(3)
+                            cap = allowed - CAP_MARGIN
+                            if kind == "OTPM" and cap < limit:
+                                self.output_caps[model] = cap
+                                log.info("Groq model %s takes at most %d output tokens, asking with that", model, cap)
+                                continue
+                            # TPM counts max_completion_tokens with the prompt: a smaller budget may let it in, once.
+                            smaller = limit - (int(requested) - allowed) - CAP_MARGIN if requested else 0
+                            if kind == "TPM" and budget == max_tokens and smaller >= MIN_OUTPUT:
+                                budget = smaller
+                                log.info("Groq model %s: request over the minute's tokens, asking for %d output tokens",
+                                         model, smaller)
+                                continue
+                            log.warning("Groq model %s cannot take this request (%s), trying the next one",
+                                        model, too_large.group(0)[-60:])
+                            failed.add(model)
+                            break
+                        if not isinstance(error, groq.RateLimitError):
+                            log.warning("Groq request failed on %s: %s", model, error)
+                            failed.add(model)
+                            break
+                        wait = _retry_after(error)
+                        # Other requests skip the model while it rests, instead of queueing behind it.
+                        self.resting[model] = time.monotonic() + min(wait if wait is not None else UNKNOWN_REST, MAX_REST)
+                        fits = left is None or (wait is not None and wait <= left - MIN_ATTEMPT)
+                        if waited or wait is None or wait > MAX_RATE_LIMIT_WAIT or not fits:
+                            log.warning("Groq model %s is rate-limited (%s), trying the next one", model,
+                                        f"{wait:.0f} s" if wait is not None else str(error)[:200])
+                            break
+                        waited = True  # a short wait for the preferred model is worth it, once
+                        log.info("Groq model %s: token limit for this minute reached, waiting %.0f s", model, wait)
+                        await asyncio.sleep(wait)
                     except json.JSONDecodeError as error:
                         last_error = error
                         log.warning("Groq model %s returned text that is not JSON", model)
                         failed.add(model)
                         break
-                    except groq.APIError as error:
-                        last_error = error
-                        log.warning("Groq request failed on %s: %s", model, error)
-                        failed.add(model)
-                        break
-            # No model answered this round. The one that frees up first is waited for, if the time allows.
+            # No model answered this round. The one that frees up first is waited for, if the time allows; only the
+            # models this request may ask count, as a simple choice leaves the first one out.
             now = time.monotonic()
-            free_at = min((self.resting[m] for m in self.models if m not in failed and m in self.resting), default=None)
+            free_at = min((self.resting[m] for m in self.order(fast) if m not in failed and m in self.resting),
+                          default=None)
             latest = deadline - MIN_ATTEMPT if deadline is not None else now + MAX_RATE_LIMIT_WAIT
             if free_at is None or free_at > latest:
                 break

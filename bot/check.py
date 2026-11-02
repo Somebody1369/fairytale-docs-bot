@@ -8,7 +8,7 @@ The first one is the customer's own example. Every answer must mention the expec
 
 import asyncio
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from .answering import Answerer
@@ -51,7 +51,7 @@ async def main() -> int:
     answerer = Answerer(store, forest, llm, ZoneInfo(settings.timezone))
     failed = 0
     for question, expected in CHECKS:
-        reply = await answerer.ask(question, datetime.now(timezone.utc))
+        reply = await answerer.ask(question, datetime.now(UTC))
         if expected == "need_place":
             ok, shown = reply.kind == "need_place", f"[{reply.kind}]"
         else:

@@ -1,5 +1,7 @@
 import io
+import zipfile
 
+import aiohttp
 import pytest
 from datetime import datetime, timezone
 
@@ -114,11 +116,13 @@ class FakeArchive:
 
     def __init__(self, files: dict[str, tuple[str, str, str]]):
         self.files = files  # id -> (name, marker, text)
+        self.downloads: list[str] = []
 
     async def list_files(self, session):
         return [DriveFile(id=i, name=n, marker=m, modified=NOW) for i, (n, m, _) in self.files.items()]
 
     async def download(self, session, file):
+        self.downloads.append(file.id)
         return self.files[file.id][2].encode("utf-8")
 
 
@@ -173,7 +177,7 @@ async def test_forest_map_is_logged_only_when_it_changes(store, forest, caplog):
     refresh_map(store, restarted)
     await sync_archive(store, restarted, FakeArchive({"m": ("Карта лісу.txt", "Oct 14", changed)}))
     assert "Forest map" not in caplog.text and restarted.mitten_parts["Біля мурашника"] == {"deciduous"}
-    # Only the order changed, but mitten buttons go by position, so that is a change too.
+    # Only the order changed, but keyboards list the mittens in the map's order, so that is a change too.
     first, second = "Під ялиною — хвойний ліс.", "У соснах — хвойний ліс."
     swapped = changed.replace(first, "@").replace(second, first).replace("@", second)
     await sync_archive(store, restarted, FakeArchive({"m": ("Карта лісу.txt", "Oct 15", swapped)}))
@@ -187,6 +191,28 @@ def test_txt_in_windows_encoding_and_docx():
     buffer = io.BytesIO()
     document.save(buffer)
     assert extract_text(buffer.getvalue(), "a.docx") == "Гриби під ялинами"
+
+
+def test_utf8_with_a_stray_byte_is_not_read_as_windows_encoding():
+    # As cp1251 it was stored as "РџРѕСЂР°РґР°...": one byte lost is better than every letter garbled.
+    text = "Порада для всього лісу.\nГриби збирайте зранку, після дощу, а тих, яких не знаєте, не беріть."
+    data = text.encode("utf-8").replace(b" ", b"\xa0", 1)  # a non-breaking space from Windows
+    assert extract_text(data, "a.txt") == text.replace(" ", "\ufffd", 1)
+
+
+def test_docx_that_unpacks_to_too_much_is_refused_unread(monkeypatch):
+    # python-docx holds every part unpacked: a zip bomb of 1.5 MB took a gigabyte of memory.
+    document = docx.Document()
+    document.add_paragraph("Порада для всього лісу.")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    with zipfile.ZipFile(buffer, "a", zipfile.ZIP_DEFLATED) as package:
+        with package.open("word/media/image1.png", "w") as picture:  # zeros: a few kilobytes packed
+            for _ in range(extract.MAX_DOCX_UNPACKED // 2**20 + 1):
+                picture.write(bytes(2**20))
+    monkeypatch.setattr(docx, "Document", lambda *args: pytest.fail("the parts were unpacked"))
+    with pytest.raises(ValueError):  # the sender is told the file could not be read
+        extract_text(buffer.getvalue(), "bomb.docx")
 
 
 def test_title_from_filename():
@@ -233,6 +259,26 @@ def test_caption_names_the_place(forest):
     assert scope_from_caption("для всього лісу", forest) == FOREST_SCOPE
     assert scope_from_caption("ось моя порада", forest) is None
     assert scope_from_caption(None, forest) is None
+    # A place negated or named as somewhere else is not the document's place.
+    assert scope_from_caption("це не для Під дубом", forest) is None
+    assert scope_from_caption("для всіх, крім Під дубом", forest) is None
+    assert scope_from_caption("від сусідів з Під вербою", forest) is None
+    assert scope_from_caption("не для всього лісу", forest) is None
+    # Only the words right before the place count, and "я з Під дубом" is the sender's own mitten: the animal
+    # types it in answer to "Про яку рукавичку?" too.
+    assert scope_from_caption("я з Під дубом", forest) == Scope("mitten", "Під дубом")
+    assert scope_from_caption("Пам'ятка з безпеки для Під дубом", forest) == Scope("mitten", "Під дубом")
+    assert scope_from_caption("Внески до 10 числа для Під дубом", forest) == Scope("mitten", "Під дубом")
+    assert scope_from_caption("для хвойного лісу, до відома", forest) == Scope("part", CONIFER)
+    assert scope_from_caption("для всього лісу без винятку", forest) == FOREST_SCOPE
+    # "для звірів з Під дубом" says who the advice is for, unless it is negated.
+    assert scope_from_caption("Це для звірів з Під дубом", forest) == Scope("mitten", "Під дубом")
+    assert scope_from_caption("Порада для звірів із рукавички «У соснах»", forest) == Scope("mitten", "У соснах")
+    assert scope_from_caption("для мешканців з листяного лісу", forest) == Scope("part", "deciduous")
+    assert scope_from_caption("Для всіх звірів з усього лісу", forest) == FOREST_SCOPE
+    assert scope_from_caption("не для звірів з Під дубом", forest) is None
+    assert scope_from_caption("для всіх крім звірів з Під дубом", forest) is None
+    assert scope_from_caption("для всіх від сусідів з Під вербою", forest) is None
 
 
 async def test_empty_drive_listing_keeps_the_archive(store, forest):
@@ -242,6 +288,73 @@ async def test_empty_drive_listing_keeps_the_archive(store, forest):
     with pytest.raises(RuntimeError):
         await sync_archive(store, forest, archive)
     assert [d.title for d in store.active_documents()] == ["Календар сезонів"]
+
+
+async def test_unreadable_archive_file_is_read_again_only_when_it_changes(store, forest, monkeypatch):
+    # A scan OCR gives up on was downloaded and read every 10 minutes, while animals' PDFs waited for the PDF lock.
+    def unreadable(data, filename, langs):
+        raise extract.UnreadableScan("Tesseract process timeout")
+
+    monkeypatch.setattr(archive_module, "extract_text", unreadable)
+    archive = FakeArchive({"1": ("Скан.pdf", "Oct 13", "")})
+    assert (await sync_archive(store, forest, archive)).failed == 1
+    assert (await sync_archive(store, forest, archive)).failed == 1
+    assert archive.downloads == ["1"]
+    archive.files["1"] = ("Скан.pdf", "Oct 14", "")  # a new version on Drive
+    await sync_archive(store, forest, archive)
+    monkeypatch.setattr(archive_module, "EXTRACT_VERSION", "test")  # the bot reads scans better
+    await sync_archive(store, forest, archive)
+    assert archive.downloads == ["1", "1", "1"]
+
+
+@pytest.mark.parametrize("error", [extract.OcrFailed("Failed loading language 'ukr'"),
+                                   pytesseract.TesseractNotFoundError(), MemoryError()])
+async def test_archive_file_is_read_again_when_the_bot_could_not_read_it(store, forest, monkeypatch, error):
+    # Tesseract set up wrong or the memory short is no fault of the file: once that is fixed, the file is read.
+    def failing(data, filename, langs):
+        raise error
+
+    monkeypatch.setattr(archive_module, "extract_text", failing)
+    archive = FakeArchive({"1": ("Скан.pdf", "Oct 13", "")})
+    assert (await sync_archive(store, forest, archive)).failed == 1
+    assert (await sync_archive(store, forest, archive)).failed == 1
+    assert archive.downloads == ["1", "1"]
+
+
+async def test_archive_file_failing_without_a_message_is_not_stored(store, forest, monkeypatch):
+    # str(MemoryError()) is "": such a failure was taken for a file read, and stored with the previous file's text.
+    def extract_or_fail(data, filename, langs):
+        if filename.startswith("Скан"):
+            raise MemoryError()
+        return data.decode("utf-8")
+
+    monkeypatch.setattr(archive_module, "extract_text", extract_or_fail)
+    archive = FakeArchive({"1": ("Скан внесків Під дубом.pdf", "Oct 13", ""),  # first: no text read before it
+                           "2": ("Календар сезонів.txt", "Oct 13", "Цей календар для всіх мешканців лісу."),
+                           "3": ("Скан чергувань Під дубом.pdf", "Oct 13", "")})
+    report = await sync_archive(store, forest, archive)
+    assert (report.added, report.failed) == (1, 2)
+    assert [d.title for d in store.active_documents()] == ["Календар сезонів"]
+
+
+async def test_archive_file_without_text_is_not_read_again(store, forest):
+    archive = FakeArchive({"1": ("Порожній.txt", "Oct 13", "")})
+    await sync_archive(store, forest, archive)
+    await sync_archive(store, forest, archive)
+    assert archive.downloads == ["1"] and store.active_documents() == []
+
+
+async def test_archive_file_not_downloaded_is_tried_at_the_next_sync(store, forest):
+    archive = FakeArchive({"1": ("Календар сезонів.txt", "Oct 13", "Цей календар для всіх мешканців лісу.")})
+    download = archive.download
+
+    async def offline(session, file):
+        raise aiohttp.ClientConnectionError("Drive is not reachable")
+
+    archive.download = offline
+    assert (await sync_archive(store, forest, archive)).failed == 1
+    archive.download = download
+    assert (await sync_archive(store, forest, archive)).added == 1
 
 
 def test_ocr_digit_three_read_as_letter():
@@ -296,11 +409,17 @@ async def test_title_with_two_places_is_not_decided_by_the_title(forest):
     assert llm.prompts == []
 
 
-def blank_pdf(pages: int) -> bytes:
-    """A PDF whose pages have no text, as a scan without a text layer."""
+def scan_pdf(pages: int, blank: int = 0) -> bytes:
+    """A PDF without a text layer: `pages` pictures, as a scan, then `blank` empty pages."""
     pdf = pdfium.PdfDocument.new()
-    for _ in range(pages):
-        pdf.new_page(200, 200)
+    for index in range(pages + blank):
+        page = pdf.new_page(200, 200)
+        if index < pages:
+            picture = pdfium.PdfImage.new(pdf)
+            picture.set_bitmap(pdfium.PdfBitmap.from_pil(Image.new("RGB", (20, 20), "white")))
+            picture.set_matrix(pdfium.PdfMatrix().scale(200, 200))
+            page.insert_obj(picture)
+            page.gen_content()
     data = io.BytesIO()
     pdf.save(data)
     return data.getvalue()
@@ -309,13 +428,21 @@ def blank_pdf(pages: int) -> bytes:
 def test_long_scan_is_refused_instead_of_cut(monkeypatch):
     monkeypatch.setattr(extract, "_ocr_page", lambda page, langs: pytest.fail("no page is read before the check"))
     with pytest.raises(extract.TooManyScannedPages):
-        extract_text(blank_pdf(extract.MAX_OCR_PAGES + 1), "scan.pdf")
+        extract_text(scan_pdf(extract.MAX_OCR_PAGES + 1), "scan.pdf")
+
+
+def test_blank_pages_are_not_scans(monkeypatch):
+    # A PDF with text and many blank pages, or pages with a heading alone, was refused as a too long scan.
+    read = []
+    monkeypatch.setattr(extract, "_ocr_page", lambda page, langs: read.append(page) or "Рижики ростуть під ялиною.")
+    assert extract_text(scan_pdf(1, blank=extract.MAX_OCR_PAGES + 1), "notes.pdf") == "Рижики ростуть під ялиною."
+    assert len(read) == 1  # the picture only
 
 
 def test_pdf_is_read_inside_the_pdfium_lock(monkeypatch):
     # Two PDFs read by two threads at once crash the process, PDFs with a text layer as much as scans, so a PDF
     # is opened, read, OCR'd and closed under the lock.
-    scan, opening = blank_pdf(1), pdfium.PdfDocument
+    scan, opening = scan_pdf(1), pdfium.PdfDocument
 
     def opened(*args, **kwargs):
         if not extract.PDFIUM.locked():
@@ -341,7 +468,19 @@ def test_scan_page_that_tesseract_cannot_finish_fails_the_whole_file(monkeypatch
 
     monkeypatch.setattr(pytesseract, "image_to_string", timeout)
     with pytest.raises(extract.UnreadableScan):
-        extract_text(blank_pdf(1), "scan.pdf")
+        extract_text(scan_pdf(1), "scan.pdf")
+    assert not extract.PDFIUM.locked()
+
+
+def test_scan_page_tesseract_fails_on_fails_the_whole_file(monkeypatch):
+    # Not stored without the page, as with a timeout; but the archive sync tries such a file again.
+    def failing(image, **options):
+        raise pytesseract.TesseractError(1, "Failed loading language 'ukr'")
+
+    monkeypatch.setattr(pytesseract, "image_to_string", failing)
+    with pytest.raises(extract.UnreadableScan) as failed:  # the sender is asked for a document with text
+        extract_text(scan_pdf(1), "scan.pdf")
+    assert not extract.file_at_fault(failed.value)
     assert not extract.PDFIUM.locked()
 
 

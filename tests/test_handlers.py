@@ -21,7 +21,7 @@ from bot.handlers import App, Flow, clean_name, router
 from bot.llm import LLMUnavailable
 from bot.places import FOREST_SCOPE
 
-from .conftest import FakeLLM, add_archive
+from .conftest import FOREST_MAP_TEXT, FakeLLM, add_archive
 
 TZ = ZoneInfo("Europe/Kyiv")
 USER = User(id=10, is_bot=False, first_name="Bilka")
@@ -271,12 +271,10 @@ async def test_stale_place_button_says_question_was_lost(setup):
 
 async def test_buttons_the_bot_cannot_read_get_a_polite_reply(setup):
     dispatcher, bot, telegram, llm, store = setup
-    for data in ("qp:gone1234:m:99", "qp:m"):  # a mitten no longer on the map, or not a button the bot makes
-        await dispatcher.feed_update(bot, callback(data))
-        assert telegram.sent[-1].text == texts.QUESTION_LOST
-    for data in ("dp:gone1234:f:", "dp:x"):
-        await dispatcher.feed_update(bot, callback(data))
-        assert telegram.sent[-1].text == texts.DOC_LOST
+    await dispatcher.feed_update(bot, callback("qp:gone1234:m:99"))  # a mitten no longer on the map
+    assert telegram.sent[-1].text == texts.QUESTION_LOST
+    await dispatcher.feed_update(bot, callback("dp:gone1234:f:"))
+    assert telegram.sent[-1].text == texts.DOC_LOST
 
     # A mitten no longer on the map under a question still known: the mittens are offered again.
     llm.answers.append({"needs_place": True})
@@ -299,6 +297,55 @@ async def test_buttons_the_bot_cannot_read_get_a_polite_reply(setup):
     await dispatcher.feed_update(bot, callback(own["Увесь ліс"]))
     await dispatcher.feed_update(bot, callback(f"dp:{key}:m:99"))
     assert telegram.sent[-1].text == texts.DOC_ALREADY_SAVED.format(title="Report", scope="увесь ліс")
+    # "Змінити місце" for a mitten no longer on the map: the places are offered again, the document stays put.
+    doc = store.documents_of(USER.id)[0]
+    await dispatcher.feed_update(bot, callback(f"cs:{doc.id}:m:99"))
+    assert telegram.sent[-1].text == texts.CHANGE_PLACE_GONE and store.get(doc.id).scope == FOREST_SCOPE
+    await dispatcher.feed_update(bot, press(telegram.sent[-1], "Під дубом"))
+    assert telegram.sent[-1].text == texts.PLACE_CHANGED.format(title="Report", scope='рукавичка "Під дубом"')
+
+
+async def test_button_data_the_bot_does_not_make_stops_spinning_quietly(setup, monkeypatch):
+    # Telegram warns that a client may send any data under a button: such a button is answered, so it stops
+    # spinning, and no apology or other message follows.
+    dispatcher, bot, telegram, _, _ = setup
+    answers = []
+    make_request = telegram.make_request
+
+    async def record(bot_, method, timeout=None):
+        if isinstance(method, AnswerCallbackQuery):
+            answers.append(method.text)
+        return await make_request(bot_, method, timeout)
+
+    monkeypatch.setattr(telegram, "make_request", record)
+    odd = ("del:abc", "delok:", "rev:x", "revok:1:2", "chg:x", "cs:x:m:1", "nm:maybe", "qp:m", "dp:x", "zz",
+           # numbers SQLite cannot hold
+           "del:99999999999999999999", "delok:-99999999999999999999", "revok:99999999999999999999",
+           "chg:99999999999999999999", "cs:99999999999999999999:f:")
+    for data in odd:
+        await dispatcher.feed_update(bot, callback(data))
+    assert answers == [texts.UNKNOWN_BUTTON] * len(odd) and telegram.sent == []
+
+
+async def test_buttons_made_before_the_map_changed_keep_their_mitten(setup):
+    # "Карта лісу" is read again at every archive sync. A mitten added to it before "Під дубом" must not make
+    # an older "Під дубом" button answer for another mitten or file a document there.
+    dispatcher, bot, telegram, llm, store = setup
+    llm.answers.append({"needs_place": True})
+    await dispatcher.feed_update(bot, message(text="скільки внесок?"))
+    question_buttons = telegram.sent[-1]
+    await send_unclear_document(dispatcher, bot, telegram, llm, store)
+    document_buttons = telegram.sent[-1]
+    new_map = FOREST_MAP_TEXT.replace("Під дубом — листяний ліс.", "У ялівці — хвойний ліс.\n–\nПід дубом — листяний ліс.")
+    assert dispatcher["app"].forest.update_from_map(new_map)
+
+    llm.answers.append({"found": True, "answer": "4 жолуді на місяць.", "sources": [1]})
+    asked = len(llm.prompts)
+    await dispatcher.feed_update(bot, press(question_buttons, "Під дубом"))
+    # Asked about it: "У ялівці" has no documents, so the model would not be asked at all.
+    assert len(llm.prompts) == asked + 1 and 'Місце з питання: рукавичка "Під дубом"' in llm.prompts[-1][1]
+    await dispatcher.feed_update(bot, press(document_buttons, "Під дубом"))
+    assert [doc.scope.describe() for doc in store.documents_of(USER.id)] == ['рукавичка "Під дубом"']
 
 
 async def test_inviter_closes_access_in_the_bot(setup):
@@ -316,6 +363,35 @@ async def test_inviter_closes_access_in_the_bot(setup):
     assert not store.is_member(fox.id)
     await dispatcher.feed_update(bot, message(user=fox, text="скільки внесок під дубом?"))
     assert "попросіть, будь ласка, запрошення" in telegram.sent[-1].text
+
+
+async def test_document_read_while_access_is_closed_is_not_used(setup, monkeypatch):
+    # A big scan takes minutes to read, and the fox's access is closed meanwhile: the document is kept like the
+    # fox's other ones, not used in answers, and the fox is not told it is. A new invite brings it back.
+    dispatcher, bot, telegram, _, store = setup
+    dispatcher["app"].settings = Settings(telegram_token="1:x", groq_api_key="x", invites_only=True)
+    fox, now = User(id=40, is_bot=False, first_name="Fox"), datetime.now(timezone.utc)
+    store.use_invite(store.create_invite(None, now), USER.id, now)
+    store.use_invite(store.create_invite(USER.id, now), fox.id, now)
+    store.set_user_name(fox.id, "Лис", now)
+    started, release = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def slow_extract(data, filename, langs, ext):
+        loop.call_soon_threadsafe(started.set)
+        asyncio.run_coroutine_threadsafe(release.wait(), loop).result()
+        return "Порада для всього лісу: при пожежі збирайтеся біля річки."
+
+    monkeypatch.setattr(handlers, "extract_text", slow_extract)
+    sending = asyncio.create_task(dispatcher.feed_update(bot, message(user=fox, document=Document(
+        file_id="r1", file_unique_id="r1", file_name="Пожежа.pdf", file_size=30))))
+    await started.wait()
+    await dispatcher.feed_update(bot, callback(f"revok:{fox.id}"))
+    release.set()
+    await sending
+    assert telegram.sent[-1].text == texts.NEED_INVITE and store.documents_of(fox.id) == []
+    assert store.use_invite(store.create_invite(USER.id, now), fox.id, now)
+    assert [doc.title for doc in store.documents_of(fox.id)] == ["Пожежа"]
 
 
 async def test_typed_yes_confirms_the_name(setup):
@@ -567,6 +643,29 @@ async def test_cancel_says_which_documents_were_dropped(setup):
     assert '"Гриби"' in telegram.sent[-1].text and "надішліть його ще раз" in telegram.sent[-1].text
 
 
+async def test_only_so_many_documents_wait_for_the_name(setup):
+    # Each waiting document keeps its text in the dialog state, and /cancel names them all in one message.
+    dispatcher, bot, telegram, _, _ = setup
+    telegram.file_bytes = "Збирайте гриби після дощу.".encode()
+    for i in range(handlers.QUEUE_LIMIT + 1):
+        await dispatcher.feed_update(bot, document_update(f"Порада {i}.txt", f"q{i}"))
+    assert telegram.sent[-1].text == texts.DOC_QUEUE_FULL.format(title=f"Порада {handlers.QUEUE_LIMIT}")
+    data = await dispatcher.fsm.get_context(bot, chat_id=USER.id, user_id=USER.id).get_data()
+    assert len(data["queue"]) == handlers.QUEUE_LIMIT
+
+
+async def test_file_beyond_the_queue_is_not_read(setup, monkeypatch):
+    # A scan takes minutes to read: a file that will be refused is not downloaded and read first.
+    dispatcher, bot, telegram, _, _ = setup
+    telegram.file_bytes = "Збирайте гриби після дощу.".encode()
+    for i in range(handlers.QUEUE_LIMIT):
+        await dispatcher.feed_update(bot, document_update(f"Порада {i}.txt", f"q{i}"))
+    read = []
+    monkeypatch.setattr(handlers, "extract_text", lambda *args: read.append(args) or "")
+    await dispatcher.feed_update(bot, document_update("Ще одна.txt", "extra"))
+    assert telegram.sent[-1].text == texts.DOC_QUEUE_FULL.format(title="Ще одна") and not read
+
+
 async def test_name_can_be_changed_later(setup):
     dispatcher, bot, telegram, _, store = setup
     store.set_user_name(USER.id, "Білка", datetime.now(timezone.utc))
@@ -601,6 +700,9 @@ async def test_invited_list_shows_the_telegram_name(setup):
     await dispatcher.feed_update(bot, message(user=fox, text="/start " + link.split("start=")[1]))
     await dispatcher.feed_update(bot, message(text="/invited"))
     assert "Foxy Red @foxy" in telegram.sent[-1].reply_markup.inline_keyboard[0][0].text
+    data = telegram.sent[-1].reply_markup.inline_keyboard[0][0].callback_data
+    await dispatcher.feed_update(bot, same_message_callback(next(ids), data, inaccessible=True))  # a new message
+    assert telegram.sent[-1].text == texts.CONFIRM_REVOKE.format(name="Foxy Red @foxy")
 
 
 async def test_document_sent_while_a_question_waits_for_its_mitten(setup):
@@ -677,11 +779,40 @@ async def test_old_place_buttons_do_not_file_the_next_document(setup):
     await dispatcher.feed_update(bot, callback(first["Увесь ліс"]))  # pressed under the first document again
     assert telegram.sent[-1].text.startswith('Документ "Перший" уже збережено, він стосується: рукавичка "Під дубом"')
     await dispatcher.feed_update(bot, callback("dp:dropped1:f:"))  # under a document dropped with /cancel
-    assert 'Ці кнопки були для попереднього документа. Для якого місця документ "Другий"?' == telegram.sent[-1].text
+    assert 'Це місце було для попереднього документа. Для якого місця документ "Другий"?' == telegram.sent[-1].text
     assert dict(buttons(telegram.sent[-1])) == second
     assert [d.title for d in store.documents_of(USER.id)] == ["Перший"]
 
     await dispatcher.feed_update(bot, callback(second["Увесь ліс"]))
+    assert {d.title: d.scope.describe() for d in store.documents_of(USER.id)} == {
+        "Перший": 'рукавичка "Під дубом"', "Другий": "увесь ліс"}
+
+
+async def test_place_typed_twice_does_not_file_the_next_document(setup, monkeypatch):
+    # "Під дубом" sent twice, the second while the bot still reports saving the first document: the next document,
+    # not asked about yet, is not filed there, and the bot says where the first one is.
+    dispatcher, bot, telegram, llm, store = setup
+    lock = dispatcher["app"].locks[USER.id] = WatchedLock()
+    await send_unclear_document(dispatcher, bot, telegram, llm, store, "Перший.txt")
+    await dispatcher.feed_update(bot, document_update("Другий.txt", "t2"))
+    make_request, saving, go = telegram.make_request, asyncio.Event(), asyncio.Event()
+
+    async def slow(bot_, method, timeout=None):
+        if isinstance(method, SendMessage) and "збережено" in method.text and not saving.is_set():
+            saving.set()
+            await go.wait()
+        return await make_request(bot_, method, timeout)
+
+    monkeypatch.setattr(telegram, "make_request", slow)
+    first = asyncio.create_task(dispatcher.feed_update(bot, message(text="під дубом")))
+    await saving.wait()
+    second = asyncio.create_task(dispatcher.feed_update(bot, message(text="під дубом")))
+    await lock.waited.wait()
+    go.set()
+    await asyncio.gather(first, second)
+    assert [d.title for d in store.documents_of(USER.id)] == ["Перший"]
+    assert telegram.sent[-1].text == texts.DOC_ALREADY_SAVED.format(title="Перший", scope='рукавичка "Під дубом"')
+    await dispatcher.feed_update(bot, message(text="увесь ліс"))
     assert {d.title: d.scope.describe() for d in store.documents_of(USER.id)} == {
         "Перший": 'рукавичка "Під дубом"', "Другий": "увесь ліс"}
 

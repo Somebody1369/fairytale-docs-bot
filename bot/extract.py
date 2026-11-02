@@ -5,20 +5,19 @@ so pages without text are rendered and passed through Tesseract OCR.
 """
 
 import io
-import logging
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
+import zipfile
 from pathlib import Path
 
 import docx
 import pypdfium2 as pdfium
+import pypdfium2.raw as pdfium_c
 import pytesseract
 from PIL import ImageOps
-
-log = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt"}
 MIN_PAGE_TEXT = 20
@@ -27,6 +26,9 @@ MAX_OCR_PAGES = 30  # a scanned page takes a few seconds to read; a longer scan 
 MAX_RENDER_SIDE = 5000
 # Tesseract is stopped after this, and the file counts as unreadable rather than being stored without the page.
 OCR_PAGE_SECONDS = 120
+# python-docx holds every part of a .docx in memory, unpacked: a 1.5 MB zip bomb took a gigabyte. Pictures in
+# a .docx are packed already, so even a 20 MB file (Telegram's limit) unpacks to not much more.
+MAX_DOCX_UNPACKED = 50 * 1024 * 1024
 
 # PDFium is not thread-safe, not even for different documents (pypdfium2 docs), and PDFs are read in threads:
 # the archive sync and every animal's file at once. Two PDFs read together crashed the process.
@@ -41,6 +43,10 @@ class TooManyScannedPages(ValueError):
 
 class UnreadableScan(ValueError):
     """Tesseract did not finish a scanned page in OCR_PAGE_SECONDS."""
+
+
+class OcrFailed(UnreadableScan):
+    """Tesseract itself failed on a page (a language not installed, killed for lack of memory): the scan may be fine."""
 
 
 class UnsupportedFormat(Exception):
@@ -75,18 +81,36 @@ def extract_text(data: bytes, filename: str, ocr_langs: str = "ukr", ext: str | 
     raise UnsupportedFormat(ext)
 
 
+def file_at_fault(error: Exception) -> bool:
+    """The file itself cannot be read, however often it is tried: too many scanned pages, a scan page Tesseract
+    does not finish, a .docx too big unpacked, a broken PDF or .docx. Not when Tesseract, memory or the disk fail."""
+    return isinstance(error, (ValueError, pdfium.PdfiumError, zipfile.BadZipFile)) and not isinstance(error, OcrFailed)
+
+
 def _decode_text(data: bytes) -> str:
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         return data.decode("utf-16")
-    for encoding in ("utf-8-sig", "cp1251"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    # UTF-8 with a stray byte (0xA0, a non-breaking space from Windows) also decodes as cp1251, every letter garbled.
+    # Text in cp1251 fails as UTF-8 on almost every letter, so one bad byte, or one in a hundred, is UTF-8 with a gap.
+    text = data.decode("utf-8-sig", errors="replace")
+    if text.count("\ufffd") <= max(1, len(text) // 100):
+        return text
+    try:
+        return data.decode("cp1251")
+    except UnicodeDecodeError:
+        return text
 
 
 def _docx_text(data: bytes) -> str:
+    # The sizes a zip declares are the most it unpacks: zipfile stops there and fails the check sum.
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        unpacked = sum(member.file_size for member in archive.infolist())
+    if unpacked > MAX_DOCX_UNPACKED:
+        raise ValueError(f"the .docx unpacks to {unpacked} bytes, more than {MAX_DOCX_UNPACKED}")
     document = docx.Document(io.BytesIO(data))
     parts = [p.text for p in document.paragraphs]
     for table in document.tables:
@@ -111,12 +135,18 @@ def _pdf_text(data: bytes, ocr_langs: str) -> str:
     # OCR stays inside as well: simpler, and a second PDF waits for at most one file's scanned pages.
     with PDFIUM, pdfium.PdfDocument(data) as pdf:
         pages = [pdf[index].get_textpage().get_text_range() for index in range(len(pdf))]
-        scanned = [index for index, text in enumerate(pages) if len(text.strip()) < MIN_PAGE_TEXT]
+        # A scan is a picture: a blank page, or one with a heading alone, has nothing for OCR to read.
+        scanned = [index for index, text in enumerate(pages)
+                   if len(text.strip()) < MIN_PAGE_TEXT and _has_image(pdf[index])]
         if len(scanned) > MAX_OCR_PAGES:
             raise TooManyScannedPages(len(scanned))
         for index in scanned:
             pages[index] = _ocr_page(pdf[index], ocr_langs) or pages[index]
     return "\n\n".join(pages)
+
+
+def _has_image(page) -> bool:
+    return next(page.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_IMAGE]), None) is not None
 
 
 def _ocr_page(page, ocr_langs: str) -> str:
@@ -126,12 +156,13 @@ def _ocr_page(page, ocr_langs: str) -> str:
     # Text is near-black; the bark background and its stains are lighter.
     image = image.point(lambda value: 0 if value < 110 else 255)
     # A timeout fails the whole file: the sender is asked for a document with text, as for any scan that could not
-    # be read, and the archive sync retries the file later instead of storing the scan without this page.
+    # be read, and the archive sync reads the file again once it changes on Drive or EXTRACT_VERSION is bumped,
+    # instead of storing the scan without this page. So does an error of Tesseract itself, but the archive sync
+    # tries that file again at the next sync, as Tesseract may be set up right by then.
     try:
         raw = pytesseract.image_to_string(image, lang=ocr_langs, config="--psm 4", timeout=OCR_PAGE_SECONDS)
     except pytesseract.TesseractError as error:
-        log.warning("OCR failed: %s", error)
-        return ""
+        raise OcrFailed(str(error)) from error
     except RuntimeError as error:  # pytesseract's timeout; TesseractError above is a RuntimeError too
         raise UnreadableScan(str(error)) from error
     return _clean_ocr(raw)

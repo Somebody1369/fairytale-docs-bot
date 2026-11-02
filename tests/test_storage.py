@@ -80,6 +80,26 @@ def test_first_load_cut_short_is_not_a_loaded_archive(store, forest):
     assert store.has_archive()
 
 
+def test_files_gone_from_drive_are_counted_once(store, forest):
+    add_archive(store, forest, DUES, "Внесок 4 жолуді.", file_id="f")
+    add_dues_version(store, forest, "Внесок 5 жолудів.")
+    add_archive(store, forest, "Правила толоки", "Толока в першу суботу жовтня", file_id="t")
+    assert store.mark_missing_archive_files({"t"}) == 1  # one file, two versions
+    assert store.mark_missing_archive_files({"t"}) == 0
+    store.recompute_archive_status()
+    assert [d.title for d in store.active_documents()] == ["Правила толоки"]
+
+
+def test_archive_status_is_recomputed_without_the_texts(store, forest):
+    # It runs at every sync over every version of every archive file: the texts are not needed for it.
+    add_archive(store, forest, DUES, "Внесок 4 жолуді.", file_id="f")
+    statements = []
+    store.db.set_trace_callback(statements.append)
+    store.recompute_archive_status()
+    selects = [statement for statement in statements if statement.startswith("SELECT")]
+    assert selects and not [select for select in selects if "*" in select or "text" in select]
+
+
 def test_search_index_follows_a_sync_made_by_another_process(tmp_path, forest):
     # `python -m bot.ask` syncs the bot's database from another process. The bot's own next sync then finds every
     # status right already, and its search index must still be rebuilt.
@@ -118,7 +138,6 @@ def test_operators_invite_never_expires_but_a_members_does(store):
     assert not store.use_invite(mishka, 2, NOW + timedelta(days=60))           # still one use only
     assert store.use_invite(store.create_invite(1, NOW), 2, NOW + timedelta(days=7))   # /invite: 7 days
     assert not store.use_invite(store.create_invite(1, NOW), 3, NOW + timedelta(days=8))
-    assert not store.use_invite(store.create_invite(1, NOW), 1, NOW)           # not one's own link
     store.revoke_member(2, by_id=1)
     assert not store.use_invite(store.create_invite(2, NOW), 4, NOW)           # the inviter must still be a member
 
@@ -160,6 +179,8 @@ def test_inviter_closes_access_for_a_stranger_and_whoever_they_invited(store):
     doc, _ = add_animal(store, "Пожежа", "Під дубом при пожежі збираємося під дубом.", Scope("mitten", "Під дубом"),
                         author_id=4, name="Лис")
 
+    assert [member[0] for member in store.invited_by_chain(1)] == [2, 3, 4]
+    assert store.in_invite_chain(4, 1) and not store.in_invite_chain(1, 4) and not store.in_invite_chain(2, 3)
     assert store.revoke_member(3, by_id=4) is None              # nobody below in the chain can do it
     # Ведмідь sleeps till spring, so Мишка, higher in the chain, closes the fox's access.
     assert sorted(store.revoke_member(3, by_id=1)) == [3, 4]
@@ -171,6 +192,19 @@ def test_inviter_closes_access_for_a_stranger_and_whoever_they_invited(store):
     # Closed by mistake: a neighbour vouches for the animal again and its documents count again.
     assert store.use_invite(store.create_invite(1, NOW), 4, NOW)
     assert store.get(doc.id).status == "active"
+
+
+def test_document_read_while_access_was_closed_comes_back_with_a_new_invite(store):
+    store.use_invite(store.create_invite(None, NOW), 1, NOW)
+    store.use_invite(store.create_invite(1, NOW), 2, NOW)
+    old, _ = add_animal(store, "Гриби", "старий текст", Scope("forest"), author_id=2)
+    store.revoke_member(2, by_id=1)
+    # The new version was still being read: it is kept, not used, and stands in for the older one.
+    new, replaced = store.add_animal_document(title="Гриби", filename="Гриби.txt", scope=Scope("forest"), author_id=2,
+                                              author_name="Зайчик", text="новий текст", now=NOW, status="revoked")
+    assert replaced.id == old.id and new.status == "revoked" and store.active_documents() == []
+    assert store.use_invite(store.create_invite(1, NOW), 2, NOW)
+    assert [d.text for d in store.active_documents()] == ["новий текст"]
 
 
 def test_own_spare_link_does_not_bring_one_back(store):

@@ -1,7 +1,8 @@
 import asyncio
 import hashlib
 import logging
-from datetime import datetime, timezone
+from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -74,13 +75,16 @@ async def main() -> None:
         ])
         store = Store(settings.db_path)
         if settings.set_profile:
+            description = texts.BOT_DESCRIPTION_INVITES if settings.invites_only else texts.BOT_DESCRIPTION
             try:
+                # Only what differs is set: Telegram limits how often these can change, and the bot restarts often.
                 if me.first_name != texts.BOT_NAME:
                     await bot.set_my_name(texts.BOT_NAME)
-                await bot.set_my_short_description(texts.BOT_SHORT_DESCRIPTION)
-                await bot.set_my_description(texts.BOT_DESCRIPTION_INVITES if settings.invites_only
-                                             else texts.BOT_DESCRIPTION)
-            except TelegramAPIError as error:  # Telegram limits how often these can change
+                if (await bot.get_my_short_description()).short_description != texts.BOT_SHORT_DESCRIPTION:
+                    await bot.set_my_short_description(texts.BOT_SHORT_DESCRIPTION)
+                if (await bot.get_my_description()).description != description:
+                    await bot.set_my_description(description)
+            except TelegramAPIError as error:
                 log.warning("Could not update the bot's name or description: %s", error)
             await set_avatar(bot, store)
         forest = Forest()
@@ -97,7 +101,7 @@ async def main() -> None:
         sync_task = asyncio.create_task(keep_archive_in_sync(store, forest, archive, settings, archive_ready))
 
         if settings.invites_only and not store.has_members():
-            link = invite_link(me.username, store.first_invite(datetime.now(timezone.utc)))
+            link = invite_link(me.username, store.first_invite(datetime.now(UTC)))
             log.warning("The bot is open only by invitation. Invite for the first animal: %s", link)
 
         app = App(settings=settings, store=store, forest=forest, llm=llm,
@@ -108,6 +112,9 @@ async def main() -> None:
             await dispatcher.start_polling(bot)
         finally:
             sync_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await sync_task
+            store.db.close()
     finally:
         await bot.session.close()
 

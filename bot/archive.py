@@ -10,11 +10,11 @@ import html
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import aiohttp
 
-from .extract import SUPPORTED_EXTENSIONS, extension, extract_text, title_from_filename
+from .extract import SUPPORTED_EXTENSIONS, extension, extract_text, file_at_fault, title_from_filename
 from .places import Forest
 from .storage import Store, content_hash, norm_title
 
@@ -90,7 +90,7 @@ class DriveArchive:
         async with session.get(FOLDER_PAGE.format(folder_id=self.folder_id)) as response:
             response.raise_for_status()
             page = await response.text()
-        return parse_folder_page(page, datetime.now(timezone.utc))
+        return parse_folder_page(page, datetime.now(UTC))
 
     async def download(self, session: aiohttp.ClientSession, file: DriveFile) -> bytes:
         # Only the Drive API gets the key; the public download and export pages never needed it.
@@ -145,12 +145,12 @@ def parse_shown_date(shown: str, now: datetime) -> datetime | None:
     match = re.fullmatch(r"([A-Za-z]{3})\w*\s+(\d{1,2})(?:,\s*(\d{4}))?", shown)
     if match and match.group(1).lower() in MONTHS_EN:
         year = int(match.group(3) or now.year)
-        return datetime(year, MONTHS_EN[match.group(1).lower()], int(match.group(2)), tzinfo=timezone.utc)
+        return datetime(year, MONTHS_EN[match.group(1).lower()], int(match.group(2)), tzinfo=UTC)
     match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", shown)
     if match:
         year = int(match.group(3))
         year = year + 2000 if year < 100 else year
-        return datetime(year, int(match.group(1)), int(match.group(2)), tzinfo=timezone.utc)
+        return datetime(year, int(match.group(1)), int(match.group(2)), tzinfo=UTC)
     return None
 
 
@@ -168,19 +168,33 @@ async def sync_archive(store: Store, forest: Forest, archive: DriveArchive) -> S
             known = store.latest_archive_version(file.id)
             if known and known.present and known.drive_marker == marker:
                 continue
+            # A file the bot cannot read (a scan OCR gives up on, too many scanned pages, no text) is not downloaded
+            # and read again at every sync, holding the PDF lock: only once it changes or the reading improves.
+            unreadable = f"archive_unreadable:{file.id}"
+            if store.meta(unreadable) == marker:
+                report.failed += 1
+                continue
             try:
                 data = await archive.download(session, file)
+            except Exception as error:  # the network: tried again at the next sync
+                log.warning("Archive file %s (%s) not downloaded: %s", file.name, file.id, error)
+                report.failed += 1
+                continue
+            try:
                 text = await asyncio.to_thread(extract_text, data, file.name, archive.ocr_langs)
             except Exception as error:  # one broken file must not stop the rest
-                log.warning("Archive file %s (%s) skipped: %s", file.name, file.id, error)
+                log.warning("Archive file %s (%s) skipped: %r", file.name, file.id, error)
+                if file_at_fault(error):  # not Tesseract or the memory: those are tried again at the next sync
+                    store.set_meta(unreadable, marker)
                 report.failed += 1
                 continue
             if not text.strip():
-                log.warning("Archive file %s has no readable text", file.name)
+                log.warning("Archive file %s (%s) has no readable text", file.name, file.id)
+                store.set_meta(unreadable, marker)
                 report.failed += 1
                 continue
 
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             title = title_from_filename(file.name)
             same_text = known and known.content_hash == content_hash(text)
             if same_text and known.title == title:
@@ -213,7 +227,7 @@ def refresh_map(store: Store, forest: Forest) -> bool:
     """Re-read "Карта лісу" from the saved archive; whether the map the bot uses changed."""
     for doc in store.active_documents():
         if doc.from_archive and doc.norm_title == norm_title("Карта лісу"):
-            before = list(forest.mitten_parts.items())  # in order: mitten buttons go by position
+            before = list(forest.mitten_parts.items())  # in order: keyboards list the mittens in the map's order
             return forest.update_from_map(doc.text) and list(forest.mitten_parts.items()) != before
     return False
 

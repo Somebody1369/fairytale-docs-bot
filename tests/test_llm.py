@@ -73,6 +73,16 @@ def rate_limited(message: str, **headers):
     return groq.RateLimitError(message, response=response, body=None)
 
 
+def too_large(message: str):
+    """Groq answers a request over a per-minute limit with 413, which the SDK raises as a plain APIStatusError."""
+    import groq
+    import httpx
+
+    response = httpx.Response(413, request=httpx.Request("POST", "https://x"))
+    return groq.APIStatusError(f"Error code: 413 - {{'error': {{'message': '{message}'}}}}", response=response,
+                               body=None)
+
+
 def fake_client(create):
     return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
 
@@ -85,7 +95,9 @@ def test_default_models_answer_with_gpt_oss_first_and_pick_with_the_smallest():
 
     llm = LLM("x", DEFAULT_GROQ_MODELS.split(","))
     assert llm.order(fast=False) == ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
-    assert llm.order(fast=True) == ["openai/gpt-oss-20b", "qwen/qwen3.8-27b", "openai/gpt-oss-120b"]
+    # The strong model's minute is kept for the answer that comes right after the pick.
+    assert llm.order(fast=True) == ["openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+    assert LLM("x", ["openai/gpt-oss-120b"]).order(fast=True) == ["openai/gpt-oss-120b"]  # the only one still picks
     assert llm.client.max_retries == 0  # waiting is decided by LLM.json alone, not by the SDK as well
 
 
@@ -164,6 +176,78 @@ async def test_prompt_too_large_for_a_model_goes_to_the_next_one_at_once():
     assert used == ["openai/gpt-oss-120b", "openai/gpt-oss-20b"] * 2
 
 
+async def test_prompt_with_its_answer_budget_over_the_minute_is_asked_once_with_a_smaller_budget():
+    import asyncio
+
+    llm = LLM("x", ["openai/gpt-oss-120b", "openai/gpt-oss-20b"])
+    used = []
+
+    async def create(model, messages, **options):
+        used.append((model, options["max_completion_tokens"]))
+        # The user message is the prompt's tokens here; Groq counts them with the reply's budget.
+        requested = int(messages[1]["content"]) + options["max_completion_tokens"]
+        if model == "openai/gpt-oss-120b" and requested > 8000:
+            raise too_large("Request too large for model `openai/gpt-oss-120b` in organization `org_x` on tokens per "
+                            f"minute (TPM): Limit 8000, Requested {requested}, please reduce your message size.")
+        return OK
+
+    llm.client = fake_client(create)
+    async with asyncio.timeout(2):
+        assert await llm.json("system", "7200", max_tokens=1500) == {"a": 1}
+        # With 7700 tokens of prompt, less than 400 tokens are left for the answer: the next model is asked.
+        assert await llm.json("system", "7700", max_tokens=1500) == {"a": 1}
+    assert used == [("openai/gpt-oss-120b", 1500), ("openai/gpt-oss-120b", 700),
+                    ("openai/gpt-oss-120b", 1500), ("openai/gpt-oss-20b", 1500)]
+
+
+async def test_prompt_over_the_input_limit_or_still_too_large_goes_to_the_next_model():
+    import asyncio
+
+    llm = LLM("x", ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"])
+    used = []
+
+    async def create(model, **options):
+        used.append((model, options["max_completion_tokens"]))
+        if model == "qwen/qwen3.8-27b":  # the prompt alone is over: a smaller budget does not help
+            raise too_large("Request too large for model `qwen/qwen3.8-27b` on input tokens per minute (ITPM): "
+                            "Limit 7000, Requested 7834, please reduce your message size.")
+        if model == "openai/gpt-oss-120b":  # asked smaller once, and still too large
+            raise too_large("Request too large for model `openai/gpt-oss-120b` on tokens per minute (TPM): "
+                            "Limit 8000, Requested 8500, please reduce your message size.")
+        return OK
+
+    llm.client = fake_client(create)
+    async with asyncio.timeout(2):
+        assert await llm.json("system", "user", max_tokens=1500) == {"a": 1}
+    assert used == [("qwen/qwen3.8-27b", 900), ("openai/gpt-oss-120b", 1500), ("openai/gpt-oss-120b", 900),
+                    ("openai/gpt-oss-20b", 1500)]
+
+
+async def test_no_request_starts_with_too_little_time_left_after_the_models_queue(monkeypatch):
+    import asyncio
+    import time
+
+    import pytest
+
+    from bot import llm as llm_module
+    from bot.llm import LLMUnavailable
+
+    monkeypatch.setattr(llm_module, "MIN_ATTEMPT", 0.3)
+    llm = LLM("x", ["openai/gpt-oss-120b"])
+    used = []
+
+    async def create(model, **options):
+        used.append(model)
+        return OK
+
+    llm.client = fake_client(create)
+    await llm.queues["openai/gpt-oss-120b"].acquire()  # another question's request to the same model
+    asyncio.get_running_loop().call_later(0.4, llm.queues["openai/gpt-oss-120b"].release)
+    with pytest.raises(LLMUnavailable):
+        await llm.json("system", "user", deadline=time.monotonic() + 0.6)
+    assert used == []
+
+
 async def test_wait_that_does_not_fit_the_deadline_goes_to_the_next_model():
     import asyncio
     import time
@@ -237,6 +321,30 @@ async def test_with_every_model_busy_the_first_to_free_up_is_waited_for():
     # free first, is asked again instead of giving up.
     assert used == ["openai/gpt-oss-120b", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
     assert time.monotonic() - started < 2 and llm.resting["openai/gpt-oss-20b"] > time.monotonic()
+
+
+async def test_simple_choice_does_not_wait_for_the_model_it_never_asks():
+    import time
+
+    import pytest
+
+    from bot.llm import LLMUnavailable
+
+    llm = LLM("x", ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"])
+    used = []
+
+    async def create(model, **options):
+        used.append(model)
+        return OK
+
+    llm.client = fake_client(create)
+    started = time.monotonic()
+    # The strong model frees up first, but a title pick leaves it to the answer; the others rest for a minute.
+    llm.resting = {"openai/gpt-oss-120b": started + 0.5, "openai/gpt-oss-20b": started + 60,
+                   "qwen/qwen3.8-27b": started + 60}
+    with pytest.raises(LLMUnavailable):
+        await llm.json("system", "user", fast=True, deadline=started + 10)
+    assert time.monotonic() - started < 0.3 and used == []
 
 
 async def test_reply_cut_off_by_long_thinking_is_asked_again_with_less_thinking():

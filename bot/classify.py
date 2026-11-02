@@ -1,8 +1,11 @@
 """Which place an animal's document is written for. Unclear means: ask the sender, never guess."""
 
+import asyncio
 import logging
 import re
 import time
+from collections.abc import Iterator
+from typing import NamedTuple
 
 from .llm import LLM, LLMUnavailable
 from .places import (FOREST_SCOPE, PART_NAMES, PART_PATTERNS, RIVER, WHOLE_FOREST_PATTERN, Forest, Scope,
@@ -39,6 +42,16 @@ WHOLE_FOREST_CAPTION = r"(?:весь|увесь|всього|усього|для
 ADDRESSEE_HEAD = 300
 QUOTE = r"[«\"'“„‘]"
 QUOTES = " \"'«»“”„‘’"
+PLACE_PREPOSITION = r"(?:(?:у|в|на|під|біля|коло|поблизу|серед)\s+)?"
+# Words right before a place in a caption that negate it or name it as somewhere else: "це не для Під дубом",
+# "для всіх, крім Під дубом", "дорога до Під дубом", "від сусідів з Під вербою". Such a caption decides nothing.
+CAPTION_ELSEWHERE = re.compile(
+    rf"\b(?:не|крім|окрім|без|від|до|повз|з|із|зі)\s+(?:для\s+)?(?:рукавич\w*\s+)?{QUOTE}?{PLACE_PREPOSITION}$")
+# ... but "(я) з Під дубом" is where the sender lives, as typed in answer to "Про яку рукавичку?",
+SENDER_FROM = re.compile(rf"(?:^|\b(?:я|ми)\s+)(?:з|із|зі)\s+(?:рукавич\w*\s+)?{QUOTE}?{PLACE_PREPOSITION}$")
+# ... and "для звірів з Під дубом", "для мешканців з листяного лісу" say who the advice is for, unless negated.
+FOR_FROM = re.compile(rf"(?<!\bне\s)(?<!крім\s)(?<!без\s)\bдля\s+(?:(?!(?:не|крім|окрім|без|від|до|повз)\b)[\w']+\s+){{1,3}}"
+                      rf"(?:з|із|зі)\s+(?:рукавич\w*\s+)?{QUOTE}?{PLACE_PREPOSITION}$")
 # Who the advice is for, at the opening: "Порада для листяного лісу:", "Мешканцям рукавички Під вербою:",
 # and, as a greeting only, "Шановні мешканці лісу!" or "Мешканці лісу під ялинами!" at the start of a line.
 # "Звірі під ялиною ховаються від дощу" is a sentence about animals, not an address.
@@ -47,10 +60,16 @@ ADDRESSEE = re.compile(r"\bдля\s+|\b(?:мешканц|звір)(?:ям|ам)\
 ADDRESSEE_LEAD = re.compile(
     rf"(?:(?:всіх|усіх)\s+)?(?:(?:мешканц|звір)\w*\s+)?(?:(?:нашого\s+)?(?:(?:всього|усього)\s+)?лісу\s*)?"
     rf"(?:(?:у|в)\s+)?(?:рукавич\w*\s+)?(?:під\s+назвою\s+)?{QUOTE}?")
-PLACE_PREPOSITION = r"(?:(?:у|в|на|під|біля|коло|поблизу|серед)\s+)?"
 # After "для", the whole forest: "для всього лісу", "для всіх мешканців лісу", "для всіх:", "для кожного звіра".
 WHOLE_FOR = re.compile(r"(?:(?:всіх|усіх)\s+(?:(?:мешканц|звір)\w*\s+)?(?:нашого\s+)?|(?:всього|усього)\s+)лісу\b"
                        r"|(?:всіх|усіх)(?:\s+(?:мешканц|звір)\w*)?$|кожного\s+звіра\b|(?:всіх|усіх)\s+рукавичок\b|лісу$")
+# "для всіх", "для (всього) лісу", "для річки" are said of anything: "це небезпечно для лісу", "вогонь страшний
+# для всіх", "Сміття шкідливе для річки". They address the advice only where they open the sentence ...
+GENERAL_FOR = re.compile(r"(?:(?:всього|усього)\s+)?лісу|(?:всіх|усіх|кожного)\b|річки")
+# ... after a heading at most: "Порада для всіх:", "Ця пам'ятка для всіх мешканців.", "Пишу для всіх",
+# "Ця карта для всіх мешканців лісу." ("Це небезпечно для лісу" is no heading).
+ADDRESS_OPENING = re.compile(
+    r"(?:(?:[\w']+\s+){0,2}(?:(?:порад|пам'ятк|нагадуванн|правил|оголошенн|звернен)\w*|пишу)|(?:ця|цей)\s+[\w']+)?")
 # In a greeting: "Шановні мешканці лісу!", "Дорогі звірі нашого лісу!", "Мешканці всіх рукавичок, увага!".
 WHOLE_OF = re.compile(r"(?:(?:нашого\s+)?(?:(?:всього|усього)\s+)?лісу|(?:всіх|усіх)\s+рукавичок)$")
 # "Для всіх, хто живе біля річки": only where they live says who.
@@ -66,6 +85,9 @@ WHOLE_GREETING = re.compile(r"(?:шановні\s+|дорогі\s+)?(?:всім|
 # A mitten named as somewhere else, not as the advice's own place: "до (старої) рукавички Під дубом іти 200 кроків",
 # "як і в рукавичці Під дубом", "сусідів з рукавички Під вербою".
 OTHER_MITTEN = r"(?:\b(?:до|від|з|із|зі|повз|сусід\w*)|як\s+(?:і\s+)?(?:у|в))\s+(?:(?!наш|сво)\w+(?:ої|ою|у|ю|ій|ого)\s+)?"
+# A mitten as a landmark: "збираємося біля рукавички Під вербою". Only before a mitten named as a mitten,
+# since "біля" also begins a mitten's own name: "Мешканцям Під ялиною і Біля мурашника".
+NEAR_MITTEN = r"\b(?:біля|коло|поблизу|навпроти)\s+(?:\w+(?:ої|ою|у|ю|ій|ого)\s+)?"
 # A river place counts by itself only where a line opens with it ("Біля річки навесні буває повінь"):
 # "не залишайте малечу біля води" or "хто носить воду з річки" say nothing about who the advice is for.
 OPENING_WORDS = 3
@@ -73,6 +95,12 @@ ASK = Scope("ask")  # several places addressed: the sender is asked
 # Advice for several mittens: Mishka wants one document per place, so the sender is asked to split it.
 # The scope's value lists the mittens.
 SPLIT = "split"
+
+
+class ModelChoice(NamedTuple):
+    """The words did not settle the place: the question for the model and the answers that may be taken."""
+    prompt: str
+    accepted: set[Scope]
 
 
 def _split(mittens: list[str], low: str) -> Scope:
@@ -90,7 +118,13 @@ def scope_from_caption(caption: str | None, forest: Forest) -> Scope | None:
         return None
     low = normalize(caption)
     mittens, parts = forest.detect_mittens(low), forest.detect_parts(low)
-    whole = bool(re.search(WHOLE_FOREST_PATTERN, low) or re.search(WHOLE_FOREST_CAPTION, low))
+    whole_patterns = [WHOLE_FOREST_PATTERN, WHOLE_FOREST_CAPTION]
+    patterns = [mitten_pattern(m) for m in mittens] + [PART_PATTERNS[p] for p in parts] + whole_patterns
+    befores = [low[:found.start()] for pattern in patterns for found in re.finditer(pattern, low)]
+    if any(CAPTION_ELSEWHERE.search(before) and not SENDER_FROM.search(before) and not FOR_FROM.search(before)
+           for before in befores):
+        return None
+    whole = any(re.search(pattern, low) for pattern in whole_patterns)
     if len(mittens) == 1 and not parts and not whole:
         return Scope("mitten", mittens[0])
     if len(parts) == 1 and not mittens and not whole:
@@ -107,11 +141,37 @@ async def classify_document(title: str, text: str, forest: Forest, llm: LLM) -> 
     the whole document, and when it cannot tell, or the text names no place, the sender is asked.
     Signals that disagree, or a document addressed to several places, also mean asking. Advice for two
     or more mittens, each named as a mitten, gives a scope of kind SPLIT: the sender splits the document."""
+    # The words are looked for in the whole text, seconds for a file of megabytes: in a thread, so the bot keeps
+    # answering everyone else. On a copy of the map, which the archive sync may re-read meanwhile.
+    found = await asyncio.to_thread(_classify_by_words, title, text, Forest(dict(forest.mitten_parts)))
+    if not isinstance(found, ModelChoice):
+        return found
+    try:
+        result = await llm.json(
+            CLASSIFY_SYSTEM.format(mittens=", ".join(forest.mittens)), found.prompt,
+            max_tokens=400, fast=True,  # a short {"kind", "value"}: the budget counts against the minute
+            deadline=time.monotonic() + CLASSIFY_SECONDS,
+        )
+    except LLMUnavailable:
+        log.warning("Groq unavailable, asking the sender about %r", title)
+        return None
+    scope = _validate(result, forest)
+    return scope if scope in found.accepted else None
+
+
+def _classify_by_words(title: str, text: str, forest: Forest) -> Scope | ModelChoice | None:
+    """The place when the words settle it, None when the sender must be asked, else the choice left to the model."""
     addressee, title_scope = _addressee(text, forest), _from_title(title, forest)
     if addressee == ASK:
         return None
     if addressee and addressee.kind == SPLIT:
         return addressee
+    if addressee and addressee.kind == "mitten":
+        # "Мешканцям рукавички Під дубом: ..." and further on "У рукавичці У соснах внески 3 шишки": two documents.
+        low = normalize(text)
+        others = [m for m in forest.mittens if m != addressee.value and _named_as_mitten(m, low, own=True)]
+        if others:
+            return _split([addressee.value, *others], low)
     if addressee and title_scope:
         # "Внески біля річки" with "Шановні мешканці рукавички Під вербою!": the more specific one.
         return addressee if _within(addressee, title_scope, forest) else \
@@ -134,8 +194,9 @@ async def classify_document(title: str, text: str, forest: Forest, llm: LLM) -> 
 
     # The whole text rules a decision out (a guide may get to other places on its third page),
     # but a decision without the model needs its evidence in the part the model would read.
-    mentioned = forest.detect_mittens(low)  # "під дубом", "серед сосен", "біля мурашника"
-    parts = set(forest.detect_parts(low))  # "у хвойному лісі", "під ялинами", "біля річки"
+    # Not Forest.detect_mittens and detect_parts: they would normalize the whole text once more.
+    mentioned = [m for m in forest.mittens if re.search(mitten_pattern(m), low)]  # "під дубом", "серед сосен"
+    parts = {key for key, pattern in PART_PATTERNS.items() if re.search(pattern, low)}  # "у хвойному лісі"
     whole = bool(re.search(WHOLE_FOREST_FOR, head))
     decided = None
     if whole and not mentioned and not parts:
@@ -177,29 +238,22 @@ async def classify_document(title: str, text: str, forest: Forest, llm: LLM) -> 
     places = [f'рукавичка "{m}"' if m in explicit else f'"{m.lower()}" (рукавичка або просто дерево чи місцевість)'
               for m in mentioned] + [PART_NAMES[p] for p in sorted(parts)]
     choices = [_choice(scope) for scope in sorted(offered, key=lambda s: (-s.level, s.value or ""))]
-    try:
-        result = await llm.json(
-            CLASSIFY_SYSTEM.format(mittens=", ".join(forest.mittens)),
-            f"Назва файлу: {title}\n\nМісця, згадані в документі: {', '.join(places) or 'жодного'}\n"
-            f"Можливі відповіді: {'; '.join(choices)}; або \"unclear\", якщо з тексту це не зрозуміло."
-            f"\n\nТекст:\n{text[:EXCERPT_CHARS]}",
-            max_tokens=400, fast=True,  # a short {"kind", "value"}: the budget counts against the minute
-            deadline=time.monotonic() + CLASSIFY_SECONDS,
-        )
-    except LLMUnavailable:
-        log.warning("Groq unavailable, asking the sender about %r", title)
-        return None
-    scope = _validate(result, forest)
-    return scope if scope in accepted else None
+    return ModelChoice(
+        f"Назва файлу: {title}\n\nМісця, згадані в документі: {', '.join(places) or 'жодного'}\n"
+        f"Можливі відповіді: {'; '.join(choices)}; або \"unclear\", якщо з тексту це не зрозуміло."
+        f"\n\nТекст:\n{text[:EXCERPT_CHARS]}",
+        accepted,
+    )
 
 
 def _named_as_mitten(mitten: str, low: str, own: bool = False) -> bool:
     """ "у рукавичці «Під дубом»", "рукавичка під назвою Під дубом", "«Під дубом»". With `own`, not as somewhere
-    else: "до рукавички Під дубом іти 200 кроків" is not advice for Під дубом."""
+    else: "до рукавички Під дубом іти 200 кроків" and "збираємося біля рукавички Під дубом" are not advice for it."""
     named = rf"(?:рукавич\w*\s+(?:під\s+назвою\s+)?{QUOTE}?|{QUOTE}){re.escape(normalize(mitten))}"
     starts = [found.start() for found in re.finditer(named, low)]
     if own:
-        starts = [start for start in starts if not _elsewhere(low, start)]
+        starts = [start for start in starts
+                  if not _elsewhere(low, start) and not re.search(NEAR_MITTEN + "$", low[max(0, start - 40):start])]
     return bool(starts)
 
 
@@ -239,7 +293,7 @@ def _lines(text: str) -> list[str]:
 
 def _opens_with(text: str, mitten: str) -> bool:
     """The first or second line (after a title line) starts with the mitten's name."""
-    return any(line.startswith(normalize(mitten)) for line in _lines(text)[:2])
+    return any(line.startswith(normalize(mitten)) for line in _lines(text[:EXCERPT_CHARS])[:2])
 
 
 def _opens_with_part(text: str, part: str, forest: Forest) -> bool:
@@ -255,49 +309,77 @@ def _choice(scope: Scope) -> str:
 
 
 def _addressee(text: str, forest: Forest) -> Scope | None:
-    """The place right after "для", "мешканцям" or a greeting at the opening of the text. A place further on
-    in the clause is not the addressee: "Для зручності внески здавайте біля бобрової греблі". A sentence that
-    names another place too ("для хвойного та листяного лісу") is addressed to several places: ASK."""
-    for line in _lines(text[:ADDRESSEE_HEAD]):
-        for match in ADDRESSEE.finditer(line):
-            kind = "for" if match.group(0).startswith("для") else \
-                "to" if re.search(r"(?:ям|ам)\s+$", match.group(0)) else "greeting"
-            # Up to the end of the sentence for the places it names, up to a comma for the addressee itself.
-            sentence = re.split(r"[.:;!?…]", line[match.end():], maxsplit=1)[0]
-            clause, _, after = sentence.partition(",")
-            clause = clause.strip()
-            lead = ADDRESSEE_LEAD.match(clause).group(0)
-            place = clause[len(lead):].strip(QUOTES)
-            scope = _place_at_start(place, forest)
-            if scope and kind == "greeting" and not _just_the_place(place, scope):
-                scope = None  # "Звірі під ялиною ховаються від дощу" is a sentence about animals, not an address
-            if scope and scope.kind == "mitten" and "лісу" in lead and "рукавич" not in lead:
-                scope = None  # "мешканців лісу біля бобрової греблі" may be the area by the dam
-            if scope is None:
-                who = after.strip()
-                if kind == "for" and re.fullmatch(r"(?:всіх|усіх)(?:\s+(?:мешканц|звір)\w*)?", clause) and \
-                        who.startswith(("хто", "які", "котрі")):
-                    # "Для всіх, хто живе біля річки": only where they live says who.
-                    lives = WHO_LIVES.match(who)
-                    scope = _place_at_start(lives.group(1).strip(QUOTES), forest) if lives else None
-                    if not scope and not (forest.detect_mittens(who) or forest.detect_parts(who)):
-                        scope = FOREST_SCOPE  # "для всіх, хто любить гриби"
-                elif WHOLE_FOR.match(clause) and (clause != "лісу" or not after.strip()) if kind == "for" \
-                        else WHOLE_OF.fullmatch(clause):
-                    # "Нагадування для всього лісу про збори": the rest is the topic. A bare "для лісу" only
-                    # as the whole address ("Порада для лісу:"), not in "Сухостій небезпечний для лісу, тому..."
-                    scope = FOREST_SCOPE
-            if scope is None:
-                continue
-            if scope == FOREST_SCOPE:
-                return scope
+    """Who the opening of the text is addressed to. A document is for one place, so addressees not one inside
+    the other ("Для мешканців рукавички Під дубом: ...", then "Для мешканців рукавички Під вербою: ...", on one
+    line or on two) are several documents in one: SPLIT when all are mittens, ASK otherwise."""
+    # A PDF breaks its lines inside a sentence, "Порада для\nхвойного лісу": a line in lower case goes on the last one.
+    head = re.sub(r"\n[ \t]*(?=[а-яіїєґa-z])", " ", text[:ADDRESSEE_HEAD])
+    found: list[Scope] = []
+    for line in _lines(head):
+        for scope in _line_addressees(line, forest):
+            if scope == ASK:
+                return ASK
+            if not any(_within(scope, known, forest) or _within(known, scope, forest) for known in found):
+                found.append(scope)
+    if len(found) <= 1:
+        return found[0] if found else None
+    mittens = []
+    for scope in found:
+        if scope.kind == "mitten":
+            mittens.append(scope.value)
+        elif scope.kind == SPLIT:
+            mittens += scope.value.split(", ")
+        else:
+            return ASK  # "Порада для листяного лісу: ...", then "Порада для хвойного лісу: ..."
+    return Scope(SPLIT, ", ".join(dict.fromkeys(mittens)))
+
+
+def _line_addressees(line: str, forest: Forest) -> Iterator[Scope]:
+    """Each place right after "для", "мешканцям" or a greeting in the line. A place further on in the clause
+    is not the addressee: "Для зручності внески здавайте біля бобрової греблі". A sentence that names another
+    place too ("для хвойного та листяного лісу") is addressed to several places: ASK."""
+    for match in ADDRESSEE.finditer(line):
+        if re.search(rf"{QUOTE}$", line[:match.start()]):
+            continue  # «для хвойного лісу» in quotes: words cited, not who the advice is for
+        kind = "for" if match.group(0).startswith("для") else \
+            "to" if re.search(r"(?:ям|ам)\s+$", match.group(0)) else "greeting"
+        # Up to the end of the sentence for the places it names, up to a comma for the addressee itself.
+        sentence = re.split(r"[.:;!?…]", line[match.end():], maxsplit=1)[0]
+        clause, _, after = sentence.partition(",")
+        clause, who = clause.strip(), after.strip()
+        opening = re.split(r"[.!?…]", line[:match.start()])[-1].strip(QUOTES)
+        if kind == "for" and GENERAL_FOR.match(clause) and not ADDRESS_OPENING.fullmatch(opening):
+            continue  # "це небезпечно для лісу", "бо вогонь страшний для всіх", "Сміття шкідливе для річки"
+        lead = ADDRESSEE_LEAD.match(clause).group(0)
+        place = clause[len(lead):].strip(QUOTES)
+        scope = _place_at_start(place, forest)
+        if scope and kind != "for" and not _just_the_place(place, forest):
+            # "Звірі під ялиною ховаються від дощу", "Звірам під дубом у грозу стояти небезпечно":
+            # a sentence about animals, not an address
+            scope = None
+        if scope and scope.kind == "mitten" and "лісу" in lead and "рукавич" not in lead:
+            scope = None  # "мешканців лісу біля бобрової греблі" may be the area by the dam
+        if scope is None and kind == "for":
+            if re.fullmatch(r"(?:всіх|усіх)(?:\s+(?:мешканц|звір)\w*)?", clause) and \
+                    who.startswith(("хто", "які", "котрі")):
+                # "Для всіх, хто живе біля річки": only where they live says who.
+                lives = WHO_LIVES.match(who)
+                scope = _place_at_start(lives.group(1).strip(QUOTES), forest) if lives else None
+                if not scope and not (forest.detect_mittens(who) or forest.detect_parts(who)):
+                    scope = FOREST_SCOPE  # "для всіх, хто любить гриби"
+            elif WHOLE_FOR.match(clause):
+                scope = FOREST_SCOPE  # "Нагадування для всього лісу про збори": the rest is the topic
+        elif scope is None and WHOLE_OF.fullmatch(clause):
+            scope = FOREST_SCOPE  # "Шановні мешканці лісу!"
+        if scope is None:
+            continue
+        if scope != FOREST_SCOPE:
             # A mitten named as somewhere to go ("які ходять по горіхи до ліщини") is not one the advice is for.
             named = [mitten for mitten in forest.detect_mittens(sentence) if _addressed(mitten, sentence)]
             if not _covers(scope, named, set(forest.detect_parts(sentence)), forest):
                 # "для Під дубом і Під вербою" is two documents in one; "для хвойного та листяного лісу" is asked about
-                return _split(named, sentence) if len(named) >= 2 else ASK
-            return scope
-    return None
+                scope = _split(named, sentence) if len(named) >= 2 else ASK
+        yield scope
 
 
 def _addressed(mitten: str, sentence: str) -> bool:
@@ -306,11 +388,17 @@ def _addressed(mitten: str, sentence: str) -> bool:
     return any(not _elsewhere(sentence, found.start()) for found in re.finditer(mitten_pattern(mitten), sentence))
 
 
-def _just_the_place(place: str, scope: Scope) -> bool:
-    """The greeting ends with the place: "Шановні мешканці рукавички «Під дубом»!", "Мешканці лісу під ялинами!"."""
-    if scope.kind == "mitten":
-        return place == normalize(scope.value)
-    return bool(re.fullmatch(rf"{PLACE_PREPOSITION}(?:{PART_PATTERNS[scope.value]})\w*(?:\s+лісу|\s+ліс)?", place))
+def _just_the_place(place: str, forest: Forest) -> bool:
+    """The greeting or the address ends with the place, or with places joined by "і", "й", "та": "Шановні мешканці
+    рукавички «Під дубом»!", "Мешканці лісу під ялинами!", "Мешканцям Під ялиною і Біля мурашника:"."""
+    return _is_place(place, forest) or all(
+        _is_place(item.strip(QUOTES), forest) for item in re.split(r"\s+(?:і|й|та)\s+", place))
+
+
+def _is_place(words: str, forest: Forest) -> bool:
+    """A mitten or a forest part, and nothing more: "під дубом", "біля сосон", "під ялинами", "хвойного лісу"."""
+    patterns = [mitten_pattern(mitten) for mitten in forest.mittens] + list(PART_PATTERNS.values())
+    return any(re.fullmatch(rf"{PLACE_PREPOSITION}(?:{pattern})\w*(?:\s+лісу|\s+ліс)?", words) for pattern in patterns)
 
 
 def _place_at_start(place: str, forest: Forest) -> Scope | None:

@@ -7,7 +7,7 @@ members make with /invite, it does not expire.
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from aiogram import Bot
 
@@ -18,7 +18,7 @@ from .storage import Store
 
 async def main() -> None:
     settings = load_settings()
-    token = Store(settings.db_path).create_invite(None, datetime.now(timezone.utc))
+    token = Store(settings.db_path).create_invite(None, datetime.now(UTC))
     bot = Bot(settings.telegram_token)
     try:
         me = await bot.get_me()
