@@ -1,4 +1,5 @@
 import io
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -9,8 +10,8 @@ import pytest
 
 from bot import texts
 from bot.answering import (ANSWER_SYSTEM, DOC_CHARS, PICK_SECONDS, PICK_SYSTEM, PICK_TOKENS, PLACE_UNKNOWN_RULE,
-                           QUESTION_SECONDS, SPARE_TOKENS, Answerer, by_number, calendar_need, calendar_note, clean_text,
-                           prompt_chars)
+                           QUESTION_SECONDS, SPARE_TOKENS, Answerer, by_number, calendar_need, calendar_note, clean_other,
+                           clean_text, clean_wording, prompt_chars)
 from bot.extract import extract_text
 from bot.llm import LLM, LLMUnavailable
 from bot.places import CONIFER, DECIDUOUS, Scope
@@ -395,7 +396,8 @@ async def test_calendar_and_thinking_only_as_much_as_the_question_needs(forest_d
     llm = BudgetLLM({"found": True, "answer": "x", "sources": [1]}, picks=[{"ids": [1]}])  # a document for any question
     await Answerer(forest_docs, forest, llm, TZ).ask(question, NOW)
     calendar = llm.prompts[0][1].split("\n\nПитання звіра:")[0]
-    assert llm.reasoning == [reasoning] and llm.budgets[-1] == ("answer", budget)
+    # A second try (the calendar's November left out of "у соснах") thinks as long as the first.
+    assert set(llm.reasoning) == {reasoning} and llm.budgets[-1] == ("answer", budget)
     assert calendar.startswith("Сьогодні: середа, 28 жовтня 2026.")
     assert [line.split(":")[0] for line in calendar.splitlines() if line.startswith("Перші дні тижня")] == (
         ["Перші дні тижня, вересень 2026", "Перші дні тижня, жовтень 2026", "Перші дні тижня, листопад 2026"]
@@ -601,10 +603,14 @@ async def test_willow_answer_saying_whose_advice_is_whose_is_taken(store, forest
     add_archive(store, forest, "Грибний путівник листяного лісу", "Любі сусіди з листяного лісу! Білі гриби "
                                                                    "тримаються старих дубів, підберезники галявин біля беріз.")
     add_archive(store, forest, "Чим поживитись поруч із рукавичкою Під вербою", "Гриби опеньки ростуть на корінні верби.")
+    # Her answer has no general advice: the whole forest says when to look for mushrooms ("Гриби шукайте після
+    # дощу"), not where, so a complete answer costs no second try.
+    add_archive(store, forest, "Їстівне й отруйне", EDIBLE)
     answer = ("Біля самої рукавички опеньки ростуть на корінні верби. У листяному лісі білі гриби — під старими дубами, "
               "підберезники — на галявинах біля беріз. Біля річки опеньки — на старих вербах і пеньках біля води.")
     llm = FakeLLM({"found": True, "answer": answer, "sources": [1, 2, 3]})
     reply = await Answerer(store, forest, llm, TZ).ask("Де шукати гриби біля верби?", NOW)
+    assert "Їстівне й отруйне" in llm.prompts[0][1]
     assert len(llm.prompts) == 1 and reply.text.startswith(answer + "\n\nДжерела:")
 
 
@@ -1461,3 +1467,247 @@ def test_quoted_sentences_answer_the_topic(store, forest):
     mushrooms = answerer._topic_sentences(docs["Грибний путівник листяного лісу"], "Де шукати гриби біля верби?")
     assert mushrooms.startswith("Де шукати білі гриби? Білі гриби тримаються старих дубів.")
     assert "Коли йти по гриби? У листяному лісі гриби йдуть на 4–5 день після дощу." in mushrooms
+
+
+EDIBLE = ("Їстівне й отруйне\nЦя пам'ятка для всіх мешканців лісу. Ліс годує щедро, а хто знає різницю, повертається "
+          "додому з поживою.\nКоли шукати гриби\nГриби шукайте після дощу, коли земля волога, але не хлюпає.\n"
+          "Головне правило\nНевідомий гриб не беріть.")
+
+
+def test_prompt_makes_the_whole_forests_advice_on_the_topic_a_must():
+    # Decided on 2 November after a live run gave the pines only the conifer guide: Mishka's answer has the general
+    # advice too. A topic the whole forest shares (the hunters' memo) is still answered without the label.
+    assert ('а документ для всього лісу має пораду на тему питання, вона обов\'язкова: що не суперечить '
+            'конкретнішій, дай в "answer", що радить інакше, — в "other" (правило 3), і додай її документ у "sources"'
+            ) in ANSWER_SYSTEM
+    assert 'Якщо там "ні", цих слів не пиши: порада для всього лісу однакова для всіх' in ANSWER_SYSTEM
+
+
+@pytest.mark.parametrize("question, part_doc, part_answer, quote, label", [
+    # Mishka: «У хвойному лісі гриби з'являються на 2–3 день після дощу. Загальна порада для всього лісу — шукати після
+    # дощу, коли земля волога, але не хлюпає.» Live on 2 November the model gave the conifer guide alone.
+    ("Через скільки днів після дощу йти по гриби в соснах?",
+     ("Грибний путівник хвойного лісу", "Порада для тих, чия рукавичка стоїть у хвойному лісі. "
+                                        "Гриби з'являються на 2–3 день після дощу."),
+     "У хвойному лісі гриби з'являються на 2–3 день після дощу.",
+     "«Гриби шукайте після дощу, коли земля волога, але не хлюпає.»", True),
+    # The same topic in other words: "йти" is no word of the topic, "коли" meets the sentence on when.
+    ("Коли йти по гриби в соснах?",
+     ("Грибний путівник хвойного лісу", "Порада для тих, чия рукавичка стоїть у хвойному лісі. "
+                                        "Гриби з'являються на 2–3 день після дощу."),
+     "У хвойному лісі гриби з'являються на 2–3 день після дощу.",
+     "«Гриби шукайте після дощу, коли земля волога, але не хлюпає.»", True),
+    # A part's advice says otherwise: the calendar's November goes to "other", and is not left out.
+    ("Коли утеплювати рукавичку у соснах?",
+     ("Як утеплити рукавичку в хвойному лісі", "Порада для тих, чия рукавичка стоїть у хвойному лісі. "
+                                               "Утеплюйте рукавичку в жовтні."),
+     "У хвойному лісі утеплюють у жовтні.", "«Рукавички утеплюють у листопаді.»", True),
+])
+async def test_named_place_answer_without_the_whole_forests_advice_on_the_topic_is_asked_again(
+        store, forest, question, part_doc, part_answer, quote, label):
+    add_archive(store, forest, *part_doc)
+    add_archive(store, forest, "Їстівне й отруйне", EDIBLE)
+    add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Гриби — з серпня до жовтня. "
+                                                  "Рукавички утеплюють у листопаді.")
+    second = {"found": True, "answer": part_answer + " Загальна порада для всього лісу — інше.", "sources": [1, 2]}
+    llm = FakeLLM({"found": True, "answer": part_answer, "sources": [1]}, second, picks=[{"ids": [1, 2, 3]}])
+    reply = await Answerer(store, forest, llm, TZ).ask(question, NOW)
+    first = llm.prompts[0][1]
+    assert len(llm.prompts) == 2 and "Їстівне й отруйне" in first and "Календар сезонів" in first
+    reminder = llm.prompts[1][1][len(first):]
+    assert 'у "sources" немає документа для всього лісу' in reminder and "За правилом 11 вона обов'язкова" in reminder
+    # Only the sentences that share two of the question's words (its one word, if it has one) are quoted.
+    assert quote in reminder and "Невідомий гриб" not in reminder and "Ліс годує" not in reminder
+    assert ('словами "Загальна порада для всього лісу — …"' in reminder) == label
+    assert reply.text.startswith(second["answer"])
+
+
+class SourceLLM(FakeLLM):
+    """Picks every whole-forest title and answers from the first document whose title has `source` in it."""
+
+    def __init__(self, source: str):
+        super().__init__()
+        self.source = source
+
+    async def json(self, system, user, *args, **options):
+        if system == PICK_SYSTEM:
+            self.picks = [{"ids": [int(number) for number, line in re.findall(r"^(\d+)\. (.+)$", user, re.M)
+                                   if line.endswith("(увесь ліс)")][:4]}]
+        elif not self.prompts:
+            titles = re.findall(r'^\[(\d+)\] "(.+)"$', user, re.M)
+            self.answers = [{"found": True, "answer": "Відповідь.",
+                             "sources": [next(int(number) for number, title in titles if self.source in title)]}]
+        return await super().json(system, user, *args, **options)
+
+
+async def test_whole_forest_advice_off_the_topic_brings_no_second_try(store, forest):
+    # A second try costs Groq tokens (8000 a minute on the free tier): none where the whole forest has nothing on the
+    # topic, nor where the answer already cites it, nor for a place found by its resident.
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць. Здавати до 10 числа.")
+    add_archive(store, forest, "Чим поживитись поруч із рукавичкою Під дубом", "Жолуді й лісові горіхи.")
+    add_archive(store, forest, "Як утеплити рукавичку в листяному лісі", "Порада для листяного лісу. Сухим листям.")
+    add_archive(store, forest, "Статут ОСМД У ліщині", "Мешканці. У рукавичці живуть Ведмідь, Сорока і Вивірка.")
+    add_archive(store, forest, "Правила співжиття в рукавичці У ліщині", "З листопада Ведмідь лягає в сплячку.")
+    add_archive(store, forest, "Стежки до сусідів від рукавички Під ялиною", "Повертайтеся стежкою до заходу сонця.")
+    add_archive(store, forest, "Небезпеки поруч із рукавичкою Біля бобрової греблі", "Восени біля греблі мисливці.")
+    add_archive(store, forest, "Їстівне й отруйне", EDIBLE)
+    add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Рукавички утеплюють у "
+                                                  "листопаді. Хто спить узимку, лягає спати в грудні.")
+    add_archive(store, forest, "Осінній путівник лісу", "Цей путівник для всіх мешканців лісу. Почув три короткі крики "
+                                                       "Сороки — ховайся, це мисливці. Кошик можна знайти потім.")
+    add_archive(store, forest, "Як кричати, коли бачиш мисливців", "Це звернення до всіх мешканців лісу. Побачив "
+                "мисливців — крикни тричі коротко, як Сорока.")
+    for question, source in [("Скільки внесок під дубом і до якого числа?", "Членські внески"),
+                             ("Що їсти під дубом?", "Чим поживитись"),  # not "Ліс годує щедро … з поживою"
+                             ("Де знайти їжу під дубом?", "Чим поживитись"),  # not "Кошик можна знайти потім"
+                             ("Чим утеплити рукавичку під дубом?", "Як утеплити"),  # the calendar says when, not with what
+                             ("Коли Ведмідь лягає спати?", "Правила співжиття"),  # the place is the resident's
+                             # Not the opening paragraph saying whom it is for: "хто знає різницю, повертається додому"
+                             ("Коли повертатися додому під ялиною?", "Стежки до сусідів"),
+                             ("Біля греблі мисливці! Як кричати?", "Як кричати")]:  # the memo itself answers
+        llm = SourceLLM(source)
+        await Answerer(store, forest, llm, TZ).ask(question, NOW)
+        assert "Рівень: увесь ліс" in llm.prompts[0][1], question
+        assert len(llm.prompts) == 1, (question, llm.prompts[-1][1][-600:])
+
+
+def test_possessive_before_a_place_goes():
+    # Live on 2 November, despite rule 10. The animal may live elsewhere, and who asks does not matter (Mishka).
+    assert clean_wording("У вашій рукавичці «У соснах» (хвойний ліс) гриби можна збирати через 2‑3 дні після дощу.",
+                         "У соснах", "conifer") == \
+        "У рукавичці «У соснах» (хвойний ліс) гриби можна збирати через 2‑3 дні після дощу."
+    assert clean_wording("Опеньки – це ті гриби, які варто шукати біля вашої верби: вони ростуть прямо на корінні верби "
+                         "у вашій рукавичці, а також на старих вербах.", "Під вербою") == \
+        ("Опеньки – це ті гриби, які варто шукати біля верби: вони ростуть прямо на корінні верби у рукавичці "
+         "«Під вербою», а також на старих вербах.")
+    assert clean_wording("У вашій частині лісу — хвойному — гриби можна збирати через 2‑3 дні після дощу.",
+                         "У соснах", "conifer") == "У хвойному лісі гриби можна збирати через 2‑3 дні після дощу."
+    assert clean_wording("Опеньки шукайте прямо на корінні верби біля вашої рукавички «Під вербою».", "Під вербою") == \
+        "Опеньки шукайте прямо на корінні верби біля рукавички «Під вербою»."
+    assert clean_wording("Опеньки шукайте на корінні верби біля вашої рукавички; біля річки вони ростуть на вербах.",
+                         "Під вербою") == \
+        "Опеньки шукайте на корінні верби біля рукавички «Під вербою»; біля річки вони ростуть на вербах."
+    assert clean_wording("Вони ростуть на корінні вашої верби.", "Під вербою") == "Вони ростуть на корінні верби."
+    # Capitals and other places; a part named when it is the asked place's only one.
+    assert clean_wording("Вашу рукавичку утеплюйте в жовтні. У вашій частині лісу гриби ростуть після дощу.",
+                         "У соснах", "conifer") == \
+        "Рукавичку «У соснах» утеплюйте в жовтні. У хвойному лісі гриби ростуть після дощу."
+    assert clean_wording("Біля вашого мурашника, у вашому лісі й біля вашої нори будьте обачні.") == \
+        "Біля мурашника, у лісі й біля нори будьте обачні."
+    assert clean_wording("Утеплюйте вашу рукавичку сухим листям.") == "Утеплюйте рукавичку сухим листям."
+    # Rule 6 writes "Ваш" with a capital anywhere: only a sentence's first word keeps its capital.
+    assert clean_wording("Опеньки ростуть на корінні верби біля Вашої рукавички.", "Під вербою") == \
+        "Опеньки ростуть на корінні верби біля рукавички «Під вербою»."
+    assert clean_wording("Шукайте опеньки біля Вашої верби.", "Під вербою") == "Шукайте опеньки біля верби."
+    assert clean_wording("Гриби у Вашій рукавичці «У соснах» ростуть після дощу.", "У соснах", "conifer") == \
+        "Гриби у рукавичці «У соснах» ростуть після дощу."
+    assert clean_wording("Гриби у Вашій частині лісу з'являються на 2–3 день. У Вашій частині лісу — хвойному — "
+                         "утеплюють у жовтні.", "У соснах", "conifer") == \
+        "Гриби у хвойному лісі з'являються на 2–3 день. У хвойному лісі утеплюють у жовтні."
+    assert clean_wording("Біля Вашого мурашника будьте обачні. Вашу нору теж бережіть.\n- Вашу рукавичку утепліть.") == \
+        "Біля мурашника будьте обачні. Нору теж бережіть.\n- Рукавичку утепліть."
+    # Other uses stay: the bot addresses animals with "Ви".
+    for text in ("Перевірте ваші запаси.", "Ваш внесок — 4 жолуді.", "Ваші лісові горіхи можна віддати замість жолудів.",
+                 "За вашою домовленістю з Совою.", "Норка з чужого лісу краде рибу."):
+        assert clean_wording(text, "Під дубом", "deciduous") == text
+
+
+def test_general_is_the_whole_forests_label_only():
+    # Live for "У соснах": "тож діє загальна порада для хвойного лісу" names the conifer forest's own advice.
+    assert clean_wording("Окремої поради про час походу для рукавички «У соснах» немає, тож діє загальна порада для "
+                         "хвойного лісу: гриби з'являються на 2-3 день після дощу.") == \
+        ("Окремої поради про час походу для рукавички «У соснах» немає, тож діє порада для хвойного лісу: гриби "
+         "з'являються на 2-3 день після дощу.")
+    assert clean_wording("Загальна порада для листяного лісу — утеплювати листям.") == \
+        "Порада для листяного лісу — утеплювати листям."
+    for text in ("Загальна порада для всього лісу — шукати після дощу.",
+                 "Окремої поради немає, тож діє загальна порада для всього лісу: у листопаді."):
+        assert clean_wording(text) == text
+    assert '"загальна" — лише про весь ліс' in ANSWER_SYSTEM
+
+
+async def test_wording_is_cleaned_in_the_reply(store, forest):
+    add_archive(store, forest, "Чим поживитись поруч із рукавичкою Під вербою", "Опеньки ростуть на корінні верби.")
+    llm = FakeLLM({"found": True, "answer": "Опеньки шукайте на корінні верби біля вашої рукавички.", "sources": [1]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Де шукати опеньки біля верби?", NOW)
+    assert reply.text.startswith("Опеньки шукайте на корінні верби біля рукавички «Під вербою».\n\nДжерело:")
+
+
+async def test_other_saying_there_is_no_conflict_keeps_its_advice_without_that_claim(store, forest):
+    # Live for "Коли Ведмідь лягає спати?": "…, але це не суперечить конкретній пораді про Ведмедя…" is the model's
+    # word on its reply. The calendar's December still gives way to November, and its document is still cited.
+    add_archive(store, forest, "Правила співжиття в рукавичці У ліщині", "З листопада Ведмідь лягає в сплячку.")
+    add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Хто спить узимку, лягає в грудні.")
+    other = ("У календарі сезонів зазначено, що у грудні сплять ті, хто спить узимку, але це не суперечить конкретній "
+             "пораді про Ведмедя, що спить вже з листопада.")
+    llm = FakeLLM({"found": True, "answer": "Ведмідь лягає спати з листопада.", "other": other, "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли Ведмідь лягає спати у ліщині?", NOW)
+    assert reply.text.split("\n\n")[:2] == ["Ведмідь лягає спати з листопада.",
+                                            "У календарі сезонів зазначено, що у грудні сплять ті, хто спить узимку."]
+    # Nothing but the claim: no paragraph.
+    llm = FakeLLM({"found": True, "answer": "Ведмідь лягає спати з листопада.", "other": "Це не суперечить конкретній "
+                   "пораді для рукавички «У ліщині».", "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли Ведмідь лягає спати у ліщині?", NOW)
+    assert reply.text.startswith("Ведмідь лягає спати з листопада.\n\nДжерела:")
+    # Advice that says otherwise keeps its paragraph whole.
+    other = "Календар сезонів радить лягати в грудні, але для рукавички «У ліщині» діє конкретніша порада."
+    llm = FakeLLM({"found": True, "answer": "Ведмідь лягає спати з листопада.", "other": other, "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли Ведмідь лягає спати у ліщині?", NOW)
+    assert reply.text.split("\n\n")[1] == other
+    for written, kept in [("Загальна порада для всього лісу (вона не суперечить конкретній) — шукати після дощу.",
+                           "Загальна порада для всього лісу — шукати після дощу."),
+                          ("Календар радить утеплювати в листопаді. Це не суперечить пораді, бо вона для іншого місця.",
+                           "Календар радить утеплювати в листопаді.")]:
+        assert clean_other(written, "Утеплюйте в жовтні.", 2) == kept
+
+
+async def test_whole_forests_advice_with_a_no_conflict_claim_is_still_shown(store, forest):
+    # Rule 11 itself says "що не суперечить": the model may put the must-have general advice in "other" with those
+    # words. Dropping the paragraph would lose it while "Їстівне й отруйне" is still cited, and no reminder would come.
+    add_archive(store, forest, "Грибний путівник хвойного лісу", "Порада для тих, чия рукавичка стоїть у хвойному лісі. "
+                                                                 "Гриби з'являються на 2–3 день після дощу.")
+    add_archive(store, forest, "Їстівне й отруйне", EDIBLE)
+    answer = "У хвойному лісі гриби з'являються на 2–3 день після дощу."
+    other = ("Загальна порада для всього лісу — шукати гриби після дощу, коли земля волога, але не хлюпає; це не "
+             "суперечить пораді для хвойного лісу.")
+    llm = FakeLLM({"found": True, "answer": answer, "other": other, "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Через скільки днів після дощу йти по гриби в соснах?", NOW)
+    assert len(llm.prompts) == 1 and reply.text.split("\n\n")[:2] == [
+        answer, "Загальна порада для всього лісу — шукати гриби після дощу, коли земля волога, але не хлюпає."]
+
+
+async def test_second_try_adding_the_whole_forests_advice_but_losing_a_point_is_not_taken(store, forest):
+    # The whole forest's advice weighs after the place's own points: the calendar's October is no reason to lose
+    # "після першого морозу" (bot/check.py looks for "мороз").
+    add_archive(store, forest, "Чим поживитись поруч із рукавичкою Під дубом",
+                "Жолуді лежать під самим дубом. Найсмачніші вони після першого морозу.")
+    add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Жолуді збирають у жовтні.")
+    first = {"facts": ["[1, рукавичка] Жолуді найсмачніші після першого морозу."], "found": True,
+             "answer": "Жолуді найсмачніші після першого морозу.", "sources": [1]}
+    worse = {"found": True, "answer": "Загальна порада для всього лісу — збирати жолуді в жовтні.", "sources": [1, 2]}
+    llm = FakeLLM(first, worse)
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли збирати жолуді під дубом?", NOW)
+    assert len(llm.prompts) == 2 and "За правилом 11 вона обов'язкова" in llm.prompts[1][1]
+    assert reply.text.startswith(first["answer"] + "\n\nДжерело:")
+    # Adding it and keeping the rest is better.
+    better = dict(worse, answer=first["answer"] + " Загальна порада для всього лісу — збирати жолуді в жовтні.")
+    llm = FakeLLM(dict(first), better)
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли збирати жолуді під дубом?", NOW)
+    assert len(llm.prompts) == 2 and reply.text.startswith(better["answer"] + "\n\nДжерела:")
+
+
+async def test_answer_with_russian_letters_is_asked_again_in_ukrainian(store, forest):
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць.")
+    russian = {"found": True, "answer": "Взносы — 4 жёлудя в месяц.", "sources": [1]}
+    ukrainian = {"found": True, "answer": "Внесок 4 жолуді на місяць.", "sources": [1]}
+    llm = FakeLLM(russian, ukrainian)
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert len(llm.prompts) == 2 and "Пиши лише українською" in llm.prompts[1][1]
+    assert reply.text.startswith("Внесок 4 жолуді на місяць.")
+    # Still in Russian, the second try is no worse and is taken, as any such; there is no third.
+    llm = FakeLLM(dict(russian), dict(russian, answer="Взносы 4 жёлудя."), dict(ukrainian))
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert len(llm.prompts) == 2 and reply.text.startswith("Взносы 4 жёлудя.")
+    llm = FakeLLM(ukrainian)
+    await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert len(llm.prompts) == 1
