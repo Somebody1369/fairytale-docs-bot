@@ -11,7 +11,7 @@ import pytest
 from bot import texts
 from bot.answering import (ANSWER_SYSTEM, DOC_CHARS, PICK_SECONDS, PICK_SYSTEM, PICK_TOKENS, PLACE_UNKNOWN_RULE,
                            QUESTION_SECONDS, SPARE_TOKENS, Answerer, by_number, calendar_need, calendar_note, clean_other,
-                           clean_text, clean_wording, prompt_chars)
+                           clean_text, clean_wording, prompt_chars, question_word)
 from bot.extract import extract_text
 from bot.llm import LLM, LLMUnavailable
 from bot.places import CONIFER, DECIDUOUS, Scope
@@ -1477,10 +1477,15 @@ EDIBLE = ("Їстівне й отруйне\nЦя пам'ятка для всі�
 def test_prompt_makes_the_whole_forests_advice_on_the_topic_a_must():
     # Decided on 2 November after a live run gave the pines only the conifer guide: Mishka's answer has the general
     # advice too. A topic the whole forest shares (the hunters' memo) is still answered without the label.
-    assert ('а документ для всього лісу має пораду на тему питання, вона обов\'язкова: що не суперечить '
-            'конкретнішій, дай в "answer", що радить інакше, — в "other" (правило 3), і додай її документ у "sources"'
-            ) in ANSWER_SYSTEM
+    # What it answers counts, not its question word: Mishka's pines answer has the whole forest's "after rain" for
+    # "через скільки днів", her willow answer no "when" for "де".
+    assert ('а документ для всього лісу відповідає на це питання ("після дощу" — і на "через скільки днів", не на '
+            '"де"), його порада обов\'язкова: що не суперечить конкретнішій, дай в "answer", що радить інакше, — в '
+            '"other" (правило 3), а її документ — у "sources"') in ANSWER_SYSTEM
     assert 'Якщо там "ні", цих слів не пиши: порада для всього лісу однакова для всіх' in ANSWER_SYSTEM
+    # Live, the whole forest's "when" stood unlabelled among the willow's "where" and read as the mitten's own advice.
+    assert ('а пораду всього лісу завжди починай словами "Загальна порада для всього лісу — …" й не змішуй із '
+            'порадою місця') in ANSWER_SYSTEM
 
 
 @pytest.mark.parametrize("question, part_doc, part_answer, quote, label", [
@@ -1711,3 +1716,223 @@ async def test_answer_with_russian_letters_is_asked_again_in_ukrainian(store, fo
     llm = FakeLLM(ukrainian)
     await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
     assert len(llm.prompts) == 1
+
+
+# The archive's mushroom documents for "Під вербою" (data/bot.db), as the live model got them on 2 November.
+WILLOW_FOOD = ("Чим поживитись поруч із рукавичкою «Під вербою»\n\nДля мешканців рукавички «Під вербою» складено цей "
+               "короткий перелік смачних місць неподалік від дому. Біля нашої верби є чим підкріпитися, треба лише "
+               "знати, куди дивитися й коли виходити по поживу.\n\nКомарі й мошки\n\nУвечері над заводдю літають "
+               "комарі й мошки. Це частування для Жабки й Горобця.\n\nОжина\n\nОжина росте на березі за 40 кроків "
+               "угору за течією.\n\nОпеньки\n\nОпеньки ростуть просто на корінні верби, тобто зовсім поруч із "
+               "рукавичкою.\n\n"
+               "Смачного вам, сусіди! Хай ваші запаси ніколи не закінчуються, а вечері на березі будуть ситими й "
+               "веселими.")
+RIVER_MUSHROOMS = ("Грибний путівник біля річки\nЦей путівник для тих, хто живе біля річки. Біля води грибна пора має "
+                   "свій\nноров, тож прочитайте ці кілька рядків уважно.\nЩо шукати? Біля річки шукайте опеньки. Вони "
+                   "ростуть на старих вербах і\nпеньках біля води.\nКоли шукати? Біля річки опеньки йдуть уже "
+                   "наступного дня після невеликого\nдощу. Тут чекати довго не доводиться: дощик пройшов, а назавтра "
+                   "можна\nвиглядати опеньки.\nЧого остерігатися? Гриби з берега, який заливало, не беріть. Хоч які "
+                   "гарні\nвони на вигляд, лишайте їх там, де виросли.\nПам'ятка в трьох рядках\n– Опеньки — на старих "
+                   "вербах і пеньках біля води.\n– Шукати — уже наступного дня після невеликого дощу.\n– З берега, "
+                   "який заливало, гриби не брати.\nДобрих вам знахідок і сухих лап у дорозі.")
+DECIDUOUS_MUSHROOMS = ("Грибний путівник листяного лісу\nЛюбі сусіди з листяного лісу! Цей путівник для вас. Листяний "
+                       "ліс щедрий на\nгриби, але свої скарби він ховає дбайливо, тож відповідаємо на питання, які\n"
+                       "найчастіше чути біля рукавичок.\nДе шукати білі гриби?\nБілі гриби тримаються старих дубів. "
+                       "Біля них і варто дивитися насамперед.\nА де підберезники?\nПідберезники ростуть на галявинах "
+                       "біля беріз.\nКоли йти по гриби?\nУ листяному лісі гриби йдуть на 4–5 день після дощу. Отже, "
+                       "після дощу не\nбіжіть до лісу того ж ранку, а дайте грибам час.\nЯк шукати, щоб не нашкодити?\n"
+                       "Листя розгрібайте паличкою, а не лапами.\nХай вам щастить, і хай кожен похід по гриби "
+                       "закінчується теплою вечерею в\nрідній рукавичці.")
+CONIFER_MUSHROOMS = ("Грибний путівник хвойного лісу\n\nЦей путівник написано для звірів, що живуть у хвойному лісі. "
+                     "Тут пахне\n\nживицею, під лапами тихо шарудить хвоя.\n\nДе шукати\n\nМаслюки ростуть під "
+                     "молодими соснами, де багато сонця.\n\nРижики шукайте в моху під ялинами.\n\nКоли вирушати\n\n"
+                     "У хвойному лісі гриби з'являються на 2-3 день після дощу. Тож коли дощ\nвідшумить, порахуйте дні "
+                     "й лише тоді беріть кошик.")
+EDIBLE_ARCHIVE = ("Їстівне й отруйне\nЦя пам'ятка для всіх мешканців лісу. Ліс годує щедро, але не все, що росте в\n"
+                  "ньому, можна класти в кошик. Хто знає різницю, той повертається додому і з\nпоживою, і здоровим.\n"
+                  "Коли шукати гриби\nГриби шукайте після дощу, коли земля волога, але не хлюпає.\nБліда поганка\n"
+                  "Бліда поганка схожа на сироїжку. Відрізнити її можна так: у блідої поганки є\nкільце на ніжці й "
+                  "бульба внизу. Побачили кільце й бульбу — не беріть такого\nгриба.\nГоловне правило\nНевідомий гриб "
+                  "не беріть. Спитайте Їжака.")
+# Live on 2 November (sources: the mitten's, the river's, the deciduous guide, "Їстівне й отруйне").
+LIVE_WILLOW = ("Для рукавички «Під вербою» шукайте опеньки на корінні верби. У частині лісу біля річки також можна "
+               "знайти опеньки на старих вербах і пеньках біля води. У листяному лісі білі гриби тримаються старих "
+               "дубів. Усі гриби слід збирати після дощу, коли земля волога, але не хлюпає.")
+# Mishka's answer (30 October, 14:20), each piece of advice with its place, as rule 7 asks.
+MISHKA_WILLOW = ("Біля самої рукавички опеньки ростуть на корінні верби. У листяному лісі білі гриби — під старими "
+                 "дубами, підберезники — на галявинах біля беріз. Біля річки опеньки — на старих вербах і пеньках "
+                 "біля води.")
+
+
+def add_willow_mushrooms(store, forest):
+    for title, text in [("Чим поживитись поруч із рукавичкою Під вербою", WILLOW_FOOD),
+                        ("Грибний путівник біля річки", RIVER_MUSHROOMS),
+                        ("Грибний путівник листяного лісу", DECIDUOUS_MUSHROOMS),
+                        ("Їстівне й отруйне", EDIBLE_ARCHIVE)]:
+        add_archive(store, forest, title, text)
+
+
+async def test_the_answer_a_cited_document_gives_to_the_very_question_is_required(store, forest):
+    # Live on 2 November about half the willow answers left out the birch boletes, the deciduous guide's own answer
+    # to "А де підберезники?": the model never listed them in "facts", so nothing noticed.
+    add_willow_mushrooms(store, forest)
+    llm = FakeLLM({"found": True, "answer": LIVE_WILLOW, "sources": [1, 2, 3, 4]},
+                  {"found": True, "answer": MISHKA_WILLOW, "sources": [1, 2, 3]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Де шукати гриби біля верби?", NOW)
+    first = llm.prompts[0][1]
+    assert len(llm.prompts) == 2 and "Поради на цю тему різні в різних місцях: так" in first
+    facts = llm.prompts[1][1][len(first):].split("пункти, яких немає")[1]
+    assert '"Підберезники ростуть на галявинах біля беріз."' in facts
+    # Only the guide's answers to "де": not its opening, nor its "Коли йти по гриби?", nor what the answer has.
+    assert "щедрий" not in facts and "4–5 день" not in facts and "Білі гриби тримаються" not in facts
+    assert reply.text.startswith(MISHKA_WILLOW + "\n\nДжерела:")
+
+
+# The live check on 2 November: the same "when", labelled this time.
+# The archive's fire memo (data/bot.db) and the README's sample for "Під дубом" (docs/samples).
+def test_a_documents_own_answers_to_the_question_asked(store, forest):
+    add_archive(store, forest, "Грибний путівник листяного лісу", DECIDUOUS_MUSHROOMS)
+    add_archive(store, forest, "Грибний путівник біля річки", RIVER_MUSHROOMS)
+    add_animal(store, "Путівник лісом", "Путівник для всіх звірів.\nБіля річки\nДе шукати гриби? На старих вербах.\n"
+               "Що робити, як заблукав під дубом? Іти на схід.", Scope("forest"), name="Сорока")
+    answerer = Answerer(store, forest, FakeLLM(), TZ)
+    docs = {doc.title: doc for doc in store.active_documents()}
+    deciduous, river, guide = (docs[title] for title in ("Грибний путівник листяного лісу",
+                                                         "Грибний путівник біля річки", "Путівник лісом"))
+    # The sentence after each of its own questions with the same question word and a word of the topic, synonyms
+    # counting ("підберезники" are mushrooms); not the opening, which no question asks, nor "Коли йти по гриби?".
+    assert answerer._asked_points(deciduous, "Де шукати гриби біля верби?") == [
+        "Білі гриби тримаються старих дубів.", "Підберезники ростуть на галявинах біля беріз."]
+    assert answerer._asked_points(deciduous, "Коли йти по гриби під дубом?") == [
+        "У листяному лісі гриби йдуть на 4–5 день після дощу."]
+    # "шукати" alone is no topic ("Як шукати, щоб не нашкодити?"), and the river guide asks "що" and "коли", not "де".
+    assert answerer._asked_points(deciduous, "Як шукати опеньки під вербою?") == []
+    assert answerer._asked_points(river, "Де шукати гриби біля верби?") == []
+    # A question under another place's heading, or naming one, is that place's.
+    assert answerer._asked_points(guide, "Де шукати гриби під дубом?") == []
+    assert answerer._asked_points(guide, "Що робити, як заблукав під дубом?") == []
+    # A title asking the question is not answered by the opening under it.
+    add_animal(store, "Де шукати гриби?", "Де шукати гриби?\nЦей путівник для всіх звірів. Опеньки — на пнях.",
+               Scope("forest"), author_id=2, name="Білочка")
+    asked = next(doc for doc in store.active_documents() if doc.title == "Де шукати гриби?")
+    assert answerer._asked_points(asked, "Де шукати гриби під дубом?") == []
+
+
+def test_a_question_asks_with_its_first_question_word():
+    assert question_word("Біля греблі мисливці! Як кричати?") == "як"
+    assert question_word("Через скільки днів після дощу йти по гриби в соснах?") == "скільки"
+    assert question_word("А де підберезники?") == "де" and question_word("Коли шукати гриби") == "коли"
+    # A clause after a comma is no question: "коли" there means "whenever", "щоб" is no "що".
+    assert question_word("Що робити, коли біля греблі мисливці?") == "що"
+    assert question_word("Як шукати, щоб не нашкодити?") == "як"
+    assert question_word("Чи можна збирати гриби, коли йде дощ?") == ""
+
+
+def test_a_conjunction_asks_nothing(store, forest):
+    add_animal(store, "Про мисливців", "Пам'ятка для всіх звірів.\nКоли мисливці приходять до лісу? Мисливці приходять "
+               "восени, у листопаді.\nЯк кричати? Тричі коротко.", Scope("forest"))
+    answerer = Answerer(store, forest, FakeLLM(), TZ)
+    doc = store.active_documents()[0]
+    assert answerer._asked_points(doc, "Що робити, коли біля греблі мисливці?") == []
+    assert answerer._asked_points(doc, "Як кричати, коли бачиш мисливців біля греблі?") == ["Тричі коротко."]
+
+
+async def test_one_kind_of_mushroom_asks_about_itself_only(store, forest):
+    # "Гриби" asks about each kind, one kind about itself: the white mushrooms are no answer to "де шукати
+    # підберезники", and the deciduous guide has none to "де шукати опеньки".
+    add_willow_mushrooms(store, forest)
+    answerer = Answerer(store, forest, FakeLLM(), TZ)
+    deciduous = next(doc for doc in store.active_documents() if doc.title == "Грибний путівник листяного лісу")
+    assert answerer._asked_points(deciduous, "Де шукати підберезники під дубом?") == [
+        "Підберезники ростуть на галявинах біля беріз."]
+    assert answerer._asked_points(deciduous, "Де шукати опеньки біля верби?") == []
+    # Complete answers take one call.
+    birch = "У листяному лісі підберезники ростуть на галявинах біля беріз."
+    llm = FakeLLM({"found": True, "answer": birch, "sources": [1]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Де шукати підберезники під дубом?", NOW)
+    assert len(llm.prompts) == 1 and "Грибний путівник листяного лісу" in reply.text
+    honey = ("Біля самої рукавички опеньки ростуть на корінні верби. Біля річки опеньки — на старих вербах і пеньках "
+             "біля води. У листяному лісі окремої поради про опеньки немає.")
+    llm = FakeLLM({"found": True, "answer": honey, "sources": [1, 2, 3]})
+    await Answerer(store, forest, llm, TZ).ask("Де шукати опеньки біля верби?", NOW)
+    assert len(llm.prompts) == 1
+
+
+async def test_only_the_cited_documents_own_answers_are_required(store, forest):
+    add_archive(store, forest, "Чим поживитись поруч із рукавичкою Під дубом", "Білі гриби ростуть під самим дубом.")
+    add_archive(store, forest, "Грибний путівник листяного лісу", DECIDUOUS_MUSHROOMS)
+    own = "Біля рукавички білі гриби ростуть під самим дубом."
+    llm = FakeLLM({"found": True, "answer": own, "sources": [1]})
+    await Answerer(store, forest, llm, TZ).ask("Де шукати гриби під дубом?", NOW)
+    assert len(llm.prompts) == 1
+    # Cited, the guide's answers to "де" are a must, its "коли" is not; asked "коли", the "коли" one is.
+    white = own + " У листяному лісі білі гриби тримаються старих дубів."
+    full = white + " Підберезники ростуть на галявинах біля беріз."
+    llm = FakeLLM({"found": True, "answer": white, "sources": [1, 2]},
+                  {"found": True, "answer": full, "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Де шукати гриби під дубом?", NOW)
+    reminder = llm.prompts[1][1][len(llm.prompts[0][1]):]
+    assert '"Підберезники ростуть на галявинах біля беріз."' in reminder and "4–5" not in reminder
+    assert reply.text.startswith(full + "\n\nДжерела:")
+    llm = FakeLLM({"found": True, "answer": "У листяному лісі гриби йдуть після дощу.", "sources": [2]})
+    await Answerer(store, forest, llm, TZ).ask("Коли йти по гриби під дубом?", NOW)
+    assert len(llm.prompts) == 2 and '"У листяному лісі гриби йдуть на 4–5 день після дощу."' in llm.prompts[1][1]
+
+
+async def test_willow_answer_without_its_deciduous_part_is_asked_for_each_of_its_answers(store, forest):
+    # The live second try, asked for "саме те", took the white mushrooms and left out the birch boletes quoted beside
+    # them: the guide's answers to the question are named one by one, and each quoted point is asked for.
+    add_willow_mushrooms(store, forest)
+    without = "Біля самої рукавички опеньки ростуть на корінні верби. Біля річки опеньки — на старих вербах і пеньках."
+    llm = FakeLLM({"found": True, "answer": without, "sources": [1, 3]},
+                  {"found": True, "answer": MISHKA_WILLOW, "sources": [1, 2, 3]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Де шукати гриби біля верби?", NOW)
+    reminder = llm.prompts[1][1][len(llm.prompts[0][1]):]
+    assert 'немає поради для частини "листяний ліс"' in reminder and "додай у відповідь кожен його пункт" in reminder
+    assert "Перекажи з цього кожен пункт, що відповідає на питання, жодного не пропускаючи." in reminder
+    assert ('"Білі гриби тримаються старих дубів."; "Підберезники ростуть на галявинах біля беріз."'
+            in reminder.split("пункти, яких немає")[1])
+    assert reply.text.startswith(MISHKA_WILLOW + "\n\nДжерела:")
+
+
+async def test_second_try_losing_the_documents_own_answers_is_not_taken(store, forest):
+    # Asked for the birch boletes, the answer gave the guide's "when" instead and lost the white mushrooms as well:
+    # what the guide itself answers to "де" counts when the two tries are weighed, not only the model's own list.
+    add_willow_mushrooms(store, forest)
+    first = ("Біля самої рукавички опеньки ростуть на корінні верби. У листяному лісі білі гриби тримаються старих "
+             "дубів. Біля річки опеньки — на старих вербах і пеньках біля води.")
+    worse = ("Біля самої рукавички опеньки ростуть на корінні верби. У листяному лісі гриби йдуть на 4–5 день після "
+             "дощу. Біля річки опеньки — на старих вербах і пеньках біля води.")
+    llm = FakeLLM({"found": True, "answer": first, "sources": [1, 2, 3]},
+                  {"found": True, "answer": worse, "sources": [1, 2, 3]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Де шукати гриби біля верби?", NOW)
+    assert len(llm.prompts) == 2 and reply.text.startswith(first + "\n\nДжерела:")
+
+
+@pytest.mark.parametrize("question, archive, answer, sources", [
+    # Mishka's reference answers (28 October 23:54, 30 October 14:19-14:20) bring no second try.
+    ("Де шукати гриби біля верби?", None, MISHKA_WILLOW, [1, 2, 3]),
+    ("Через скільки днів після дощу йти по гриби в соснах?",
+     [("Грибний путівник хвойного лісу", CONIFER_MUSHROOMS), ("Їстівне й отруйне", EDIBLE_ARCHIVE)],
+     "У хвойному лісі гриби з’являються на 2–3 день після дощу. Загальна порада для всього лісу — шукати після дощу, "
+     "коли земля волога, але не хлюпає.", [1, 2]),
+    ("Біля греблі мисливці! Як кричати?",
+     [("Як кричати, коли бачиш мисливців", "Це звернення до всіх мешканців лісу. Побачив мисливців\nКрикни тричі "
+       "коротко, як Сорока.\nПочув постріл\nНе біжи на відкрите. Ховайся в гущавину.")],
+     "Крикни тричі коротко, як Сорока. Якщо почув постріл — не біжи на відкрите, ховайся в гущавину.", [1]),
+    ("Коли утеплювати рукавичку на узліссі?",
+     [("Календар сезонів", "Цей календар для всіх мешканців лісу.\nЛистопад\nРукавички утеплюють у листопаді."),
+      ("Як утеплити рукавичку в хвойному лісі", "Порада для тих, чия рукавичка стоїть у хвойному лісі. Утеплюйте "
+                                                "рукавичку в жовтні.")],
+     "Окремих порад про утеплення для узлісся немає. Загальна порада для всього лісу — утеплювати в листопаді.", [1]),
+])
+async def test_reference_answers_are_taken_as_they_are(store, forest, question, archive, answer, sources):
+    if archive is None:
+        add_willow_mushrooms(store, forest)
+    for title, text in archive or []:
+        add_archive(store, forest, title, text)
+    llm = FakeLLM({"found": True, "answer": answer, "sources": sources})
+    reply = await Answerer(store, forest, llm, TZ).ask(question, NOW)
+    assert len(llm.prompts) == 1 and reply.text.startswith(answer + "\n\nДжерел")
+
+

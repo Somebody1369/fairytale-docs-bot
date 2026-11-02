@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from .llm import LLM, LLMUnavailable
 from .places import CONIFER, DECIDUOUS, PART_NAMES, RIVER, Forest, Scope, resident_homes, residents_from_statute
-from .search import COMMON_STEMS, STOPWORDS, Hit, Index, expand, looks_like_heading, split_chunks, tokens
+from .search import COMMON_STEMS, STOPWORDS, SYNONYMS, Hit, Index, expand, looks_like_heading, split_chunks, tokens
 from .storage import Document, Store, norm_title
 from . import texts
 
@@ -98,7 +98,7 @@ ANSWER_SYSTEM = """Ти бот-помічник звірів лісу. Ти ві
 8. Не згадуй в "answer" та "other" номери й назви документів: джерела бот додасть сам.
 9. Якщо в документі є окремі розділи для різних місць, бери розділ для місця з питання. Але рівень розділу той самий, що й у всього документа (рядок "Рівень"): розділ "Під дубом" у путівнику для всього лісу є порадою рівня "увесь ліс", тож документ для рукавички Під дубом або для її частини лісу важливіший за нього.
 10. Місце в питанні ("під дубом", "біля сосон", "біля верби") означає рукавичку з рядка "Місце з питання", а не саме дерево: відповідай усіма порадами, що підходять цій рукавичці, навіть якщо в них це дерево не згадано, а названо інші дерева чи місця ("білі гриби тримаються старих дубів" теж відповідь на "де шукати гриби біля верби"). Звір не обов'язково там живе: ніколи не пиши "ваш…" перед рукавичкою, частиною лісу, деревом чи домом, а називай місце з рядка "Для кого" документа ("у хвойному лісі", навіть коли питали про «У соснах»).
-11. Якщо в питанні названо рукавичку чи частину лісу, а документ для всього лісу має пораду на тему питання, вона обов'язкова: що не суперечить конкретнішій, дай в "answer", що радить інакше, — в "other" (правило 3), і додай її документ у "sources". Якщо в рядку "Поради на цю тему різні в різних місцях" стоїть "так", скажи, для якого місця кожна порада ("У хвойному лісі …"), а пораду для всього лісу почни словами "Загальна порада для всього лісу — …" ("загальна" — лише про весь ліс). Якщо ж ні для цього місця, ні для його частини лісу поради на тему питання немає й відповідь лише з поради для всього лісу, почни так: "Окремої поради про … для … немає, тож діє загальна порада для всього лісу: …". Якщо там "ні", цих слів не пиши: порада для всього лісу однакова для всіх (усе одно перекажи всі її пункти на тему питання).
+11. Якщо в питанні названо рукавичку чи частину лісу, а документ для всього лісу відповідає на це питання ("після дощу" — і на "через скільки днів", не на "де"), його порада обов'язкова: що не суперечить конкретнішій, дай в "answer", що радить інакше, — в "other" (правило 3), а її документ — у "sources". Якщо в рядку "Поради на цю тему різні в різних місцях" стоїть "так", скажи, для якого місця кожна порада ("У хвойному лісі …"), а пораду всього лісу завжди починай словами "Загальна порада для всього лісу — …" й не змішуй із порадою місця ("загальна" — лише про весь ліс). Якщо ж відповідь лише з поради для всього лісу, почни так: "Окремої поради про … для … немає, тож діє загальна порада для всього лісу: …". Якщо там "ні", цих слів не пиши: порада для всього лісу однакова для всіх (усе одно перекажи всі її пункти на тему питання).
 
 Поверни JSON: {"facts": ["кожен пункт документів, з яких відповідаєш, на тему питання, окремим рядком, навіть якщо про нього прямо не питали (на \"скільки внесок\" це й кому та куди віддавати, і чим можна замінити): скільки, коли, кому, куди, чим замінити, хто звільнений; на початку рядка номер документа і його рівень, наприклад [2, частина лісу]"], "found": true або false, "answer": "текст відповіді для місця з питання, у якому є всі ці пункти, крім тих, що пішли в other", "other": "порада, що радить інакше й тут поступається відповіді, з поясненням чому, або \"\"", "sources": [номери документів, з яких узято відповідь, найважливіший перший]}"""
 
@@ -115,11 +115,11 @@ LEVEL_REMINDER = """
 
 PARTS_REMINDER = """
 
-Зверни увагу: рукавичка "{mitten}" належить до кількох частин лісу, і їй підходять поради кожної з них. У відповіді {cited}немає поради для {missing}. Якщо в документі {docs} є щось на тему питання "{topic}" (навіть без дерева, названого в питанні, чи з іншими деревами: дерево з питання лише вказує на рукавичку), додай у відповідь саме те, що відповідає на цю тему, сказавши, {label}, і додай номер документа в "sources".{quotes}"""
+Зверни увагу: рукавичка "{mitten}" належить до кількох частин лісу, і їй підходять поради кожної з них. У відповіді {cited}немає поради для {missing}. Якщо в документі {docs} є щось на тему питання "{topic}" (навіть без дерева, названого в питанні, чи з іншими деревами: дерево з питання лише вказує на рукавичку), додай у відповідь кожен його пункт, що відповідає на це питання, сказавши, {label}, і додай номер документа в "sources".{quotes}"""
 
 FACTS_REMINDER = """
 
-Зверни увагу: ти виписав у "facts" із документів, на які посилаєшся, пункти, яких немає ні в "answer", ні в "other": {facts}. Додай їх у "answer" (можна коротко), нічого не вигадуючи, а пункт поради, що тут поступається конкретнішій чи архіву, — коротко в "other"."""
+Зверни увагу: у документах, з яких ти відповідаєш, є на тему питання пункти, яких немає ні в "answer", ні в "other": {facts}. Додай їх у "answer" (можна коротко), нічого не вигадуючи, а пункт поради, що тут поступається конкретнішій чи архіву, — коротко в "other"."""
 
 ARCHIVE_REMINDER = """
 
@@ -135,15 +135,17 @@ OTHER_REMINDER = """
 
 FOREST_REMINDER = """
 
-Зверни увагу: у "sources" немає документа для всього лісу, а в документі {docs} (рівень "увесь ліс") є порада на тему питання "{topic}". За правилом 11 вона обов'язкова: те, що не суперечить конкретнішій пораді, додай у "answer"{label}, а що радить інакше — коротко в "other", як у правилі 3, і додай номер документа в "sources".{quotes}"""
+Зверни увагу: у "sources" немає документа для всього лісу, а в документі {docs} (рівень "увесь ліс") є порада на тему питання "{topic}". За правилом 11 вона обов'язкова: кожен її пункт на це питання, що не суперечить конкретнішій пораді, додай у "answer"{label}, а що радить інакше — коротко в "other", як у правилі 3, і додай номер документа в "sources".{quotes}"""
 
 UKRAINIAN_REMINDER = """
 
 Зверни увагу: у відповіді є російські літери ({letters}). Пиши лише українською: перекажи "answer" і "other" грамотною українською, нічого не змінюючи по суті."""
 
 # The model, given "Де шукати гриби біля верби?", kept to the willow and skipped the deciduous guide's "Білі гриби
-# тримаються старих дубів" even when reminded of it; quoting the sentences on the topic brought them in.
-QUOTE_NOTE = " На цю тему в документі [{number}] сказано: «{quote}»"
+# тримаються старих дубів" even when reminded of it; quoting the sentences on the topic brought them in. Asked for
+# "саме те", the live second try took the white mushrooms and left out the birch boletes quoted beside them.
+QUOTE_NOTE = (" На цю тему в документі [{number}] сказано: «{quote}» Перекажи з цього кожен пункт, що відповідає на "
+              "питання, жодного не пропускаючи.")
 QUOTE_CHARS = 300
 # Words of searching and going say nothing of the topic: "де шукати гриби" shares them with "Гриби шукайте після
 # дощу" (when, not where), "коли йти по гриби" with no advice at all.
@@ -151,6 +153,14 @@ SEARCH_STEMS = frozenset({"шука", "знай", "знах", "йти", "іти"
 WHEN = re.compile(r"\bколи\b", re.I)
 # The line saying whom a document is for: "Ця пам'ятка для всіх мешканців лісу", "Це звернення до всіх мешканців".
 FOR_EVERYONE = re.compile(r"\b(?:всіх|усіх)\s+мешканців\b|\b(?:всього|усього)\s+лісу\b", re.I)
+# A document's own question answers the animal's when it asks the same: "Де шукати білі гриби?" and "А де
+# підберезники?" for "де шукати гриби", not "Коли йти по гриби?".
+QUESTION_WORDS = re.compile(r"\b(?:де|коли|скільки|чим|як|куди|хто|що)\b", re.I)
+# "Гриби" asks about each kind ("А де підберезники?" answers "де шукати гриби"), one kind about itself only: "де
+# шукати підберезники" asks nothing about the white mushrooms, nor "де шукати опеньки" about the birch boletes.
+GENERAL_WORDS = frozenset({"гриби", "гриб", "грибів"})
+KINDS = frozenset(term for group in SYNONYMS if group & GENERAL_WORDS for word in group - GENERAL_WORDS
+                  for term in tokens(word))
 
 RESIDENT_NOTE = " (місце визначено за звіром {name}, який тут живе; якщо порада однакова для всього лісу, на рукавичці не наголошуй)"
 
@@ -170,6 +180,7 @@ class Draft(NamedTuple):
     faults: int  # how many of the rules Answerer._review counts it breaks, the whole forest's advice aside
     general: bool  # the whole forest's advice on the topic of a place asked left out (rule 11)
     facts: list  # the points the model listed from the documents
+    points: list[str]  # the documents' own answers to the very question asked (Answerer._asked_points)
 
 
 def prompt_chars(max_tokens: int) -> int:
@@ -274,25 +285,68 @@ def fact_terms(text: str) -> set[str]:
 FACT = re.compile(r"\s*[-*•«\"(]*\s*\[\s*(?:№|документ\s*)?(\d+)[^\]]*\]\**\s*(.+)", re.S | re.I)
 
 
-def missing_facts(facts, docs: list[Document], sources: list[Document], text: str, question: str = "") -> list[str]:
-    """The facts ("[1, рукавичка] ...") the model listed from the documents it cites that the text leaves out:
-    checked sentence by sentence (and line by line for lists), a sentence is left out when the text lacks one of
-    its numbers or half of its word stems. Words of the question need not be repeated ("у хвойному лісі" in
-    "Коли утеплювати у соснах?" -> "У жовтні"). Facts from documents the answer does not cite are not required."""
+def missing_facts(facts, docs: list[Document], sources: list[Document], text: str, question: str = "",
+                  points: list[str] | tuple = ()) -> list[str]:
+    """The facts ("[1, рукавичка] ...") the model listed from the documents it cites, and the `points` the documents
+    give themselves as answers to the question, that the text leaves out, each once: checked sentence by sentence
+    (and line by line for lists), a sentence is left out when the text lacks one of its numbers or half of its word
+    stems. Words of the question need not be repeated ("у хвойному лісі" in "Коли утеплювати у соснах?" -> "У
+    жовтні"). Facts from documents the answer does not cite are not required."""
     cited = {docs.index(doc) + 1 for doc in sources}
     have, asked = fact_terms(text), fact_terms(question)
-    left_out = []
+    sentences = []
     for fact in facts if isinstance(facts, list) else []:
         match = FACT.match(str(fact))
-        if not match or int(match.group(1)) not in cited:
-            continue
-        for sentence in re.split(r"(?<=[.!?;])\s+|\n+", match.group(2).strip()):
-            terms = fact_terms(sentence)
-            numbers = {term for term in terms if term.isdigit()}
-            terms = (terms - asked) or terms
-            if numbers - have or (terms and len(terms & have) * 2 < len(terms)):
-                left_out.append(sentence.strip())
+        if match and int(match.group(1)) in cited:
+            sentences += re.split(r"(?<=[.!?;])\s+|\n+", match.group(2).strip())
+    left_out = []
+    for sentence in sentences + list(points):
+        terms = fact_terms(sentence)
+        numbers = {term for term in terms if term.isdigit()}
+        terms = (terms - asked) or terms
+        if (numbers - have or (terms and len(terms & have) * 2 < len(terms))) and sentence.strip() not in left_out:
+            left_out.append(sentence.strip())
     return left_out
+
+
+def answered_sentences(doc: Document, skip_intro: bool = False) -> list[tuple[str, str, str]]:
+    """The document's sentences other than questions, each with its heading and the question just before it, which it
+    answers: ("", "Де шукати білі гриби?", "Білі гриби тримаються старих дубів."). The title line is no heading, nor a
+    question the opening answers ("Де шукати гриби?" as an animal's file name), and a PDF line wrapped mid-sentence is
+    joined to the one before. With `skip_intro`, the opening paragraph saying whom the document is for goes: "Хто
+    знає різницю, той повертається додому…" is no advice on "коли повертатися"."""
+    lines = []
+    for line in (line.strip() for line in doc.text.splitlines()):
+        if lines and line and not lines[-1].endswith((".", "!", "?", "…", ":", ";")) and line[0].islower():
+            lines[-1] += " " + line  # a PDF line wrapped mid-sentence
+        elif line:
+            lines.append(line)
+    title = lambda line: norm_title(line) == doc.norm_title
+    body = [line for line in lines if not looks_like_heading(line) and not title(line)]
+    if skip_intro and len(body) > 1 and FOR_EVERYONE.search(body[0]):
+        lines.remove(body[0])
+    sentences, heading, asked = [], "", ""
+    for line in lines:
+        if title(line) or looks_like_heading(line):
+            heading, asked = ("" if title(line) else line), ""
+            continue
+        for sentence in re.split(r"(?<=[.!?…])\s+", line):
+            if sentence.endswith("?"):
+                asked = sentence
+            else:
+                sentences.append((heading, asked, sentence))
+                asked = ""
+    return sentences
+
+
+def question_word(text: str) -> str:
+    """The word a question or a heading asks with, or "": the first of QUESTION_WORDS in its last asking sentence,
+    before any comma ("Біля греблі мисливці! Як кричати?" -> "як", "Коли шукати гриби" -> "коли"), so the "коли" of
+    "Що робити, коли біля греблі мисливці?" ("whenever") asks nothing."""
+    sentences = [sentence for sentence in re.split(r"(?<=[.!?…])\s+", text.strip()) if sentence]
+    asking = [sentence for sentence in sentences if sentence.endswith("?")] or sentences or [""]
+    match = QUESTION_WORDS.search(asking[-1].split(",")[0])
+    return match.group(0).lower() if match else ""
 
 
 # Document numbers as the model writes them: "[1]", "[2, рукавичка]" and runs of them like "[1], [2]" or "[1] і [2]".
@@ -622,22 +676,22 @@ class Answerer:
                 prompt += SOURCES_REMINDER  # the very same request would mostly bring the very same reply
                 continue
             facts = result.get("facts") if isinstance(result.get("facts"), list) else []
-            reminders, faults, general = self._review(question, docs, mittens, named, answer, other, sources, facts,
-                                                      varies)
-            draft = Draft(answer, other, sources, faults, general, facts)
+            reminders, faults, general, points = self._review(question, docs, mittens, named, answer, other, sources,
+                                                              facts, varies)
+            draft = Draft(answer, other, sources, faults, general, facts, points)
             if kept:
                 # The one second try is taken unless it came out worse: more broken rules, the advice that gives way
-                # still without its document, or more of the points both answers listed left out (a weaker fallback
-                # model may answer it worse than the first). A new "other" without its document is dropped anyway.
-                # The whole forest's advice weighs last: adding it is no reason to lose a place's own point
-                # ("після першого морозу" for the acorns under the oak, beside the calendar's October).
+                # still without its document, or more of the points both answers listed, or its documents give as the
+                # answers to the question, left out (a weaker fallback model may answer it worse than the first). A new
+                # "other" without its document is dropped anyway. The whole forest's advice weighs last: adding it is
+                # no reason to lose a place's own point ("після першого морозу" for the acorns under the oak).
                 every = kept.facts + facts
                 unsourced = bool(kept.other) and len(kept.sources) == 1 and len(docs) > 1
                 before = (kept.faults, unsourced,
-                          len(missing_facts(every, docs, kept.sources, f"{kept.answer} {kept.other}", question)),
-                          kept.general)
+                          len(missing_facts(every, docs, kept.sources, f"{kept.answer} {kept.other}", question,
+                                            kept.points)), kept.general)
                 after = (faults, unsourced and bool(other) and len(sources) == 1,
-                         len(missing_facts(every, docs, sources, f"{answer} {other}", question)), general)
+                         len(missing_facts(every, docs, sources, f"{answer} {other}", question, points)), general)
                 if after <= before:
                     kept = draft
                 break
@@ -687,10 +741,10 @@ class Answerer:
                 if len(term) >= 4 and not term.isdigit()} - names
 
     def _review(self, question: str, docs: list[Document], mittens: list[str], named: bool, answer: str, other: str,
-                sources: list[Document], facts: list, varies: str = "") -> tuple[list[str], int, bool]:
+                sources: list[Document], facts: list, varies: str = "") -> tuple[list[str], int, bool, list[str]]:
         """What to put right in an answer: the reminders for the model, how many of the rules (levels, the archive,
-        both forest parts, Ukrainian) the answer breaks, and whether it leaves out the whole forest's advice on the
-        topic of a place asked. `varies` is "так" or "ні" when the question itself names the place, else ""."""
+        both forest parts, Ukrainian) the answer breaks, whether it leaves out the whole forest's advice on the
+        topic of a place asked, and the points its documents give as the answers to the question. `varies` is "так" or "ні" when the question itself names the place, else ""."""
         reminders = []
         asked = re.sub(r"\s+", " ", self.forest.strip_places(question)).strip(" ?.!,")
         # A section about the asked mitten inside a whole-forest guide tempts the model to put the
@@ -752,11 +806,15 @@ class Answerer:
         if other and len(sources) == 1 and len(docs) > 1:
             reminders.append(OTHER_REMINDER)
         # The model lists the points of the cited documents in "facts", then now and then drops some of them
-        # when it writes the answer ("Кабанові в кошик біля входу" in the customer's own example).
-        left_out = missing_facts(facts, docs, sources, f"{answer} {other}", question)
+        # when it writes the answer ("Кабанові в кошик біля входу" in the customer's own example). What a cited
+        # document, or a forest part's document the answer left out, gives itself as the answer to the very question
+        # is a must too: live, the birch boletes went missing from about half the willow answers, never in "facts".
+        points = [point for doc in sources + [doc for doc in missing if doc not in sources]
+                  for point in self._asked_points(doc, question)]
+        left_out = missing_facts(facts, docs, sources, f"{answer} {other}", question, points)
         if left_out:
             reminders.append(FACTS_REMINDER.format(facts="; ".join(f'"{fact}"' for fact in left_out)))
-        return reminders, faults, bool(general)
+        return reminders, faults, bool(general), points
 
     def _topic_sentences(self, doc: Document, question: str, strict: bool = False) -> str:
         """The document's sentences on the topic of the question, the ones sharing most words first, up to QUOTE_CHARS
@@ -772,38 +830,46 @@ class Answerer:
         least = min(2, len(words)) if strict else 0
         own = [word for word in words if not word & SEARCH_STEMS]
         when = strict and bool(WHEN.search(query))
-        lines = []
-        for line in (line.strip() for line in doc.text.splitlines()):
-            if lines and line and not lines[-1].endswith((".", "!", "?", "…", ":", ";")) and line[0].islower():
-                lines[-1] += " " + line  # a PDF line wrapped mid-sentence
-            elif line:
-                lines.append(line)
-        body = [line for line in lines if not looks_like_heading(line)]
-        if strict and len(body) > 1 and FOR_EVERYONE.search(body[0]):
-            lines.remove(body[0])  # "Хто знає різницю, той повертається додому…" is no advice on "коли повертатися"
         # A sentence counts with its heading and with the question it answers: "Чим? Сухим дубовим листям.",
-        # "Де шукати білі гриби?" over "Білі гриби тримаються старих дубів."; the title line is no heading.
-        scored, heading, asked = [], "", ""
-        for line in lines:
-            if looks_like_heading(line):
-                heading, asked = ("" if norm_title(line) == doc.norm_title else line), ""
-                continue
-            for sentence in re.split(r"(?<=[.!?…])\s+", line):
-                if sentence.endswith("?"):
-                    asked = sentence
-                    continue
-                quote = f"{asked} {sentence}".strip()
-                said = set(tokens(f"{heading} {quote}"))
-                shared = sum(1 for word in own if word & said) + bool(when and WHEN.search(f"{heading} {quote}"))
-                if shared >= least:
-                    scored.append((len(topic & said), len(scored), quote))
-                asked = ""
+        # "Де шукати білі гриби?" over "Білі гриби тримаються старих дубів.".
+        scored = []
+        for heading, asked, sentence in answered_sentences(doc, skip_intro=strict):
+            quote = f"{asked} {sentence}".strip()
+            said = set(tokens(f"{heading} {quote}"))
+            shared = sum(1 for word in own if word & said) + bool(when and WHEN.search(f"{heading} {quote}"))
+            if shared >= least:
+                scored.append((len(topic & said), len(scored), quote))
         chosen, used = [], 0
         for score, i, quote in sorted(scored, key=lambda item: (-item[0], item[1])):
             if score and used + len(quote) <= QUOTE_CHARS:
                 chosen.append((i, quote))
                 used += len(quote) + 1
         return " ".join(quote for _, quote in sorted(chosen))
+
+    def _asked_points(self, doc: Document, question: str) -> list[str]:
+        """What the document itself gives as the answer to the very question asked, where it asks that question: for
+        "Де шукати гриби біля верби?" the deciduous guide's "Де шукати білі гриби? Білі гриби тримаються старих дубів."
+        and "А де підберезники? Підберезники ростуть на галявинах біля беріз.", the sentence after each. Its question
+        asks with the same question word (question_word) and has a word of the topic ("шукати" and "йти" do not count,
+        synonyms do, but one kind of mushroom stands only for itself: KINDS), so "Коли йти по гриби?" is no answer to
+        "де", and the opening paragraph, which no question asks, is none either. A question naming a place other than
+        the document's own, or under a heading that does, is that place's."""
+        query = self.forest.strip_places(question)
+        word = question_word(query)
+        topic = set()
+        for part in QUESTION_WORDS.sub(" ", query).split():
+            terms = set(tokens(part))
+            if not terms & SEARCH_STEMS:
+                topic |= terms if terms & KINDS else expand(terms)
+        own = {doc.scope.value} - {None}
+        points = []
+        for heading, asked, sentence in answered_sentences(doc):
+            if not (word and question_word(asked) == word and topic & set(tokens(asked))):
+                continue
+            named = f"{heading} {asked}"
+            if set(self.forest.detect_mittens(named) + self.forest.detect_parts(named)) <= own:
+                points.append(sentence)
+        return points
 
     def _missing_parts(self, mittens: list[str], docs: list[Document], sources: list[Document], answer: str,
                        question: str) -> list[Document]:
