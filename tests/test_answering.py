@@ -2525,3 +2525,38 @@ def test_a_sentence_going_on_joins_the_one_before_only_while_the_quote_fits(stor
                                                                      f"{key}\n{on}\nДобрих знахідок!"))
     quote = Answerer(store, forest, FakeLLM(), TZ)._topic_sentences(doc, "Де шукати опеньки біля верби?")
     assert key in quote
+
+
+@pytest.mark.parametrize("second, shown", [
+    ({"found": True, "answer": MISHKA_WILLOW, "sources": [1, 2, 3]}, MISHKA_WILLOW),
+    ({"found": False}, texts.NOT_FOUND),  # asked once more, it still finds nothing: the honest "not found"
+])
+async def test_nothing_found_with_guides_on_the_topic_is_asked_once_more(store, forest, second, shown):
+    # Live on 3 November gpt-oss-20b, answering while the strong model rested, found nothing for Mishka's "Де шукати
+    # гриби біля верби?" though all three guides were in its prompt.
+    add_willow_mushrooms(store, forest)
+    llm = FakeLLM({"found": False}, second)
+    reply = await Answerer(store, forest, llm, TZ).ask("Де шукати гриби біля верби?", NOW)
+    assert len(llm.prompts) == 2 and reply.text.startswith(shown)
+    reminder = llm.prompts[1][1][len(llm.prompts[0][1]):]
+    assert 'ти повернув "found": false' in reminder and 'на тему питання "де шукати гриби"' in reminder
+    assert "Опеньки ростуть просто на корінні верби" in reminder and "Білі гриби тримаються старих дубів" in reminder
+
+
+@pytest.mark.parametrize("question", [
+    # Nothing in the documents on the topic.
+    "Чим лікувати застуду в зайченяти біля верби?",
+    # The topic's word only in passing, in a document titled on something else.
+    "Скільки внесок біля річки?",
+])
+async def test_nothing_found_with_no_document_on_the_topic_is_taken(store, forest, question):
+    add_willow_mushrooms(store, forest)
+    add_archive(store, forest, "Небезпеки біля річки", "Ця пам'ятка для мешканців біля річки. Внески тут ні до чого: "
+                                                        "не ходіть по тонкому льоду.")
+    llm = FakeLLM({"found": False}, {"found": True, "answer": "Вигадка.", "sources": [1]}, picks=[{"ids": [1, 2]}])
+    await Answerer(store, forest, llm, TZ).ask(question, NOW)
+    assert len(llm.prompts) == 1
+
+
+def test_the_prompt_asks_to_look_through_every_document_before_finding_nothing():
+    assert 'поверни "found": false, але спершу перевір кожен документ: відповідь буває іншими словами' in ANSWER_SYSTEM
