@@ -1,6 +1,41 @@
+import asyncio
+import json
+import time
 from types import SimpleNamespace
 
-from bot.llm import LLM, parse_json
+import groq
+import httpx
+import pytest
+
+from bot import llm as llm_module
+from bot.config import DEFAULT_GROQ_MODELS
+from bot.llm import LLM, LLMUnavailable, _retry_after, model_options, parse_json
+
+
+def rate_limited(message: str, **headers):
+    response = httpx.Response(429, headers=headers, request=httpx.Request("POST", "https://x"))
+    return groq.RateLimitError(message, response=response, body=None)
+
+
+def too_large(message: str):
+    """Groq answers a request over a per-minute limit with 413, which the SDK raises as a plain APIStatusError."""
+    response = httpx.Response(413, request=httpx.Request("POST", "https://x"))
+    return groq.APIStatusError(f"Error code: 413 - {{'error': {{'message': '{message}'}}}}", response=response,
+                               body=None)
+
+
+def cut_off():
+    """Groq's 400 for a reply that ran out of max_completion_tokens before its JSON was complete."""
+    response = httpx.Response(400, request=httpx.Request("POST", "https://x"))
+    return groq.BadRequestError("json_validate_failed: max completion tokens reached before generating a valid "
+                                "document", response=response, body=None)
+
+
+def fake_client(create):
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+OK = SimpleNamespace(usage=None, choices=[SimpleNamespace(message=SimpleNamespace(content='{"a": 1}'))])
 
 
 def test_json_in_code_block_or_with_words_around():
@@ -14,85 +49,43 @@ async def test_simple_choices_go_to_the_lightest_model_first():
 
     async def create(model, **options):
         used.append((model, options.get("max_completion_tokens")))
-        return SimpleNamespace(usage=None, choices=[SimpleNamespace(message=SimpleNamespace(content='{"ids": []}'))])
+        return OK
 
-    llm.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    llm.client = fake_client(create)
     await llm.json("system", "user", max_tokens=700, fast=True)
     await llm.json("system", "user", max_tokens=1500)
     assert used == [("openai/gpt-oss-20b", 700), ("openai/gpt-oss-120b", 1500)]
 
 
 def test_reply_that_is_not_an_object_is_not_json():
-    import json
-    import pytest
     with pytest.raises(json.JSONDecodeError):
         parse_json('[{"found": true}]')
 
 
 async def test_model_out_of_its_daily_limit_rests():
-    import groq
-    import httpx
-
     llm = LLM("x", ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"])
     used = []
 
     async def create(model, **options):
         used.append(model)
         if model == "openai/gpt-oss-120b":
-            response = httpx.Response(429, headers={"retry-after": "3000"}, request=httpx.Request("POST", "https://x"))
-            raise groq.RateLimitError("tokens per day", response=response, body=None)
-        return SimpleNamespace(usage=None, choices=[SimpleNamespace(message=SimpleNamespace(content='{"a": 1}'))])
+            raise rate_limited("tokens per day", **{"retry-after": "3000"})
+        return OK
 
-    llm.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    llm.client = fake_client(create)
     assert await llm.json("system", "user") == {"a": 1}
     assert await llm.json("system", "user") == {"a": 1}
     assert used == ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "qwen/qwen3.8-27b"]
 
 
 def test_wait_comes_from_retry_after_or_the_token_reset():
-    import groq
-    import httpx
-
-    from bot.llm import _retry_after
-
-    def limited(**headers):
-        response = httpx.Response(429, headers=headers, request=httpx.Request("POST", "https://x"))
-        return groq.RateLimitError("limit", response=response, body=None)
-
-    assert _retry_after(limited(**{"retry-after": "12"})) == 12
-    assert _retry_after(limited(**{"x-ratelimit-reset-tokens": "7.5s"})) == 7.5
-    assert _retry_after(limited(**{"x-ratelimit-reset-tokens": "1m2.5s"})) == 62.5
-    assert _retry_after(limited()) is None
-
-
-def rate_limited(message: str, **headers):
-    import groq
-    import httpx
-
-    response = httpx.Response(429, headers=headers, request=httpx.Request("POST", "https://x"))
-    return groq.RateLimitError(message, response=response, body=None)
-
-
-def too_large(message: str):
-    """Groq answers a request over a per-minute limit with 413, which the SDK raises as a plain APIStatusError."""
-    import groq
-    import httpx
-
-    response = httpx.Response(413, request=httpx.Request("POST", "https://x"))
-    return groq.APIStatusError(f"Error code: 413 - {{'error': {{'message': '{message}'}}}}", response=response,
-                               body=None)
-
-
-def fake_client(create):
-    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-
-
-OK = SimpleNamespace(usage=None, choices=[SimpleNamespace(message=SimpleNamespace(content='{"a": 1}'))])
+    assert _retry_after(rate_limited("limit", **{"retry-after": "12"})) == 12
+    assert _retry_after(rate_limited("limit", **{"x-ratelimit-reset-tokens": "7.5s"})) == 7.5
+    assert _retry_after(rate_limited("limit", **{"x-ratelimit-reset-tokens": "1m2.5s"})) == 62.5
+    assert _retry_after(rate_limited("limit")) is None
 
 
 def test_default_models_answer_with_gpt_oss_first_and_pick_with_the_smallest():
-    from bot.config import DEFAULT_GROQ_MODELS
-
     llm = LLM("x", DEFAULT_GROQ_MODELS.split(","))
     assert llm.order(fast=False) == ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
     # The strong model's minute is kept for the answer that comes right after the pick.
@@ -102,8 +95,6 @@ def test_default_models_answer_with_gpt_oss_first_and_pick_with_the_smallest():
 
 
 async def test_configured_models_stay_as_they_are_and_defaults_stand_in_only_for_none_offered():
-    from bot.config import DEFAULT_GROQ_MODELS
-
     offered = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 
     async def models_list():
@@ -123,10 +114,6 @@ async def test_configured_models_stay_as_they_are_and_defaults_stand_in_only_for
 
 async def test_key_groq_does_not_accept_stops_the_bot_at_start():
     # Otherwise every question looked like a busy model, and the bot apologised ten minutes later.
-    import groq
-    import httpx
-    import pytest
-
     request = httpx.Request("GET", "https://api.groq.com/openai/v1/models")
     llm = LLM("gsk_typo", ["openai/gpt-oss-120b"])
 
@@ -161,8 +148,6 @@ async def test_qwen_is_asked_for_no_more_output_than_its_minute_allows():
 
 
 async def test_request_above_the_output_limit_is_asked_again_smaller_without_waiting():
-    import asyncio
-
     llm = LLM("x", ["vendor/model-9b", "openai/gpt-oss-20b"])
     used = []
 
@@ -181,8 +166,6 @@ async def test_request_above_the_output_limit_is_asked_again_smaller_without_wai
 
 
 async def test_prompt_too_large_for_a_model_goes_to_the_next_one_at_once():
-    import asyncio
-
     llm = LLM("x", ["openai/gpt-oss-120b", "openai/gpt-oss-20b"])
     used = []
 
@@ -202,8 +185,6 @@ async def test_prompt_too_large_for_a_model_goes_to_the_next_one_at_once():
 
 
 async def test_prompt_with_its_answer_budget_over_the_minute_is_asked_once_with_a_smaller_budget():
-    import asyncio
-
     llm = LLM("x", ["openai/gpt-oss-120b", "openai/gpt-oss-20b"])
     used = []
 
@@ -226,8 +207,6 @@ async def test_prompt_with_its_answer_budget_over_the_minute_is_asked_once_with_
 
 
 async def test_prompt_over_the_input_limit_or_still_too_large_goes_to_the_next_model():
-    import asyncio
-
     llm = LLM("x", ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"])
     used = []
 
@@ -249,14 +228,6 @@ async def test_prompt_over_the_input_limit_or_still_too_large_goes_to_the_next_m
 
 
 async def test_no_request_starts_with_too_little_time_left_after_the_models_queue(monkeypatch):
-    import asyncio
-    import time
-
-    import pytest
-
-    from bot import llm as llm_module
-    from bot.llm import LLMUnavailable
-
     monkeypatch.setattr(llm_module, "MIN_ATTEMPT", 0.3)
     llm = LLM("x", ["openai/gpt-oss-120b"])
     used = []
@@ -274,9 +245,6 @@ async def test_no_request_starts_with_too_little_time_left_after_the_models_queu
 
 
 async def test_wait_that_does_not_fit_the_deadline_goes_to_the_next_model():
-    import asyncio
-    import time
-
     llm = LLM("x", ["openai/gpt-oss-120b", "openai/gpt-oss-20b"])
     used = []
 
@@ -293,14 +261,6 @@ async def test_wait_that_does_not_fit_the_deadline_goes_to_the_next_model():
 
 
 async def test_no_reply_before_the_deadline_is_unavailable(monkeypatch):
-    import asyncio
-    import time
-
-    import pytest
-
-    from bot import llm as llm_module
-    from bot.llm import LLMUnavailable
-
     monkeypatch.setattr(llm_module, "MIN_ATTEMPT", 0.05)
     llm = LLM("x", ["openai/gpt-oss-120b", "openai/gpt-oss-20b"])
     used = []
@@ -319,15 +279,11 @@ async def test_no_reply_before_the_deadline_is_unavailable(monkeypatch):
 
 def test_qwen_answers_without_thinking():
     # Its hidden thinking used up all 900 output tokens the free tier allows, and no reply was left.
-    from bot.llm import model_options
-
     assert model_options("qwen/qwen3.8-27b", "medium") == {"reasoning_effort": "none", "reasoning_format": "hidden"}
     assert model_options("openai/gpt-oss-120b", "medium") == {"reasoning_effort": "medium"}
 
 
 async def test_with_every_model_busy_the_first_to_free_up_is_waited_for():
-    import time
-
     llm = LLM("x", ["openai/gpt-oss-120b", "openai/gpt-oss-20b"])
     used = []
 
@@ -349,12 +305,6 @@ async def test_with_every_model_busy_the_first_to_free_up_is_waited_for():
 
 
 async def test_simple_choice_does_not_wait_for_the_model_it_never_asks():
-    import time
-
-    import pytest
-
-    from bot.llm import LLMUnavailable
-
     llm = LLM("x", ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"])
     used = []
 
@@ -373,18 +323,13 @@ async def test_simple_choice_does_not_wait_for_the_model_it_never_asks():
 
 
 async def test_reply_cut_off_by_long_thinking_is_asked_again_with_less_thinking():
-    import groq
-    import httpx
-
     llm = LLM("x", ["openai/gpt-oss-20b"])
     efforts = []
 
     async def create(model, **options):
         efforts.append(options["reasoning_effort"])
         if len(efforts) == 1:
-            response = httpx.Response(400, request=httpx.Request("POST", "https://x"))
-            raise groq.BadRequestError("json_validate_failed: max completion tokens reached before generating a valid "
-                                       "document", response=response, body=None)
+            raise cut_off()
         return OK
 
     llm.client = fake_client(create)
@@ -393,18 +338,13 @@ async def test_reply_cut_off_by_long_thinking_is_asked_again_with_less_thinking(
 
 
 async def test_reply_cut_off_on_qwen_is_asked_again_as_plain_text_not_the_same_way():
-    import groq
-    import httpx
-
     llm = LLM("x", ["qwen/qwen3.8-27b"])
     sent = []
 
     async def create(model, **options):
         sent.append(options)
         if len(sent) == 1:
-            response = httpx.Response(400, request=httpx.Request("POST", "https://x"))
-            raise groq.BadRequestError("json_validate_failed: max completion tokens reached before generating a valid "
-                                       "document", response=response, body=None)
+            raise cut_off()
         return OK
 
     llm.client = fake_client(create)

@@ -125,7 +125,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 bot/  __main__ (запуск), handlers (діалоги, відповіді пізніше), answering (відповідь, календар),
       places (місця), search (BM25), classify (місце документа), archive (Google Диск),
       extract (PDF/DOCX/TXT, OCR), storage (SQLite), fsm (стан діалогів), llm (Groq),
-      ask, check, invite (команди з термінала), texts, assets (аватарка)
+      config (змінні оточення), ask, check, invite (команди з термінала), texts, assets (аватарка)
 tests/
 docs/ розмова, як це працює, приклади документів
 ```

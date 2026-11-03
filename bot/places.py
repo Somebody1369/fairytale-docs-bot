@@ -84,7 +84,7 @@ def mitten_pattern(name: str) -> str:
 
 @dataclass(frozen=True)
 class Scope:
-    kind: str  # "mitten" | "part" | "forest"
+    kind: str  # "mitten" | "part" | "forest"; in classify also "split" (several mittens' advice) and "ask"
     value: str | None = None
 
     @property
@@ -136,11 +136,7 @@ class Forest:
 
     def detect_mittens(self, text: str) -> list[str]:
         low = normalize(text)
-        found = []
-        for name in self.mittens:
-            if re.search(mitten_pattern(name), low):
-                found.append(name)
-        return found
+        return [name for name in self.mittens if re.search(mitten_pattern(name), low)]
 
     def strip_places(self, text: str) -> str:
         """The question without place words, so search looks for the topic, not the address."""
@@ -245,7 +241,7 @@ def name_pattern(name: str) -> str:
         return rf"\b(?:{IRREGULAR_FORMS[low]})\b"
     if low.endswith("а"):  # Сова, Білочка: сови, сові, сову, совою; Білочці
         stem = low[:-1]
-        alternation = rf"|{stem[:-1]}ц(?:і)" if stem.endswith("к") else ""
+        alternation = rf"|{stem[:-1]}ці" if stem.endswith("к") else ""
         return rf"\b(?:{stem}(?:а|и|і|у|ою|о){alternation})\b"
     if low.endswith("я"):  # Синиця: синиці, синицю, синицею
         return rf"\b{low[:-1]}(?:я|і|ю|ею|е)\b"

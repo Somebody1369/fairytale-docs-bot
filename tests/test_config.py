@@ -24,3 +24,18 @@ def test_archive_sync_needs_at_least_a_minute(monkeypatch, minutes):
     monkeypatch.setenv("ARCHIVE_SYNC_MINUTES", minutes)
     with pytest.raises(SystemExit, match="ARCHIVE_SYNC_MINUTES"):
         load_settings()
+
+
+def test_bot_is_closed_unless_switched_off(monkeypatch):
+    monkeypatch.delenv("INVITES_ONLY", raising=False)
+    assert load_settings().invites_only
+    monkeypatch.setenv("INVITES_ONLY", "false")
+    assert not load_settings().invites_only
+
+
+def test_empty_settings_from_docker_compose_mean_defaults(monkeypatch):
+    for name in ("GROQ_MODELS", "DRIVE_FOLDER_ID", "GOOGLE_API_KEY", "ARCHIVE_SYNC_MINUTES", "TZ_NAME", "INVITES_ONLY"):
+        monkeypatch.setenv(name, "")
+    settings = load_settings()
+    assert settings.sync_minutes == 10 and settings.timezone == "Europe/Kyiv" and settings.invites_only
+    assert settings.google_api_key is None and settings.groq_models[0] == "openai/gpt-oss-120b"

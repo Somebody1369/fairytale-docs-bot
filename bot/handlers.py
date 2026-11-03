@@ -62,7 +62,7 @@ FOLLOW_UP_MINUTES = 30
 # When every Groq model rests after its rate limit for longer than a question may take, the bot does not
 # give up: Telegram lets it answer whenever it likes, so it asks again after each of these pauses (seconds).
 # The tries count too, each up to QUESTION_SECONDS: 7 minutes of pauses and 5 tries keep the answer within
-# the promised "about 10 minutes" even when every try takes all its time.
+# the "about 10 minutes" promised to the customer (docs/dialog.md) even when every try takes all its time.
 LATER_PAUSES = (30, 60, 90, 120, 120)
 LATER_PER_CHAT = 3  # beyond this many waiting questions the animal is asked to try again itself
 # Documents waiting for their sender's name or place keep their whole text in the dialog state, and /cancel
@@ -128,7 +128,7 @@ def follow_up(text: str, last: str | None, forest: Forest) -> str | None:
     if any(word not in STOPWORDS | FILLER_WORDS for word in rest):
         return None  # a new question that names its own place
     topic = re.sub(r"\s+", " ", forest.strip_places(last)).strip(" ?.!,")
-    place = re.sub(r"^(?:а|і|й|ну|а як|а що|а якщо|щодо|стосовно)\s+", "", text.strip().lower()).strip(" ?.!,")
+    place = re.sub(r"^(?:а якщо|а як|а що|а|і|й|ну|щодо|стосовно)\s+", "", text.strip().lower()).strip(" ?.!,")
     return f"{topic} {place}?" if topic else None
 
 
@@ -531,15 +531,16 @@ async def document(message: Message, state: FSMContext, app: App, bot: Bot) -> N
 
     dialog = await state.get_data()
     epoch = dialog.get("epoch", 0)
+    title = title_from_filename(filename)
     if len(dialog.get("queue", [])) >= QUEUE_LIMIT:  # not downloaded and read (a scan takes minutes) to be refused
-        await message.answer(texts.DOC_QUEUE_FULL.format(title=title_from_filename(filename)))
+        await message.answer(texts.DOC_QUEUE_FULL.format(title=title))
         return
     if ext == ".pdf" and (file.file_size or 0) > BIG_PDF_BYTES:
-        await message.answer(texts.DOC_READING.format(title=title_from_filename(filename)))
+        await message.answer(texts.DOC_READING.format(title=title))
     try:
         async with ChatActionSender.typing(bot=bot, chat_id=message.chat.id):
-            data = (await bot.download(file)).read()
-            text = await asyncio.to_thread(extract_text, data, filename, app.settings.ocr_langs, ext)
+            content = (await bot.download(file)).read()
+            text = await asyncio.to_thread(extract_text, content, filename, app.settings.ocr_langs, ext)
     except TooManyScannedPages as error:
         await message.answer(texts.DOC_TOO_MANY_SCANS.format(filename=filename, pages=error.pages, limit=MAX_OCR_PAGES))
         return
@@ -555,7 +556,7 @@ async def document(message: Message, state: FSMContext, app: App, bot: Bot) -> N
         await message.answer(texts.DOC_NO_TEXT.format(filename=filename))
         return
 
-    pending = {"id": uuid.uuid4().hex[:8], "filename": filename, "title": title_from_filename(filename),
+    pending = {"id": uuid.uuid4().hex[:8], "filename": filename, "title": title,
                "text": text, "sent_at": now_utc().isoformat()}
     caption_scope = scope_from_caption(message.caption, app.forest)
     if caption_scope:
@@ -680,25 +681,21 @@ async def remind_document(message: Message, state: FSMContext, app: App) -> None
     """After a question answered in the middle, ask again what the waiting document still needs.
     `message` may be the bot's own (under a button), so the animal is the dialog's user."""
     current, data, user_id = await state.get_state(), await state.get_data(), state.key.user_id
-    if current == Flow.waiting_doc_place.state and data.get("queue"):
-        await state.update_data(asked=data["queue"][0]["id"])
-        await message.answer(texts.DOC_STILL_WAITING.format(title=data["queue"][0]["title"]),
-                             reply_markup=doc_place_keyboard(app.forest, data["queue"][0]))
+    queue = data.get("queue")
+    if queue and current not in DOCUMENT_STATES and not app.locks[user_id].locked():
+        # The queue is stored before the model places the document, so a restart (or an error) meanwhile
+        # leaves it waiting with nothing asked about it: the dialog goes back to waiting for its place, or for
+        # the name first. The lock is held while it is being placed now.
+        current = Flow.waiting_doc_place.state if app.store.user_name(user_id) else Flow.waiting_name.state
+        await state.set_state(current)
+    if current == Flow.waiting_doc_place.state and queue:
+        await state.update_data(asked=queue[0]["id"])
+        await message.answer(texts.DOC_STILL_WAITING.format(title=queue[0]["title"]),
+                             reply_markup=doc_place_keyboard(app.forest, queue[0]))
     elif current == Flow.confirming_name.state and data.get("name"):
         await message.answer(texts.CONFIRM_NAME.format(name=data["name"]), reply_markup=name_keyboard())
     elif current == Flow.waiting_name.state:
-        await message.answer(texts.ASK_NAME_STILL if data.get("queue") else texts.ASK_NEW_NAME)  # or /name
-    elif data.get("queue") and current not in DOCUMENT_STATES and not app.locks[user_id].locked():
-        # The queue is stored before the model places the document, so a restart (or an error) meanwhile
-        # leaves it waiting with nothing asked about it. The lock is held while it is being placed now.
-        if app.store.user_name(user_id):
-            await state.set_state(Flow.waiting_doc_place)
-            await state.update_data(asked=data["queue"][0]["id"])
-            await message.answer(texts.DOC_STILL_WAITING.format(title=data["queue"][0]["title"]),
-                                 reply_markup=doc_place_keyboard(app.forest, data["queue"][0]))
-        else:
-            await state.set_state(Flow.waiting_name)
-            await message.answer(texts.ASK_NAME_STILL)
+        await message.answer(texts.ASK_NAME_STILL if queue else texts.ASK_NEW_NAME)  # or /name
 
 
 async def file_pending(message: Message, state: FSMContext, app: App, user_id: int, queue: list[dict],
@@ -864,11 +861,11 @@ async def question(message: Message, state: FSMContext, app: App, bot: Bot) -> N
     data = await state.get_data()
     pending = data.get("question")
     waiting = await state.get_state() == Flow.waiting_question_place.state
+    asked_at, last_at = data.get("question_at"), data.get("last_at")
+    is_recent = lambda at: (now_utc() - datetime.fromisoformat(at)).total_seconds() < FOLLOW_UP_MINUTES * 60
     # A question still waiting for its mitten after a document came in between, with nothing answered since:
     # a bare place typed now ("у соснах") answers it.
-    asked_at = data.get("question_at")
-    fresh = pending and asked_at and asked_at > (data.get("last_at") or "") and \
-        (now_utc() - datetime.fromisoformat(asked_at)).total_seconds() < FOLLOW_UP_MINUTES * 60
+    fresh = pending and asked_at and asked_at > (last_at or "") and is_recent(asked_at)
     # "А у соснах?" answers "Про яку рукавичку?" too, since /help teaches the place with a question mark.
     place = typed_place(text.rstrip(" ?!"), app.forest) if pending and (waiting or fresh) else None
     if waiting or place:
@@ -888,8 +885,7 @@ async def question(message: Message, state: FSMContext, app: App, bot: Bot) -> N
             # The animal answered "під дубом" instead of pressing a button.
             text, mitten = pending, place.value
     else:
-        last_at = data.get("last_at")
-        recent = last_at and (now_utc() - datetime.fromisoformat(last_at)).total_seconds() < FOLLOW_UP_MINUTES * 60
+        recent = last_at and is_recent(last_at)
         # "А у соснах?": the question still waiting for its mitten first, else the last one answered.
         again = fresh and follow_up(text, pending, app.forest)
         if again:
@@ -1011,10 +1007,8 @@ async def ask_later(message: Message, state: FSMContext, app: App, question: str
         await remind_document(message, state, app)
     except Exception:
         log.exception("Answering a question of chat %s later failed", message.chat.id)
-        try:
+        with suppress(TelegramAPIError):
             await message.answer(lead + texts.SOMETHING_WRONG)
-        except TelegramAPIError:
-            pass
 
 
 @router.message()
@@ -1031,12 +1025,10 @@ async def unknown_button(callback: CallbackQuery) -> None:
 @router.errors()
 async def unexpected_error(event: ErrorEvent, bot: Bot) -> None:
     """Whatever breaks, the animal hears back instead of waiting in silence."""
-    log.error("Update %s failed", event.update.update_id, exc_info=event.exception)
     update = event.update
+    log.error("Update %s failed", update.update_id, exc_info=event.exception)
     chat = update.message.chat if update.message else \
         update.callback_query.message.chat if update.callback_query and update.callback_query.message else None
     if chat:
-        try:
+        with suppress(TelegramAPIError):
             await bot.send_message(chat.id, texts.SOMETHING_WRONG)
-        except TelegramAPIError:
-            pass

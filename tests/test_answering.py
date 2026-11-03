@@ -11,10 +11,10 @@ import pytest
 from bot import texts
 from bot.answering import (ANSWER_SYSTEM, DOC_CHARS, PICK_SECONDS, PICK_SYSTEM, PICK_TOKENS, PLACE_UNKNOWN_RULE,
                            QUESTION_SECONDS, SPARE_TOKENS, Answerer, by_number, calendar_need, calendar_note, clean_other,
-                           clean_text, clean_wording, prompt_chars, question_word, retold)
+                           clean_text, clean_wording, item_runs, PART_SAID, prompt_chars, question_word, retold)
 from bot.extract import extract_text
 from bot.llm import LLM, LLMUnavailable
-from bot.places import CONIFER, DECIDUOUS, Scope
+from bot.places import CONIFER, DECIDUOUS, RIVER, Scope
 from bot.storage import Store
 
 from .conftest import NOW, FakeLLM, add_animal, add_archive
@@ -613,7 +613,6 @@ async def test_title_pick_lists_all_archive_titles_and_the_newest_animals_that_f
 
 
 def test_prompt_labels_the_level_of_the_advice():
-    from bot.answering import ANSWER_SYSTEM
     # Mishka's reference answers (30 October): the more general advice says it is the whole forest's.
     assert '"Загальна порада для всього лісу — …"' in ANSWER_SYSTEM
     assert '"Окремої поради про … для … немає, тож діє загальна порада для всього лісу: …"' in ANSWER_SYSTEM
@@ -721,7 +720,6 @@ async def test_willow_answer_saying_whose_advice_is_whose_is_taken(store, forest
 
 
 def test_newer_archive_document_wins_among_equals():
-    from bot.answering import ANSWER_SYSTEM
     assert "Серед документів архіву, як і серед документів від звірів, важливіший новіший" in ANSWER_SYSTEM
 
 
@@ -1881,9 +1879,8 @@ class SourceLLM(FakeLLM):
             self.picks = [{"ids": [int(number) for number, line in re.findall(r"^(\d+)\. (.+)$", user, re.M)
                                    if line.endswith("(увесь ліс)")][:4]}]
         elif not self.prompts:
-            titles = re.findall(r'^\[(\d+)\] "(.+)"$', user, re.M)
-            self.answers = [{"found": True, "answer": "Відповідь.",
-                             "sources": [next(int(number) for number, title in titles if self.source in title)]}]
+            source = next(number for title, number in numbered(user).items() if self.source in title)
+            self.answers = [{"found": True, "answer": "Відповідь.", "sources": [source]}]
         return await super().json(system, user, *args, **options)
 
 
@@ -2329,3 +2326,202 @@ async def test_two_words_an_answer_shares_with_a_document_it_does_not_cite_are_n
     assert re.findall(r'^- "(.*?)"', reply.text, re.M) == cited
 
 
+# The archive's anthill food (data/bot.db): one line for each of its three foods.
+ANTHILL_FOOD = ("Чим поживитись поруч із рукавичкою «Біля мурашника»\nОсь що варто знати мешканцям рукавички «Біля "
+                "мурашника» про поживу неподалік від дому. Ліс біля нас багатий, треба тільки знати, куди піти.\nГоробина "
+                "росте на краю вирубки за 60 кроків на схід.\nОпеньки ростуть на трухлявих пнях за мурашником.\nЧорниці "
+                "ростуть на північ від мурашника.\nМурашник для нас — головний орієнтир: і опеньки, і чорниці шукайте, "
+                "рахуючи від нього. А горобина червоніє далі на сході, на краю вирубки.\nХай кожен похід по поживу буде "
+                "вдалим, а в рукавичці завжди вистачає смачного для всіх мешканців. Ліс щедрий до тих, хто приходить до "
+                "нього з повагою.")
+DECIDUOUS_FOOD = ("Що їсти в листяному лісі\nЦя пам'ятка для звірів, що мешкають у листяному лісі. Листяний ліс багатий "
+                  "на поживу.\n– Лісові горіхи в ліщиняках збирайте тоді, коли шкаралупка стала бурою.\n– Ожину на "
+                  "узбіччях ярків можна брати до перших заморозків.\n– Жолуді — основна зимова їжа. Запасайте їх не "
+                  "менше кошика на звіра.\nПро жолуді скажемо окремо. Саме вони тримають листяний ліс узимку.\n"
+                  "Збирайте з розумом, діліться з ближніми.")
+# The archive's scan of the hazel's paths (data/bot.db), OCR debris and all.
+HAZEL_PATHS = ("Стежки до сусідів від рукавички «У ліщині»\nЦя пам'ятка -- для мешканців рукавички «У ліщині», які "
+               "збираються в гості.\nДо дуба -- 300 кроків на захід уздовж ярка.\nЧі - До мурашника -- 350 кроків на "
+               "північ через просіку.\n7- До греблі -- 500 кроків на південь уздовж ярка, аж до річки.\nЯк бачите, "
+               "ярок допомагає знайти дорогу. До мурашника ж ведуть через просіку.\nЩасливої дороги туди й назад!")
+STATUTE = ("Статут ОСМД Під вербою\nЦей статут для мешканців рукавички «Під вербою». Він визначає, хто за що відповідає."
+           "\nГолова ОСМД — Качка.\nСкарбник ОСМД — Жабка.\nЗбори мешканців відбуваються щосуботи ввечері на березі.\n"
+           "Хай у рукавичці буде лад. Шануймо одне одного.")
+DECIDUOUS_WARMING = ("Як утеплити рукавичку в листяному лісі\nЦя порада для тих, чия рукавичка лежить у листяному лісі.\n"
+                     "Коли? Утеплюйте рукавичку тоді, коли облетить листя, але до першого снігу.\nЧим? Сухим дубовим "
+                     "листям.\nЯк? Насипте сухого дубового листя шаром у дві лапи.\nОтже, коротко:\nчекайте, поки "
+                     "облетить листя;\nвстигніть до першого снігу;\nберіть сухе дубове листя;\nнасипайте шаром у дві "
+                     "лапи.\nТоді зимові вечори минатимуть у теплі.")
+
+
+def test_one_line_items_make_a_run_and_a_document_asking_its_own_questions_has_none(store, forest):
+    runs = lambda title, text: item_runs(store.get(add_archive(store, forest, title, text)))
+    assert runs("Чим поживитись поруч із рукавичкою Біля мурашника", ANTHILL_FOOD) == [[
+        "Горобина росте на краю вирубки за 60 кроків на схід.", "Опеньки ростуть на трухлявих пнях за мурашником.",
+        "Чорниці ростуть на північ від мурашника."]]
+    # List points are items, a line drawing a conclusion ends the run ("Тож улітку виглядайте чорниці…").
+    assert runs("Що їсти в хвойному лісі", CONIFER_FOOD) == [["Чорниці достигають у липні на північних схилах.",
+                                                             "Брусниця достигає у вересні."]]
+    # "Коли? … Чим? …": the document says itself which point answers which question.
+    assert runs("Як утеплити рукавичку в листяному лісі", DECIDUOUS_WARMING) == []
+    # A list point may have two sentences, and OCR debris before its marker goes ("7- До греблі").
+    assert runs("Що їсти в листяному лісі", DECIDUOUS_FOOD)[0][2] == ("Жолуді — основна зимова їжа. Запасайте їх не "
+                                                                     "менше кошика на звіра.")
+    assert runs("Стежки до сусідів від рукавички У ліщині", HAZEL_PATHS) == [[
+        "До дуба -- 300 кроків на захід уздовж ярка.", "Чі - До мурашника -- 350 кроків на північ через просіку.",
+        "До греблі -- 500 кроків на південь уздовж ярка, аж до річки."]]
+    # A conclusion inside the text ends the run, as the text's first and last lines are none of it.
+    assert runs("Ягоди хвойного лісу", "Ягоди хвойного лісу\nПорада для мешканців хвойного лісу.\n- Чорниці у липні.\n- "
+                "Брусниця у вересні.\nТож улітку виглядайте чорниці.\nЖуравлина на болоті.\nСмачного всім!") == [
+        ["Чорниці у липні.", "Брусниця у вересні."]]
+
+
+@pytest.mark.parametrize("question, asked_again", [
+    # Live on 2 November: "опеньки" and "чорниці" told, the rowan "за 60 кроків на схід" left out.
+    ("Де знайти їжу біля мурашника?", True),
+    # A question naming an item asks nothing of the others, but "росте", which every item has, names none.
+    ("Де ростуть чорниці біля мурашника?", False),
+    ("Що смачного росте біля мурашника?", True),
+])
+async def test_a_documents_one_line_items_told_in_part_are_told_whole(store, forest, question, asked_again):
+    add_archive(store, forest, "Чим поживитись поруч із рукавичкою Біля мурашника", ANTHILL_FOOD)
+    answer = "Опеньки шукайте на трухлявих пнях біля мурашника, а чорниці – на північ від нього."
+    llm = FakeLLM({"found": True, "answer": answer, "sources": [1]})
+    await Answerer(store, forest, llm, TZ).ask(question, NOW)
+    assert (len(llm.prompts) == 2) == asked_again
+    if asked_again:
+        reminder = llm.prompts[1][1][len(llm.prompts[0][1]):]
+        assert '"Горобина росте на краю вирубки за 60 кроків на схід."' in reminder
+
+
+async def test_one_item_told_asks_nothing_of_the_rest(store, forest):
+    # "Що їсти в хвойному лісі восени?" may be about the cowberry alone: one item of two is no list told in part.
+    add_archive(store, forest, "Ягоди хвойного лісу", "Ягоди хвойного лісу\nПорада для мешканців хвойного лісу.\n"
+                "- Чорниці достигають у липні.\n- Брусниця достигає у вересні.\nСмачного всім!")
+    llm = FakeLLM({"found": True, "answer": "У хвойному лісі брусниця достигає у вересні.", "sources": [1]})
+    await Answerer(store, forest, llm, TZ).ask("Що їсти в хвойному лісі восени?", NOW)
+    assert len(llm.prompts) == 1
+
+
+async def test_a_willow_answer_naming_no_forest_part_is_asked_again_with_each_parts_points(store, forest):
+    # Live on 3 November: both parts' guides, neither part named, and the river's "на старих вербах і пеньках біля
+    # води" left out. The reminder quotes it, as it goes on from "Біля річки шукайте опеньки" with "Вони".
+    add_willow_mushrooms(store, forest)
+    answer = ("Опеньки шукайте на корені верби біля рукавички «Під вербою»; вони з’являються вже наступного дня після "
+              "дощу, уникайте грибів з затоплених берегів. Білі гриби тримаються старих дубів, а підберезники – на "
+              "галявинах біля беріз.")
+    cited = ["Чим поживитись поруч із рукавичкою Під вербою", "Грибний путівник біля річки",
+             "Грибний путівник листяного лісу"]
+    llm = CitingLLM(answer, cited)
+    await Answerer(store, forest, llm, TZ).ask("Де шукати гриби біля верби?", NOW)
+    assert len(llm.prompts) == 2
+    reminder = llm.prompts[1][1][len(llm.prompts[0][1]):]
+    assert 'не сказано, що порада з документа' in reminder and '"біля річки"' in reminder and '"листяний ліс"' in reminder
+    assert "Біля річки шукайте опеньки. Вони ростуть на старих вербах і пеньках біля води." in reminder
+    # Each part named: no reminder (Mishka's own answer, test_reference_answers_are_taken_as_they_are, too).
+    named = answer.replace("Опеньки шукайте на корені", "Біля самої рукавички опеньки на корені").replace(
+        "; вони", ". Біля річки опеньки").replace("Білі гриби", "У листяному лісі білі гриби")
+    llm = CitingLLM(named, cited)
+    await Answerer(store, forest, llm, TZ).ask("Де шукати гриби біля верби?", NOW)
+    assert len(llm.prompts) == 1
+
+
+async def test_an_answer_with_no_full_stop_gets_one_and_the_prompt_asks_what_not_to_do(store, forest):
+    # Live on 3 November the owl's answer ended with no full stop; Mishka's hunters answer has "не біжи на відкрите".
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді з дорослого звіра на місяць.")
+    llm = FakeLLM({"found": True, "answer": "Внесок 4 жолуді з дорослого звіра на місяць", "sources": [1]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert reply.text.startswith("Внесок 4 жолуді з дорослого звіра на місяць.\n\nДжерело:")
+    assert "хто звільнений, чого не робити." in ANSWER_SYSTEM
+
+
+@pytest.mark.parametrize("title, text, question, answer, asked_again", [
+    # Found in review: a statute's lines are no list of its leaders; only a document on the topic has one.
+    ("Статут ОСМД Під вербою", STATUTE, "Хто керує рукавичкою під вербою?",
+     "Рукавичкою Під вербою керує Качка — вона голова ОСМД, а скарбник — Жабка.", False),
+    # OCR debris "7-" made the told dam look untold.
+    ("Стежки до сусідів від рукавички У ліщині", HAZEL_PATHS, "Як дійти до сусідів від ліщини?",
+     "Від рукавички У ліщині до дуба — 300 кроків на захід уздовж ярка, до мурашника — 350 кроків на північ через "
+     "просіку, а до греблі — 500 кроків на південь уздовж ярка, аж до річки.", False),
+    # A list point of two sentences: the acorns left out are asked for, told by one sentence they are told.
+    ("Що їсти в листяному лісі", DECIDUOUS_FOOD, "Що їсти в листяному лісі?",
+     "У листяному лісі лісові горіхи збирайте, коли шкаралупка стала бурою, а ожину можна брати до перших заморозків.",
+     True),
+    ("Що їсти в листяному лісі", DECIDUOUS_FOOD, "Що їсти в листяному лісі?",
+     "У листяному лісі лісові горіхи збирайте, коли шкаралупка стала бурою, ожину можна брати до перших заморозків, а "
+     "жолудів запасайте не менше кошика на звіра.", False),
+])
+async def test_only_a_list_on_the_topic_told_in_part_is_asked_for(store, forest, title, text, question, answer,
+                                                                  asked_again):
+    add_archive(store, forest, title, text)
+    llm = FakeLLM({"found": True, "answer": answer, "sources": [1]}, picks=[{"ids": [1]}])
+    await Answerer(store, forest, llm, TZ).ask(question, NOW)
+    assert len(llm.prompts) == 1 + asked_again
+
+
+async def test_a_second_try_dropping_list_items_the_first_told_is_not_taken(store, forest):
+    # Found in review: asked for the rowan, a weaker second try kept the honey mushrooms alone; held to the points either
+    # answer was, it is worse than the first, which keeps the blueberries.
+    add_archive(store, forest, "Чим поживитись поруч із рукавичкою Біля мурашника", ANTHILL_FOOD)
+    first = "Опеньки шукайте на трухлявих пнях біля мурашника, а чорниці – на північ від нього."
+    llm = FakeLLM({"found": True, "answer": first, "sources": [1]},
+                  {"found": True, "answer": "Опеньки шукайте на трухлявих пнях за мурашником.", "sources": [1]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Де знайти їжу біля мурашника?", NOW)
+    assert len(llm.prompts) == 2 and reply.text.startswith(first + "\n\n")
+
+
+class TwoAnswersLLM(CitingLLM):
+    """Answers `first`, then `second`, each citing the documents titled `cited` by their numbers in the prompt."""
+
+    def __init__(self, first: str, second: str, cited: list[str]):
+        super().__init__(first, cited)
+        self.second = second
+
+    async def json(self, system, user, *args, **options):
+        if system != PICK_SYSTEM and self.prompts:
+            self.answer = self.second
+        return await super().json(system, user, *args, **options)
+
+
+async def test_naming_the_parts_is_no_reason_to_lose_a_point(store, forest):
+    # Found in review: a second try that names both parts but drops the birch boletes is no better than a first that
+    # named none; one that names them and keeps every point is taken. "Прибережжя" names the river too.
+    add_willow_mushrooms(store, forest)
+    cited = ["Чим поживитись поруч із рукавичкою Під вербою", "Грибний путівник біля річки",
+             "Грибний путівник листяного лісу"]
+    first = ("Опеньки шукайте на корінні верби, а біля води — на старих вербах і пеньках, наступного дня після дощу. "
+             "Білі гриби тримаються старих дубів, а підберезники ростуть на галявинах біля беріз.")
+    named = ("Біля самої рукавички опеньки ростуть на корінні верби. На прибережжі опеньки — на старих вербах і пеньках "
+             "біля води, наступного дня після дощу. У листяному лісі білі гриби тримаються старих дубів.")
+    for second, kept in [(named, first), (named + " Підберезники ростуть на галявинах біля беріз.", None)]:
+        llm = TwoAnswersLLM(first, second, cited)
+        reply = await Answerer(store, forest, llm, TZ).ask("Де шукати гриби біля верби?", NOW)
+        assert len(llm.prompts) == 2
+        assert reply.text.startswith((kept or second) + "\n\n")
+    # The river part as the dangers' own words name it: "кожен мешканець прибережжя".
+    for words in ("На прибережжі не стійте на льоду.", "Біля ріки не стійте на льоду.", "У річковій частині лісу …"):
+        assert PART_SAID[RIVER].search(words), words
+
+
+@pytest.mark.parametrize("written, shown", [
+    ("Внесок 4 жолуді з дорослого звіра на місяць;", "Внесок 4 жолуді з дорослого звіра на місяць."),
+    ("Внесок віддають у рукавичці «Під дубом»", "Внесок віддають у рукавичці «Під дубом»."),
+    ("Внесок — 4 жолуді (з дорослого звіра)", "Внесок — 4 жолуді (з дорослого звіра)."),
+    ("Внесок — 4 жолуді («щомісяця».)", "Внесок — 4 жолуді («щомісяця».)"),
+])
+async def test_the_full_stop_goes_after_a_closing_quote_and_in_place_of_a_trailing_mark(store, forest, written, shown):
+    add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді з дорослого звіра на місяць.")
+    llm = FakeLLM({"found": True, "answer": written, "sources": [1]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Скільки внесок під дубом?", NOW)
+    assert reply.text.startswith(shown + "\n\nДжерело:")
+
+
+def test_a_sentence_going_on_joins_the_one_before_only_while_the_quote_fits(store, forest):
+    # Found in review: joined past QUOTE_CHARS, the key sentence dropped out of the quote whole.
+    key = ("Найбільше опеньків я бачив на старих вербах нижче бобрової греблі, на трухлявих вільхових пнях уздовж берега "
+           "і на поваленому дубі біля броду, де вода не стоїть, а земля лишається сухою навіть після дощу.")
+    on = "Вони там ростуть щільними родинами, тож одного ранку вистачить, щоб набрати повний кошик на всю рукавичку."
+    doc = store.get(add_archive(store, forest, "Опеньки біля річки", f"Опеньки біля річки\nДля тих, хто живе біля річки.\n"
+                                                                     f"{key}\n{on}\nДобрих знахідок!"))
+    quote = Answerer(store, forest, FakeLLM(), TZ)._topic_sentences(doc, "Де шукати опеньки біля верби?")
+    assert key in quote

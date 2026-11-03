@@ -27,7 +27,7 @@ CHUNK_CHARS = 700
 
 
 # Words every document shares; they say nothing about what a document is about.
-COMMON_STEMS = ("рукави", "лісу", "лісі", "лісом", "ліс", "мешкан", "звір", "порад")
+COMMON_STEMS = ("рукави", "ліс", "мешкан", "звір", "порад")
 
 RELATIVE_CUTOFF = 0.35
 
@@ -52,7 +52,7 @@ def stems(word: str) -> list[str]:
     while words that share the longer prefix count twice."""
     if len(word) <= 4:
         return [word]
-    return [word[:4], word[:6]] if len(word) > 6 else [word[:4], word]
+    return [word[:4], word[:6]]
 
 
 def tokens(text: str) -> list[str]:

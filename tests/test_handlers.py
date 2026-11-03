@@ -21,7 +21,7 @@ from bot.fsm import SQLiteStorage
 from bot import handlers, texts
 from bot.handlers import App, Flow, clean_name, router
 from bot.llm import LLMUnavailable
-from bot.places import FOREST_SCOPE
+from bot.places import FOREST_SCOPE, Forest
 
 from .conftest import FOREST_MAP_TEXT, FakeLLM, add_archive
 
@@ -263,8 +263,8 @@ def test_name_is_cleaned():
     assert clean_name("  зайчик-побігайчик ") == "Зайчик-побігайчик"
 
 
-async def test_waiting_document_survives_restart(setup, store, forest):
-    dispatcher, bot, telegram, llm, _ = setup
+async def test_waiting_document_survives_restart(setup):
+    dispatcher, bot, telegram, _, store = setup
     telegram.file_bytes = "Збирайте гриби після дощу.".encode()
     await dispatcher.feed_update(bot, message(document=Document(
         file_id="f4", file_unique_id="u4", file_name="Гриби.txt", file_size=30)))
@@ -450,6 +450,12 @@ async def test_short_follow_up_asks_the_same_question_for_another_place(setup):
     prompt = llm.prompts[-1][1]
     assert "Питання звіра: скільки внесок у соснах?" in prompt
     assert "Членські внески рукавички У соснах" in prompt
+
+
+@pytest.mark.parametrize("text", ["А під ялиною?", "А як під ялиною?", "А якщо під ялиною?", "А що під ялиною?"])
+def test_follow_up_drops_its_lead_in_words(text):
+    # "А як" and "А якщо" were never cut whole, "а" matching first: "що їсти як під ялиною?".
+    assert handlers.follow_up(text, "Що їсти під вербою?", Forest()) == "що їсти під ялиною?"
 
 
 async def test_plain_text_file_of_another_kind_is_accepted(setup):

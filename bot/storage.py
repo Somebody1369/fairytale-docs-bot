@@ -273,16 +273,21 @@ class Store:
         return self.get(doc_id), replaced
 
     def delete_animal_document(self, doc_id: int, author_id: int) -> Document | None:
-        doc = self.get(doc_id)
-        if not doc or doc.source != "animal" or doc.author_id != author_id or doc.status != "active":
+        doc = self._own_active_document(doc_id, author_id)
+        if not doc:
             return None
         self.db.execute("UPDATE documents SET status = 'deleted' WHERE id = ?", (doc_id,))
         self._changed()
         return doc
 
-    def change_scope(self, doc_id: int, author_id: int, scope: Scope) -> Document | None:
+    def _own_active_document(self, doc_id: int, author_id: int) -> Document | None:
+        """The animal's own document while answers use it: the only kind it may delete or move."""
         doc = self.get(doc_id)
-        if not doc or doc.source != "animal" or doc.author_id != author_id or doc.status != "active":
+        return doc if doc and doc.source == "animal" and doc.author_id == author_id and doc.status == "active" else None
+
+    def change_scope(self, doc_id: int, author_id: int, scope: Scope) -> Document | None:
+        doc = self._own_active_document(doc_id, author_id)
+        if not doc:
             return None
         # The animal's own document with this title already written for the new place is an older version.
         self.db.execute(

@@ -1,16 +1,15 @@
 import ctypes
 import io
 import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
 
 import aiohttp
-import pytest
-from datetime import datetime, timezone
-
 import docx
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pytesseract
-from pathlib import Path
+import pytest
 from PIL import Image
 
 from bot import archive as archive_module
@@ -20,9 +19,7 @@ from bot.classify import SPLIT, classify_document, scope_from_caption
 from bot.extract import _clean_ocr, extract_text, old_word_supported, title_from_filename
 from bot.places import CONIFER, DECIDUOUS, FOREST_SCOPE, Forest, Scope
 
-from .conftest import FOREST_MAP_TEXT, FakeLLM
-
-NOW = datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)
+from .conftest import FOREST_MAP_TEXT, NOW, FakeLLM
 
 FOLDER_PAGE = """
 <div class="flip-entry" id="entry-abc123" tabindex="0" role="link"><div class="flip-entry-info">

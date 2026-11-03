@@ -36,6 +36,7 @@ def load_settings() -> Settings:
     sync_minutes = int(env("ARCHIVE_SYNC_MINUTES", "10"))
     if sync_minutes < 1:  # with 0 the archive sync would list Google Drive back to back, without a pause
         raise SystemExit("ARCHIVE_SYNC_MINUTES must be 1 or more.")
+    flag = lambda name: env(name, "true").lower() not in ("0", "false", "no", "ні")  # on unless switched off
     return Settings(
         telegram_token=os.environ["TELEGRAM_BOT_TOKEN"],
         groq_api_key=os.environ["GROQ_API_KEY"],
@@ -47,6 +48,6 @@ def load_settings() -> Settings:
         timezone=env("TZ_NAME", "Europe/Kyiv"),
         max_file_mb=int(env("MAX_FILE_MB", "20")),
         ocr_langs=env("OCR_LANGS", "ukr"),
-        invites_only=env("INVITES_ONLY", "true").lower() not in ("0", "false", "no", "ні"),
-        set_profile=env("SET_BOT_PROFILE", "true").lower() not in ("0", "false", "no", "ні"),
+        invites_only=flag("INVITES_ONLY"),
+        set_profile=flag("SET_BOT_PROFILE"),
     )

@@ -142,27 +142,6 @@ def test_operators_invite_never_expires_but_a_members_does(store):
     assert not store.use_invite(store.create_invite(2, NOW), 4, NOW)           # the inviter must still be a member
 
 
-def test_bot_is_closed_unless_switched_off(monkeypatch):
-    from bot.config import load_settings
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1:x")
-    monkeypatch.setenv("GROQ_API_KEY", "x")
-    monkeypatch.delenv("INVITES_ONLY", raising=False)
-    assert load_settings().invites_only
-    monkeypatch.setenv("INVITES_ONLY", "false")
-    assert not load_settings().invites_only
-
-
-def test_empty_settings_from_docker_compose_mean_defaults(monkeypatch):
-    from bot.config import load_settings
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "1:x")
-    monkeypatch.setenv("GROQ_API_KEY", "x")
-    for name in ("GROQ_MODELS", "DRIVE_FOLDER_ID", "GOOGLE_API_KEY", "ARCHIVE_SYNC_MINUTES", "TZ_NAME", "INVITES_ONLY"):
-        monkeypatch.setenv(name, "")
-    settings = load_settings()
-    assert settings.sync_minutes == 10 and settings.timezone == "Europe/Kyiv" and settings.invites_only
-    assert settings.google_api_key is None and settings.groq_models[0] == "openai/gpt-oss-120b"
-
-
 def test_moving_a_document_to_a_place_with_its_older_version_replaces_it(store):
     old, _ = add_animal(store, "Гриби", "старий текст", Scope("part", CONIFER), when=NOW - timedelta(days=2))
     new, _ = add_animal(store, "Гриби", "новий текст", Scope("mitten", "Під ялиною"))
