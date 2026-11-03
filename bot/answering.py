@@ -85,16 +85,16 @@ MONTHS_NOMINATIVE = ["січень", "лютий", "березень", "квіт
 MONTHS = ["січня", "лютого", "березня", "квітня", "травня", "червня", "липня", "серпня", "вересня", "жовтня",
           "листопада", "грудня"]
 
-ANSWER_SYSTEM = """Ти бот-помічник звірів лісу. Ти відповідаєш на питання лише на основі наданих документів із порадами.
+ANSWER_SYSTEM = """Ти бот-помічник звірів лісу й відповідаєш на питання лише за наданими документами з порадами.
 
 Правила:
-1. Бери інформацію тільки з наданих документів. Нічого не вигадуй і не додавай від себе: жодних дат, умов чи уточнень, яких немає в тексті документів.
+1. Бери інформацію тільки з наданих документів. Нічого не вигадуй і не додавай від себе: жодних дат, умов, уточнень чи зв'язків між фактами, яких немає в тексті документів.
 2. Якщо в документах немає відповіді на питання, поверни "found": false.
-3. Конкретніша порада важливіша за загальну: рівень "рукавичка" важливіший за "частина лісу", а "частина лісу" важливіша за "увесь ліс". Рівень документа написано в рядку "Рівень", і місця, названі в тексті документа, його не змінюють. Якщо в документі для рукавички є хоч щось на тему питання, починай відповідь із нього. Якщо поради суперечать, у "answer" пиши лише конкретнішу, а із загальнішої тільки те, що їй не суперечить. Загальнішу пораду, що радить інакше, не змішуй із відповіддю: коротко перекажи її в полі "other", скажи там, для кого вона і що тут діє конкретніша, і додай її документ у "sources" (наприклад: "Загальна пам'ятка для всього лісу радить збиратися біля бобрової греблі, але для рукавички Під дубом діє конкретніша порада.").
+3. Конкретніша порада важливіша за загальну: рівень "рукавичка" важливіший за "частина лісу", а "частина лісу" важливіша за "увесь ліс". Рівень документа стоїть у рядку "Рівень"; місця, названі в тексті, його не змінюють. Якщо в документі для рукавички є хоч щось на тему питання, починай відповідь із нього. Якщо поради суперечать, у "answer" пиши лише конкретнішу, а із загальнішої тільки те, що їй не суперечить. Загальнішу пораду, що радить інакше, не змішуй із відповіддю: коротко перекажи її в полі "other", скажи там, для кого вона і що тут діє конкретніша, і додай її документ у "sources" (наприклад: "Загальна пам'ятка для всього лісу радить збиратися біля бобрової греблі, але для рукавички Під дубом діє конкретніша порада.").
 4. Якщо поради однаково конкретні й написані для того самого місця: документ із Лісового архіву важливіший за документ від звіра. Серед документів архіву, як і серед документів від звірів, важливіший новіший (дата й час у рядку "Звідки"; якщо вони однакові, новіший той, що стоїть у переліку вище). Пораду, що поступилася й радить інакше, коротко перекажи в полі "other", як у правилі 3, і додай її документ у "sources".
 5. Якщо питання про час, пору року, день тижня чи "чи вже можна", враховуй сьогоднішню дату. Дні тижня й дати бери лише з наданого календаря (там уже пораховано, наприклад, яка дата перша субота місяця), не обчислюй їх сам. Порівнюй дату події із сьогоднішньою: якщо вона раніше за сьогодні, пиши в минулому часі, що подія вже була, і не вигадуй дату наступної, якщо її немає в документах чи календарі. Про щорічну подію за правилом ("у першу суботу жовтня", "у вересні"), чия дата цього року вже минула, пиши, що цього року вона вже була (з датою з календаря, якщо вона там є), а наступна буде за тим самим правилом наступного року. Про минулу подію ніколи не пиши в майбутньому часі.
 6. Пиши грамотною українською, ввічливо, просто, доброзичливо й по суті, без казковості та без звертань на кшталт "любий звіре". Якщо звертаєшся до звіра, то на "Ви" (з великої літери): "Вам", "здайте", "біжіть", "якщо почуєте". Відповідь коротка (1-5 речень), але переказуй усі пункти документа, що стосуються питання, нічого з них не пропускай: скільки, коли, кому й куди віддавати чи приносити, чим можна замінити, хто звільнений.
-7. Якщо рукавичка належить до кількох частин лісу (як "Під вербою": і листяний ліс, і біля річки), їй підходять поради кожної з цих частин: наведи в "answer" поради всіх її частин лісу, що стосуються питання, навіть якщо вони не суперечать одна одній, і скажи, до якої частини лісу належить кожна. Поради різних частин лісу однієї рукавички одна одній не поступаються, тож жодна з них не йде в "other". Порада самої рукавички, як і завжди, іде першою.
+7. Якщо рукавичка належить до кількох частин лісу (як "Під вербою": і листяний ліс, і біля річки), їй підходять поради кожної з них: наведи в "answer" поради всіх її частин лісу, що стосуються питання, навіть якщо вони не суперечать одна одній, і скажи, до якої частини лісу належить кожна. Поради різних частин лісу однієї рукавички одна одній не поступаються, тож жодна з них не йде в "other". Порада самої рукавички, як і завжди, іде першою.
 8. Не згадуй в "answer" та "other" номери й назви документів: джерела бот додасть сам.
 9. Якщо в документі є окремі розділи для різних місць, бери розділ для місця з питання. Але рівень розділу той самий, що й у всього документа (рядок "Рівень"): розділ "Під дубом" у путівнику для всього лісу є порадою рівня "увесь ліс", тож документ для рукавички Під дубом або для її частини лісу важливіший за нього.
 10. Місце в питанні ("під дубом", "біля сосон", "біля верби") означає рукавичку з рядка "Місце з питання", а не саме дерево: відповідай усіма порадами, що підходять цій рукавичці, навіть якщо в них це дерево не згадано, а названо інші дерева чи місця ("білі гриби тримаються старих дубів" теж відповідь на "де шукати гриби біля верби"). Звір не обов'язково там живе: ніколи не пиши "ваш…" перед рукавичкою, частиною лісу, деревом чи домом, а називай місце з рядка "Для кого" документа ("у хвойному лісі", навіть коли питали про «У соснах»).
@@ -282,6 +282,17 @@ def fact_terms(text: str) -> set[str]:
             or (len(word) >= 3 and word not in STOPWORDS and not word.startswith(COMMON_STEMS))}
 
 
+# Months by number, so that "листопаді" does not meet "листя" on the stem "лист".
+MONTH_WORD = re.compile(rf"\b(?:{MONTH_STEMS})\w*", re.I)
+MONTH_KEYS = ["січ", "лют", "бер", "кві", "тра", "чер", "лип", "сер", "вер", "жов", "лис", "гру"]
+MONTH_TERM = re.compile(r"m\d\d")
+
+
+def month_terms(text: str) -> set[str]:
+    """fact_terms with each month as its number: "Рукавички утеплюють у листопаді" -> {"утеп", "m11"}."""
+    return fact_terms(MONTH_WORD.sub(lambda match: f" m{MONTH_KEYS.index(match.group(0)[:3].lower()) + 1:02} ", text))
+
+
 FACT = re.compile(r"\s*[-*•«\"(]*\s*\[\s*(?:№|документ\s*)?(\d+)[^\]]*\]\**\s*(.+)", re.S | re.I)
 
 
@@ -307,6 +318,29 @@ def missing_facts(facts, docs: list[Document], sources: list[Document], text: st
         if (numbers - have or (terms and len(terms & have) * 2 < len(terms))) and sentence.strip() not in left_out:
             left_out.append(sentence.strip())
     return left_out
+
+
+# Calibrated on the 74 live answers of 2-3 November: the owl's answer carries 3 stems of Їжак's note it did not cite,
+# two willow answers 3 and 4 of "Їстівне й отруйне" their whole-forest paragraph retold, the others at most 2 of an
+# uncited document in their prompt ("збир", "знай").
+RETOLD_STEMS = 3
+
+
+def retold(text: str, head: str, docs: list[Document], excerpts: list[str], sources: list[Document]) -> list[Document]:
+    """The prompt's documents the text retells without citing them: RETOLD_STEMS of its numbers and word stems in the
+    document's excerpt and in neither a cited document nor the prompt's `head`, the question, calendar and place every
+    document came with ("поже", "одра", "дупл" of Їжак's note; "5" of "внесок тепер 5 жолудів", unless a date of the
+    calendar). Stems shorter than four letters ("сам", "тож", "том") say nothing of the source."""
+    given = list(zip(docs, excerpts, strict=True))
+    known = fact_terms(head).union(*(fact_terms(excerpt) for doc, excerpt in given if doc in sources))
+    said = {term for term in fact_terms(text) if len(term) == 4 or term.isdigit()}
+    added = []
+    for doc, excerpt in given:
+        own = said & fact_terms(excerpt) - known
+        if doc not in sources and len(own) >= RETOLD_STEMS:
+            added.append(doc)
+            known |= own
+    return added
 
 
 def answered_sentences(doc: Document, skip_intro: bool = False) -> list[tuple[str, str, str]]:
@@ -351,11 +385,13 @@ def question_word(text: str) -> str:
 
 # Document numbers as the model writes them: "[1]", "[2, рукавичка]" and runs of them like "[1], [2]" or "[1] і [2]".
 REFERENCES = r"\[\s*\d+(?:,[^\]]*)?\](?:\s*(?:,|;|і|й|та)\s*\[\s*\d+(?:,[^\]]*)?\])*"
+# Words the model repeated in brackets: "У листопаді (у листопаді) утеплюють" (live on 3 November).
+REPEATED = re.compile(r"\b([\w'’ʼ]+(?:\s+[\w'’ʼ]+){0,3})\s*\(\s*\1\s*\)", re.I)
 
 
 def clean_text(value, documents: int) -> str:
     """The model's text without the document numbers it now and then puts in ("у документі [2]", "[1, рукавичка]")
-    or a bare "(документ)"; other numbers in brackets ("[2026]") stay."""
+    or a bare "(документ)", and without words repeated in brackets; other numbers in brackets ("[2026]") stay."""
     # An object or a number where a text belongs is no text: "{'text': '4 жолуді.'}" must never reach an animal.
     if isinstance(value, list):
         text = " ".join(part for part in value if isinstance(part, str))
@@ -371,7 +407,7 @@ def clean_text(value, documents: int) -> str:
                   rf"(?:\s*{REFERENCES}|\s*\[[^\]]*\]|\s+\d+|\s*«[^»]{{0,80}}»|\s*\"[^\"]{{0,80}}\")?\s*\)", "", text)
     text = re.sub(rf"(?:\s+(?:у\s+|в\s+)?документ\w*)?\s*{REFERENCES}", numbered, text)
     text = re.sub(r"\s*\(\s*\)", "", text)  # "([1], [2])" once its numbers are gone
-    return re.sub(r"\s{2,}", " ", text).strip()
+    return re.sub(r"\s{2,}", " ", REPEATED.sub(r"\1", text)).strip()
 
 
 PLACEHOLDER = re.compile(r"(?:немає|нема|-+|—|–|null|none|n/a|порожній рядок|\"\")\.?"
@@ -413,12 +449,39 @@ PART_LOCATIVE = {CONIFER: "у хвойному лісі", DECIDUOUS: "у лис�
 # "У соснах") is the conifer forest's own advice.
 PART_GENERAL = re.compile(r"\b([Зз])агальн(?:а|ої|у|ою|ій|і|их)\s+(порад\w*)(?=\s+(?:для\s+)?(?:хвойн|листян"
                           r"|частин\w*\s+лісу\s+біля\s+річки|біля\s+річки))")
+# Mishka's label: «Загальна порада для всього лісу — шукати після дощу». Live: "… для всього лісу радить шукати".
+GENERAL_SAYS = re.compile(r"\b([Зз]агальна\s+порада\s+для\s+(?:всього|усього)\s+лісу)\s+(?:радить|рекомендує)\s+")
+GENERAL_LABEL = "Загальна порада для всього лісу — "
+# The model's own words on whose the advice is, which the bot does not repeat: "немає", "загальна", "окремої поради",
+# "порада для всього лісу", "не знайдено" ("окремої поради про утеплення не знайдено, тож діє календар для всього лісу").
+WHOSE = re.compile(r"\bнема|загальн|окрем\w*\s+порад|для\s+(?:всього|усього)\s+лісу|не\s+знайдено", re.I)
+# A paragraph that opens with the whole forest's label: "Загальний календар для всього лісу радить …".
+WHOLE_FOREST = re.compile(r"\s*загальн\w*(?:\s+\S+)?\s+для\s+(?:всього|усього)\s+лісу\b", re.I)
+# Words joining a sentence to the one before, which read wrong after the label: "Крім того, гриби можна …" (live),
+# "А крім того", "Але також", "Тому шукайте їх". Each goes, one after another.
+JOINED = re.compile(r"^(?:о?крім\s+(?:того|цього)(?!,?\s+що\b)|до\s+того\s+ж|а\s+також|також|але(?:\s+[жй])?|однак|проте"
+                    r"|водночас|при\s+цьому|загалом|отже|отож|тож|відтак|тому(?!,?\s+хто\b)|зокрема|у?тім|втім|тобто"
+                    r"|так\s+само|натомість|а|і)\b\s*,?\s*", re.I)
+# Words that cannot go and do not read after the label: "Ще одна порада: …", "Й …". The answer stays as it is.
+NOT_LEAD = re.compile(r"(?:ще|й|одн\w*|саме|навіть|ба|більше)\b", re.I)
+POLITE = re.compile(r"Ви|Вам|Вас|Вами|Ваш\w*")  # rule 6: "Ви" with a capital
+
+
+def retells(other: str, sentences: list[str], question: str) -> bool:
+    """Whether `other` is the whole forest's labelled paragraph telling each of these sentences already, half of its
+    words at least, the question's aside: live, the fire answer under the oak retold the memo both in the answer and in
+    "Загальна порада для всього лісу — …". An animal's whole-forest advice that gave way, labelled so, tells other
+    things."""
+    told, asked = month_terms(other), month_terms(question)
+    return bool(WHOLE_FOREST.match(other)) and all(
+        len((terms := month_terms(sentence) - asked) & told) * 2 >= len(terms) for sentence in sentences)
 
 
 def clean_wording(text: str, mitten: str | None = None, part: str | None = None) -> str:
     """The model's text without "ваш" before a place ("біля вашої верби" -> "біля верби", "у вашій рукавичці" ->
     "у рукавичці «Під вербою»" with the one mitten asked, "У вашій частині лісу — хвойному —" -> "У хвойному лісі"),
-    and without "загальна" before a forest part's advice. Other "ваш" stay: "перевірте ваші запаси"."""
+    without "загальна" before a forest part's advice, and with Mishka's "Загальна порада для всього лісу — …" for
+    "… радить …". Other "ваш" stay: "перевірте ваші запаси"."""
     capital = lambda word, upper: word[0].upper() + word[1:] if upper else word
 
     def part_place(match: re.Match) -> str:
@@ -434,7 +497,8 @@ def clean_wording(text: str, mitten: str | None = None, part: str | None = None)
         return capital(word, match.group(1) == "В" and bool(SENTENCE_START.search(match.string[:match.start()])))
 
     text = YOUR_PLACE.sub(place, YOUR_PART.sub(part_place, text))
-    return PART_GENERAL.sub(lambda match: capital(match.group(2), match.group(1) == "З"), text)
+    text = PART_GENERAL.sub(lambda match: capital(match.group(2), match.group(1) == "З"), text)
+    return GENERAL_SAYS.sub(r"\1 — ", text)
 
 
 def by_number(numbers, items: list) -> list:
@@ -642,8 +706,8 @@ class Answerer:
         room = (prompt_chars(budget) - len(system) - len(head) - sum(map(len, headers))
                 - len(separator) * (len(docs) - 1))
         size = self._excerpt_size(docs, room)
-        prompt = head + separator.join(header + self._excerpt(doc, question, mittens, parts, size)
-                                       for header, doc in zip(headers, docs, strict=True))
+        excerpts = [self._excerpt(doc, question, mittens, parts, size) for doc in docs]
+        prompt = head + separator.join(header + excerpt for header, excerpt in zip(headers, excerpts, strict=True))
         asked_sources = False
         kept: Draft | None = None  # the answer so far, kept while the model is asked once to put it right
         # At most three calls: the answer, once more when it forgot its sources, and once more to put it right.
@@ -703,6 +767,10 @@ class Answerer:
             prompt += "".join(reminders)
 
         answer, other, sources = kept.answer, kept.other, kept.sources
+        # Mishka: always the source, for an animal's document who sent it and when. Live, the owl's answer cited the
+        # statute alone and retold Їжак's note ("хто підходить до її дупла"): a document whose own words the text
+        # carries is cited too, before the check below that its documents are still there.
+        sources = sources + retold(f"{answer} {other}", head, docs, excerpts, sources)
         # No "у вашій рукавичці" (who asks does not matter) and no "загальна" for a forest part's advice, though the
         # rules say so: the model still wrote them in two answers of six on 2 November, and a try more costs tokens.
         mitten = mittens[0] if len(mittens) == 1 else None
@@ -716,6 +784,13 @@ class Answerer:
             if sources[0] in gone:
                 return Reply("not_found", texts.NOT_FOUND)
             sources, other = [doc for doc in sources if doc not in gone], ""
+        # Mishka: «У хвойному лісі гриби з'являються на 2–3 день після дощу. Загальна порада для всього лісу — шукати
+        # після дощу…», «Окремих порад про утеплення для узлісся немає. Загальна порада для всього лісу — …». Where the
+        # topic differs by place, the bot says whose the advice is if the model did not: live on 3 November it twice
+        # put the whole forest's advice among the conifer forest's food with no word whose.
+        own = self._place_genitive(mittens, parts)
+        if varies == "так" and own and any(doc.scope.kind == "forest" for doc in sources) and not WHOSE.search(answer):
+            answer = self._label_general(question, answer, other, sources, docs, own)
         if len(sources) == 1:
             cite = "Джерело: " + source_line(sources[0], self.tz)
             # The document the advice that gives way retells is not among the sources: the animal would not see where
@@ -723,12 +798,6 @@ class Answerer:
             other = ""
         else:
             cite = "Джерела:\n" + "\n".join("- " + source_line(doc, self.tz) for doc in sources)
-        # Mishka: «Окремих порад про утеплення для узлісся немає. Загальна порада для всього лісу — …». Where the
-        # topic differs by place and only the whole forest answers, the bot says so if the model did not.
-        own = self._place_genitive(mittens, parts)
-        if varies == "так" and own and all(doc.scope.kind == "forest" for doc in sources) \
-                and not re.search(r"\bнема|загальн", answer.lower()):
-            answer = texts.NO_OWN_ADVICE.format(place=own) + " " + answer
         # The advice that gives way stands in a paragraph of its own, so it never reads as part of the answer.
         text = f"{answer}\n\n{other[0].upper()}{other[1:]}" if other else answer
         return Reply("answer", f"{text}\n\n{cite}")
@@ -893,6 +962,75 @@ class Answerer:
             if doc:
                 missing.append(doc)
         return missing
+
+    def _label_general(self, question: str, answer: str, other: str, sources: list[Document], docs: list[Document],
+                       place: str) -> str:
+        """The answer with Mishka's words for the whole forest's advice the model left unlabelled, `place` being the
+        place asked ('рукавички "На узліссі"') and `docs` the documents in the prompt. With the whole forest's documents
+        alone cited, "Окремої поради … немає" goes first. Else "Загальна порада для всього лісу — " goes where the whole
+        forest's advice starts, when it closes the answer after the place's own (rule 3) and "other" does not tell it
+        with the label already. Nothing is moved, as a sentence moved loses what its "вони" or "Однак" pointed to, and
+        where the bot cannot tell whose a sentence is, the answer stays as the model wrote it."""
+        sentences = [sentence for sentence in re.split(r"(?<=[.!?…])\s+", answer.strip()) if sentence]
+        # The places' documents the model was given but did not cite count too: it now and then leaves out a source,
+        # and retold() needs three words of a document's own ("збирайтеся під дубом, біля дупла Сови" is Їжак's note).
+        given = sources + [doc for doc in docs if doc.scope.kind != "forest" and doc not in sources]
+        whose = self._whose(sentences, given)
+        if all(doc.scope.kind == "forest" for doc in sources):
+            # Only when every sentence is plainly the whole forest's, and no place's document given has the topic in
+            # its title: the place has advice of its own then, though the model did not take it.
+            topic = expand(set(tokens(self.forest.strip_places(question))))
+            if not all(whose) or any(topic & set(tokens(doc.title)) for doc in given if doc.scope.kind != "forest"):
+                return answer
+            return texts.NO_OWN_ADVICE.format(place=place) + ("\n" if "\n" in answer else " ") + answer
+        first = whose.index(True) if True in whose else len(whose)
+        if first == len(whose) or False not in whose[:first] or not all(whose[first:]) or "\n" in answer \
+                or retells(other, sentences[first:], question):
+            return answer
+        lead = sentences[first]
+        while (rest := JOINED.sub("", lead)) and rest != lead:
+            lead = rest
+        # A sentence naming a place ("У хвойному лісі гриби шукайте …") is that place's, whoever said it first.
+        if NOT_LEAD.match(lead) or self.forest.detect_mittens(lead) or self.forest.detect_parts(lead):
+            return answer
+        word = lead.split()[0].strip("«»\"'(,.:;")
+        if not (POLITE.fullmatch(word) or any(word.startswith(name.rstrip("аяоь") or name) for name in self.residents)):
+            lead = lead[0].lower() + lead[1:]  # "Вам" and "Їжака" keep the capital
+        return " ".join([*sentences[:first], GENERAL_LABEL + lead, *sentences[first + 1:]])
+
+    def _whose(self, sentences: list[str], sources: list[Document]) -> list[bool | None]:
+        """Whose each sentence of the answer is: True for the cited whole-forest documents', False for the place's, None
+        when the bot cannot tell. A sentence is the place's when it has a number or a month, or two words, that the
+        place's documents have and the whole forest's sentence closest to it lacks ("2–3 день" of the conifer guide,
+        "у жовтні" of its warming, "носить Їжак" of the duty roster), even beside the whole forest's advice in one
+        sentence. Else it is the whole forest's when that closest sentence shares two of its word stems at least and
+        twice as many as any sentence of the place's ("Гриби збирайте після дощу, коли земля волога" is "Їстівне й
+        отруйне"'s beside the conifer forest's food), and the place's when one of the place's shares two. Places named
+        do not count, months count as numbers ("у листопаді" is no "листя"), and of the other words only stems of four
+        letters: "тож" of a guide's closing line tells nothing."""
+        places = [doc for doc in sources if doc.scope.kind != "forest"]
+        if not places:
+            return [True] * len(sentences)
+        general = [month_terms(sentence) for doc in sources if doc.scope.kind == "forest"
+                   for _, _, sentence in answered_sentences(doc)]
+        # A place's lines count as its sentences too: a short animal's note with no full stop reads as a heading.
+        own = [month_terms(sentence) for doc in places for _, _, sentence in answered_sentences(doc)] + [
+            month_terms(line) for doc in places for line in doc.text.splitlines() if line.strip()]
+        place_terms = set().union(*(month_terms(doc.text) for doc in places))
+        whose = []
+        for sentence in sentences:
+            terms = month_terms(self.forest.strip_places(sentence))
+            closest = max(general, key=lambda said: len(terms & said), default=set())
+            whole, mine = len(terms & closest), max((len(terms & said) for said in own), default=0)
+            places_only = (terms - closest) & place_terms
+            dates = {term for term in places_only if term.isdigit() or MONTH_TERM.fullmatch(term)}
+            if dates or len({term for term in places_only if len(term) == 4}) >= 2:
+                whose.append(False)
+            elif whole >= max(2, 2 * mine):
+                whose.append(True)
+            else:
+                whose.append(False if mine >= 2 else None)
+        return whose
 
     @staticmethod
     def _place_genitive(mittens: list[str], parts: list[str]) -> str | None:

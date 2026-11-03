@@ -11,7 +11,7 @@ import pytest
 from bot import texts
 from bot.answering import (ANSWER_SYSTEM, DOC_CHARS, PICK_SECONDS, PICK_SYSTEM, PICK_TOKENS, PLACE_UNKNOWN_RULE,
                            QUESTION_SECONDS, SPARE_TOKENS, Answerer, by_number, calendar_need, calendar_note, clean_other,
-                           clean_text, clean_wording, prompt_chars, question_word)
+                           clean_text, clean_wording, prompt_chars, question_word, retold)
 from bot.extract import extract_text
 from bot.llm import LLM, LLMUnavailable
 from bot.places import CONIFER, DECIDUOUS, Scope
@@ -221,6 +221,112 @@ async def test_resident_question_finds_the_mittens_own_documents(store, forest):
     await Answerer(store, forest, llm, TZ).ask("Що робить Сова вночі?", NOW)
     prompt = llm.prompts[0][1].split("Документи:")[1]
     assert "Чергування в рукавичці Під дубом" in prompt and "У соснах" not in prompt
+
+
+# The archive's documents for "Під дубом" (data/bot.db), the duties as the PDF's text came out, and Їжак's note
+# from the README (docs/samples).
+OAK_DOCS = [
+    ("Статут ОСМД Під дубом",
+     "Статут ОСМД «Під дубом»\n\nМешканці рукавички «Під дубом» приймають цей статут як основу свого спільного життя. "
+     "Старий дуб бачив багато поколінь лісових звірів, і ми хочемо, щоб наш дім під ним був таким самим надійним і "
+     "довговічним.\n\nПро рукавичку\n\n- Рукавичка лежить між корінням старого дуба в центрі листяного лісу.\n- "
+     "Мешканці рукавички: Кабан, Сова і Жолудівка-сойка.\n\nПро керівництво\n\n- Голова ОСМД — Сова.\n- Скарбник ОСМД — "
+     "Кабан.\n\nПро збори\n\n- Збори мешканців відбуваються першої неділі місяця на заході сонця, коли прокидається "
+     "Сова.\nКожен мешканець рукавички «Під дубом» знає цей статут і дотримується його. Хай під могутнім дубом завжди "
+     "панують згода, повага і добросусідство."),
+    ("Членські внески рукавички Під дубом",
+     "Членські внески рукавички «Під дубом»\n\nШановні мешканці рукавички «Під дубом»! Щоб наш дім між корінням "
+     "залишався теплим і доглянутим, кожен дорослий звір робить свій внесок до спільної скарбнички.\n\nОсновне\n\n- "
+     "Внесок — 4 жолуді з дорослого звіра на місяць.\n- Здавати його потрібно до 10 числа.\n- Внески віддають Кабанові "
+     "в кошик біля входу.\n\nЗаміна\n\nЗамість 4 жолудів можна віддати 2 лісові горіхи. Це зручно для тих, у кого саме "
+     "горіхів більше, ніж жолудів.\n\nХто не платить\n\nПташенята й поросята до року не платять. Малеча ще росте, і "
+     "скарбничка на неї не розраховує.\n\nДякуємо кожному, хто здає свою частку вчасно. Жолудь до жолудя — і вже "
+     "повний кошик, а з повного кошика і рукавичці затишніше."),
+    ("Чергування в рукавичці Під дубом",
+     "ак \"и\nанна оман\n\nЧергування в рукавичці «Під дубом»\n\nДля мешканців рукавички «Під дубом» нагадуємо, хто і "
+     "як доглядає наш\n\nспільний дім. Кожен має свою роботу, і разом ми тримаємо рукавичку в\nдоброму стані.\n\nКабан"
+     "\n\nо 2 Кабанносить хмиз по понеділках. Сильний і витривалий, він приносить\n7 стільки, скільки треба.\n\nще "
+     "Жолудівка-сойка\n\nЖолудівка-сойка щоранку вимітає листя від входу. Завдяки їй до рукавички\nзавжди можна легко "
+     "пройти.\n\nСова\nСова стоїть нічну варту і латає дірки. Поки інші сплять, вона пильнує і\nи водночас дбає, щоб у "
+     "рукавичці не було шпарин.\nг Дякуємо кожному черговому! Коли всі тримаються своїх обов'язків, наш дім під\n(7 7 "
+     "дубом стоїть міцно і затишно в будь-яку пору року."),
+    ("Правила співжиття в рукавичці Під дубом",
+     "Правила співжиття в рукавичці «Під дубом»\n\nПравила, наведені нижче, стосуються кожного мешканця рукавички «Під "
+     "дубом». Вони допомагають нам жити разом без образ і непорозумінь.\n\nТиша\n\nТиша в рукавичці триває з полудня "
+     "до заходу сонця, бо Сова спить удень. Її нічна служба потребує денного відпочинку.\n\nГості\n\nГостей приймають "
+     "тільки ввечері й не більше двох за раз. Так і господарям зручно, і гостям просторо.\n\nЗапаси\n\nЧужі запаси "
+     "жолудів не чіпати. Кожен ховає свої в окрему нірку в корінні, і кожна нірка належить лише своєму господареві."
+     "\n\nЦі правила прості й справедливі. Хай вони бережуть мир під нашим старим дубом, а кожен мешканець почувається "
+     "вдома спокійно і впевнено."),
+]
+OAK_FIRE = ("При пожежі мешканці рукавички Під дубом збираються під дубом, біля дупла Сови, а не біля бобрової греблі: "
+            "так Сова одразу бачить, хто вже прийшов.")
+
+
+@pytest.mark.parametrize("fire", [False, True])
+async def test_night_question_finds_the_night_watch(store, forest, fire):
+    # Live on 2 November "Що робить Сова вночі?" got the statute, the dues and Їжак's fire note, not the duties'
+    # "Сова стоїть нічну варту": "вночі" never met "нічну", and a mitten has three seats when the title pick brings
+    # nothing.
+    for title, text in OAK_DOCS:
+        add_archive(store, forest, title, text)
+    if fire:
+        add_animal(store, "Пожежа Під дубом", OAK_FIRE, Scope("mitten", "Під дубом"), name="Їжак")
+    llm = FakeLLM({"found": False})
+    await Answerer(store, forest, llm, TZ).ask("Що робить Сова вночі?", NOW)
+    prompt = llm.prompts[0][1].split("Документи:")[1]
+    assert "Чергування в рукавичці Під дубом" in prompt
+
+
+def numbered(prompt: str) -> dict[str, int]:
+    """The documents' numbers in a prompt by title."""
+    return {title: int(number) for number, title in re.findall(r'^\[(\d+)\] "(.*)"$', prompt, re.M)}
+
+
+class CitingLLM(FakeLLM):
+    """Answers `answer` citing the documents titled `cited`, by their numbers in the prompt."""
+
+    def __init__(self, answer: str, cited: list[str], **options):
+        super().__init__(**options)
+        self.answer, self.cited = answer, cited
+
+    async def json(self, system, user, *args, **options):
+        if system != PICK_SYSTEM:
+            self.answers = [{"found": True, "answer": self.answer, "sources": [numbered(user)[t] for t in self.cited]}]
+        return await super().json(system, user, *args, **options)
+
+
+async def test_a_document_the_answer_retells_is_cited(store, forest):
+    # Live on 3 November the owl's answer cited the statute alone, though its "хто підходить до її дупла" is Їжак's
+    # note: the animal saw neither who wrote it nor when.
+    for title, text in OAK_DOCS:
+        add_archive(store, forest, title, text)
+    add_animal(store, "Пожежа Під дубом", OAK_FIRE, Scope("mitten", "Під дубом"), name="Їжак")
+    live = ("Сова, будучи головою ОСМД у рукавичці «Під дубом», прокидається на заході сонця і вночі спостерігає за "
+            "прибуттям мешканців, зокрема під час зборів і пожежі вона одразу бачить, хто підходить до її дупла.")
+    llm = CitingLLM(live, ["Статут ОСМД Під дубом"], picks=[{"ids": [5, 1]}])  # Їжак's note and the statute, as live
+    reply = await Answerer(store, forest, llm, TZ).ask("Що робить Сова вночі?", NOW)
+    assert "Пожежа Під дубом" in llm.prompts[0][1]
+    assert reply.text == (f'{live}\n\nДжерела:\n- "Статут ОСМД Під дубом" (Лісовий архів, місце: рукавичка "Під дубом")'
+                          '\n- "Пожежа Під дубом", надіслано 28.10.2026 о 14:00, автор: Їжак, місце: рукавичка "Під дубом"')
+    # Told from its cited duties and statute, nothing is added, though the rules share "заходу сонця" with them.
+    duties = "Сова стоїть нічну варту і латає дірки, а прокидається на заході сонця."
+    llm = CitingLLM(duties, ["Чергування в рукавичці Під дубом", "Статут ОСМД Під дубом"], picks=[{"ids": [5, 1]}])
+    reply = await Answerer(store, forest, llm, TZ).ask("Що робить Сова вночі?", NOW)
+    assert "Пожежа" in llm.prompts[0][1] and "Пожежа" not in reply.text and "Правила" not in reply.text
+
+
+def test_numbers_count_as_retold_unless_the_calendar_has_them(store, forest):
+    # A short animal's note is mostly its numbers. The calendar comes with every document: its dates and months tell
+    # nothing of where the answer comes from.
+    dues = store.get(add_archive(store, forest, "Членські внески рукавички Під дубом", "Внесок 4 жолуді на місяць."))
+    note, _ = add_animal(store, "Нові внески", "Для рукавички Під дубом: внесок тепер 5 жолудів або 3 горіхи.",
+                         Scope("mitten", "Під дубом"), name="Білочка")
+    text, asked = "Внесок тепер 5 жолудів або 3 горіхи.", "Питання звіра: Скільки внесок під дубом?"
+    assert retold(text, asked, [dues, note], [dues.text, note.text], [dues]) == [note]
+    # With every day of the month in the calendar, 5 and 3 may be dates: "тепер" and "горіхи" alone are too few.
+    head = f"{calendar_note(NOW, TZ)}\n\n{asked}"
+    assert retold(text, head, [dues, note], [dues.text, note.text], [dues]) == []
 
 
 async def test_mitten_advice_is_not_pushed_out_by_stronger_general_matches(store, forest):
@@ -1418,6 +1524,235 @@ async def test_the_bot_says_the_place_has_no_advice_of_its_own_when_the_model_do
     assert reply.text.startswith("Крикни тричі коротко, як Сорока.\n\nДжерело:")
 
 
+# The archive's conifer food (data/bot.db), cited beside "Їстівне й отруйне" live on 3 November.
+CONIFER_FOOD = ("Що їсти в хвойному лісі\n\nЦя порада для мешканців хвойного лісу.\n\nНасіння з шишок\n\nНасіння з шишок "
+                "найбільше в лютому, коли шишки розкриваються.\n\nЯгоди\n\n- Чорниці достигають у липні на північних "
+                "схилах.\n- Брусниця достигає у вересні.\nТож улітку виглядайте чорниці, а коли прийде вересень, наставте "
+                "око на брусницю.")
+CONIFER_OWN = "У хвойному лісі насіння з шишок найбільше в лютому, чорниці – у липні, брусниця – у вересні."
+
+
+GENERAL_MUSHROOMS = "Гриби збирайте після дощу, коли земля волога, але не хлюпає."
+LABELLED_MUSHROOMS = "Загальна порада для всього лісу — гриби збирайте після дощу, коли земля волога, але не хлюпає."
+MUSHROOMS_ON = "гриби збирайте після дощу, коли земля волога, але не хлюпає."  # after a joining word
+
+
+@pytest.mark.parametrize("answer, shown", [
+    # Live: the whole forest's advice among the conifer forest's food with no word whose. The sentence after it that
+    # tells no more whose goes on under the label.
+    (f"{CONIFER_OWN} {GENERAL_MUSHROOMS} Невідомий гриб не беріть.",
+     f"{CONIFER_OWN} {LABELLED_MUSHROOMS} Невідомий гриб не беріть."),
+    # Live: "Крім того" joined it to the place's advice; "Але" no better after the label.
+    (f"{CONIFER_OWN} Крім того, гриби можна збирати після дощу, коли земля волога, але не хлюпає.",
+     f"{CONIFER_OWN} Загальна порада для всього лісу — гриби можна збирати після дощу, коли земля волога, але не хлюпає."),
+    (f"{CONIFER_OWN} Але {GENERAL_MUSHROOMS[0].lower()}{GENERAL_MUSHROOMS[1:]}", f"{CONIFER_OWN} {LABELLED_MUSHROOMS}"),
+    (f"{CONIFER_OWN} Але ж {GENERAL_MUSHROOMS[0].lower()}{GENERAL_MUSHROOMS[1:]}", f"{CONIFER_OWN} {LABELLED_MUSHROOMS}"),
+    # "Тож" of the guide's closing line is no word of the place's own advice.
+    (f"{CONIFER_OWN} Тож {MUSHROOMS_ON}", f"{CONIFER_OWN} {LABELLED_MUSHROOMS}"),
+    # Found in review: joining words one after another, and others than "Крім того".
+    (f"{CONIFER_OWN} А крім того, {MUSHROOMS_ON}", f"{CONIFER_OWN} {LABELLED_MUSHROOMS}"),
+    (f"{CONIFER_OWN} Але також {MUSHROOMS_ON}", f"{CONIFER_OWN} {LABELLED_MUSHROOMS}"),
+    (f"{CONIFER_OWN} Тому {MUSHROOMS_ON}", f"{CONIFER_OWN} {LABELLED_MUSHROOMS}"),
+    # A lead-in that cannot go, or a sentence naming the place: as the model wrote it.
+    (f"{CONIFER_OWN} Ще одна порада: {MUSHROOMS_ON}", f"{CONIFER_OWN} Ще одна порада: {MUSHROOMS_ON}"),
+    (f"{CONIFER_OWN} У хвойному лісі {MUSHROOMS_ON}", f"{CONIFER_OWN} У хвойному лісі {MUSHROOMS_ON}"),
+    # Rule 6's "Вам" keeps its capital.
+    (f"{CONIFER_OWN} Вам варто збирати гриби після дощу, коли земля волога, але не хлюпає.",
+     f"{CONIFER_OWN} Загальна порада для всього лісу — Вам варто збирати гриби після дощу, коли земля волога, але не "
+     "хлюпає."),
+    # Nothing is moved: before the place's own advice, the whole forest's "гриби" are what the place's "вони" means.
+    (f"{GENERAL_MUSHROOMS} У хвойному лісі вони ростуть рідше, а насіння з шишок найбільше в лютому.",
+     f"{GENERAL_MUSHROOMS} У хвойному лісі вони ростуть рідше, а насіння з шишок найбільше в лютому."),
+    # One sentence with the place's own "лютому" is the place's, though it shares more words with the whole forest.
+    ("У хвойному лісі гриби збирайте після дощу, коли земля волога, але не хлюпає, а насіння з шишок — у лютому.",
+     "У хвойному лісі гриби збирайте після дощу, коли земля волога, але не хлюпає, а насіння з шишок — у лютому."),
+    # A list keeps its lines, and the model's own words on whose the advice is are not said twice.
+    (f"{CONIFER_OWN}\n{GENERAL_MUSHROOMS}", f"{CONIFER_OWN}\n{GENERAL_MUSHROOMS}"),
+    (f"{CONIFER_OWN} Порада для всього лісу — {GENERAL_MUSHROOMS[0].lower()}{GENERAL_MUSHROOMS[1:]}",
+     f"{CONIFER_OWN} Порада для всього лісу — {GENERAL_MUSHROOMS[0].lower()}{GENERAL_MUSHROOMS[1:]}"),
+    # A sentence the bot cannot tell whose after the whole forest's: nothing labelled.
+    (f"{CONIFER_OWN} {GENERAL_MUSHROOMS} Робіть так щоліта.", f"{CONIFER_OWN} {GENERAL_MUSHROOMS} Робіть так щоліта."),
+    # Labelled by the model, or the place's own alone: as it is.
+    (f"{CONIFER_OWN} Загальна порада для всього лісу — шукати гриби після дощу.",
+     f"{CONIFER_OWN} Загальна порада для всього лісу — шукати гриби після дощу."),
+    (CONIFER_OWN, CONIFER_OWN),
+])
+async def test_whole_forests_advice_after_the_places_is_labelled(store, forest, answer, shown):
+    # Mishka: «У хвойному лісі гриби з'являються на 2–3 день після дощу. Загальна порада для всього лісу — …».
+    add_archive(store, forest, "Що їсти в хвойному лісі", CONIFER_FOOD)
+    add_archive(store, forest, "Їстівне й отруйне", EDIBLE_ARCHIVE)
+    llm = FakeLLM({"found": True, "answer": answer, "sources": [1, 2]}, picks=[{"ids": [1, 2]}])
+    reply = await Answerer(store, forest, llm, TZ).ask("Що їсти в хвойному лісі?", NOW)
+    assert "Поради на цю тему різні в різних місцях: так" in llm.prompts[0][1]
+    assert reply.text.startswith(f"{shown}\n\nДжерела:")
+
+
+@pytest.mark.parametrize("other, labelled", [
+    # Live for "Що робити при пожежі під дубом?": the memo told in the answer and, labelled, in "other" once more.
+    ("Загальна порада для всього лісу — гриби шукайте після дощу, коли земля волога, але не хлюпає, а невідомий гриб "
+     "не беріть.", False),
+    # A labelled paragraph on something else leaves the answer's sentence to be labelled.
+    ("Загальна порада для всього лісу — невідомий гриб не беріть, спитайте Їжака.", True),
+])
+async def test_whole_forests_advice_labelled_in_its_own_paragraph_is_not_labelled_twice(store, forest, other, labelled):
+    add_archive(store, forest, "Що їсти в хвойному лісі", CONIFER_FOOD)
+    add_archive(store, forest, "Їстівне й отруйне", EDIBLE_ARCHIVE)
+    answer = f"{CONIFER_OWN} {GENERAL_MUSHROOMS}"
+    llm = FakeLLM({"found": True, "answer": answer, "other": other, "sources": [1, 2]}, picks=[{"ids": [1, 2]}])
+    reply = await Answerer(store, forest, llm, TZ).ask("Що їсти в хвойному лісі?", NOW)
+    assert reply.text.split("\n\n")[:2] == [f"{CONIFER_OWN} {LABELLED_MUSHROOMS}" if labelled else answer, other]
+
+
+async def test_the_calendars_november_is_no_deciduous_forests_leaves(store, forest):
+    # "листопаді" and "листя" share the stem "лист": months count as numbers, so the calendar's November is labelled.
+    add_archive(store, forest, "Як утеплити рукавичку в листяному лісі", "Порада для тих, чия рукавичка стоїть у "
+                "листяному лісі. Утеплюйте рукавичку тоді, коли облетить листя, сухим дубовим листям шаром у дві лапи.")
+    add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Рукавички утеплюють у листопаді.")
+    own = "У листяному лісі утеплюйте рукавичку, коли облетить листя, сухим дубовим листям шаром у дві лапи."
+    llm = FakeLLM({"found": True, "answer": f"{own} Рукавички утеплюють у листопаді.", "sources": [1, 2]},
+                  picks=[{"ids": [1, 2]}])
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли утеплювати рукавичку в листяному лісі?", NOW)
+    assert reply.text.startswith(f"{own} Загальна порада для всього лісу — рукавички утеплюють у листопаді.\n\n")
+
+
+async def test_a_cited_place_document_leaves_the_answer_and_its_sources_as_the_model_wrote_them(store, forest):
+    # Live on 3 November: the calendar's November answered, the forest edge's duty roster cited beside it, and "other"
+    # retelling the calendar with Їжак's leaves. Whether the roster is advice on warming the bot cannot tell, so it says
+    # nothing of the place's own advice and drops no source: only the words repeated in brackets go.
+    add_archive(store, forest, "Чергування в рукавичці На узліссі", "Їжак до сплячки носить листя. Поки він не заснув, "
+                                                                    "він дбає, щоб у рукавичці було чим утеплитися.")
+    add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Рукавички утеплюють у листопаді.")
+    add_archive(store, forest, "Як утеплити рукавичку в хвойному лісі",
+                "Порада для тих, чия рукавичка стоїть у хвойному лісі. Утеплюйте рукавичку в жовтні.")
+    other = ("Загальна порада для всього лісу — у листопаді утеплюють рукавички; для рукавички «На узліссі» саме "
+             "утеплення забезпечує Їжак, який до сплячки носить листя.")
+    llm = FakeLLM({"found": True, "answer": "У листопаді (у листопаді) утеплюють рукавичку «На узліссі».", "other": other,
+                   "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли утеплювати рукавичку на узліссі?", NOW)
+    assert "Поради на цю тему різні в різних місцях: так" in llm.prompts[0][1]
+    assert reply.text.split("\n\n")[:2] == ["У листопаді утеплюють рукавичку «На узліссі».", other]
+    assert '"Чергування в рукавичці На узліссі"' in reply.text and '"Календар сезонів"' in reply.text
+    # Found in review: Кріт's note saying what the whole forest says, with no topic in its title, is still the mitten's
+    # own advice and stays a source.
+    add_animal(store, "Порада від Крота", "На узліссі гриби шукаємо після дощу.", Scope("mitten", "На узліссі"),
+               name="Кріт")
+    add_archive(store, forest, "Їстівне й отруйне", EDIBLE_ARCHIVE)
+    add_archive(store, forest, "Грибний путівник хвойного лісу", CONIFER_MUSHROOMS)
+    answer = "На узліссі гриби шукайте після дощу, коли земля волога, але не хлюпає."
+    llm = FakeLLM({"found": True, "answer": answer, "sources": [1, 2]}, picks=[{"ids": []}])
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли шукати гриби на узліссі?", NOW)
+    assert re.findall(r'^\[\d\] "(.+)"$', llm.prompts[0][1], re.M)[:2] == ["Порада від Крота", "Їстівне й отруйне"]
+    assert reply.text.startswith(answer + "\n\nДжерела:") and "Порада від Крота" in reply.text
+
+
+@pytest.mark.parametrize("note", [
+    "При пожежі мешканці рукавички Під дубом збираються під дубом, біля дупла Сови, а не біля бобрової греблі: так Сова "
+    "одразу бачить, хто вже прийшов.",
+    # Found in review: a short note with no full stop reads as a heading, yet its words are the place's.
+    "При пожежі збираємося під дубом біля дупла Сови",
+])
+async def test_no_own_advice_is_not_claimed_for_a_places_document_the_model_forgot_to_cite(store, forest, note):
+    # The model now and then leaves out a source. Їжак's note shares one word of its own with the answer ("дупла"),
+    # too few for retold(), yet the answer is his advice, not the memo's: no "Окремої поради … немає" before it.
+    add_animal(store, "Пожежа Під дубом", note, Scope("mitten", "Під дубом"), name="Їжак")
+    add_archive(store, forest, "Що робити при пожежі", "Ця пам'ятка для всіх мешканців лісу. Біжіть до річки проти вітру. "
+                                                       "Усі збираються біля бобрової греблі.")
+    answer = "При пожежі збирайтеся під дубом, біля дупла Сови, а не біля бобрової греблі."
+    llm = FakeLLM({"found": True, "answer": answer, "sources": [2]}, {"found": True, "answer": answer, "sources": [2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Що робити при пожежі під дубом?", NOW)
+    assert "Поради на цю тему різні в різних місцях: так" in llm.prompts[0][1]
+    assert reply.text.startswith(answer + "\n\n")
+
+
+async def test_no_own_advice_is_not_claimed_when_the_places_own_on_the_topic_was_given(store, forest):
+    # Found in review: the model took the calendar's November alone, though the conifer forest's warming (October) was in
+    # the prompt for "Під ялиною": the place has advice of its own, so the bot does not say it has none.
+    add_archive(store, forest, "Як утеплити рукавичку в хвойному лісі",
+                "Порада для тих, чия рукавичка стоїть у хвойному лісі. Утеплюйте рукавичку в жовтні.")
+    add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Рукавички утеплюють у листопаді.")
+    llm = FakeLLM({"found": True, "answer": "Рукавички утеплюють у листопаді.", "sources": [2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли утеплювати рукавичку під ялиною?", NOW)
+    assert "Як утеплити рукавичку в хвойному лісі" in llm.prompts[0][1]
+    assert reply.text.startswith("Рукавички утеплюють у листопаді.\n\n")
+
+
+@pytest.mark.parametrize("cited", [[1, 2], [2]])
+async def test_an_animals_note_in_lines_without_full_stops_is_the_places_cited_or_not(store, forest, cited):
+    # Found in review: lines with no full stop read as headings, so Кріт's note has no sentence of its own for the bot,
+    # and the model may not cite it. Its "коли земля після дощу підсохне" shares more words with the memo's "Гриби
+    # шукайте після дощу, коли земля волога" than with anything else, yet it is Кріт's: its lines count as sentences.
+    add_animal(store, "Порада від Крота", "Опеньки ростуть біля старого пня за рукавичкою\nГриби шукаємо коли земля "
+               "після дощу підсохне", Scope("mitten", "На узліссі"), name="Кріт")
+    add_archive(store, forest, "Їстівне й отруйне", EDIBLE_ARCHIVE)
+    add_archive(store, forest, "Грибний путівник хвойного лісу", CONIFER_MUSHROOMS)
+    answer = "Опеньки ростуть біля старого пня за рукавичкою. Гриби шукайте, коли земля після дощу підсохне."
+    llm = FakeLLM({"found": True, "answer": answer, "sources": cited})
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли шукати гриби на узліссі?", NOW)
+    assert re.findall(r'^\[\d\] "(.+)"$', llm.prompts[0][1], re.M) == ["Порада від Крота", "Їстівне й отруйне"]
+    assert "Поради на цю тему різні в різних місцях: так" in llm.prompts[0][1]
+    assert reply.text.startswith(answer + "\n\n")
+
+
+async def test_a_places_contrary_advice_in_the_memos_words_is_not_labelled_the_whole_forests(store, forest):
+    # Found in review: Їжак's "біжимо за вітром, а не проти вітру" retold as "Біжіть за вітром, а не проти вітру" shares
+    # three words with the memo's "Біжіть до річки проти вітру" and two with his note: a lead of one word is too close
+    # to tell, and the memo says the opposite.
+    add_animal(store, "Пожежа Під дубом", "Під дубом при пожежі збираємося біля дупла Сови і біжимо за вітром, а не "
+               "проти вітру.", Scope("mitten", "Під дубом"), name="Їжак")
+    add_archive(store, forest, "Що робити при пожежі", "Ця пам'ятка для всіх мешканців лісу. Біжіть до річки проти вітру. "
+                                                       "Усі збираються біля бобрової греблі.")
+    answer = "При пожежі збирайтеся біля дупла Сови. Біжіть за вітром, а не проти вітру."
+    llm = FakeLLM({"found": True, "answer": answer, "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Що робити при пожежі під дубом?", NOW)
+    assert "Поради на цю тему різні в різних місцях: так" in llm.prompts[0][1]
+    assert reply.text.startswith(answer + "\n\n")
+
+
+@pytest.mark.parametrize("answer", [
+    # Found in review: the conifer forest's October glued to the calendar's words is the conifer forest's.
+    "Кладіть мох шаром у три лапи. Утеплюйте рукавичку в жовтні, коли час подбати, щоб у домівці було тепло.",
+    # The calendar's words with the place's month count for neither: nothing is labelled.
+    "Кладіть мох шаром у три лапи. Час подбати, щоб у домівці було тепло, — у жовтні.",
+])
+async def test_a_sentence_with_the_places_own_words_is_not_labelled_the_whole_forests(store, forest, answer):
+    add_archive(store, forest, "Як утеплити рукавичку в хвойному лісі", "Порада для тих, чия рукавичка стоїть у хвойному "
+                "лісі. Утеплюйте рукавичку в жовтні. Кладіть мох шаром у три лапи.")
+    add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Жолуді збирають у жовтні. "
+                "Рукавички утеплюють у листопаді. Час подбати, щоб у домівці було тепло.")
+    llm = FakeLLM({"found": True, "answer": answer, "sources": [1, 2]}, picks=[{"ids": [1, 2]}])
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли утеплювати рукавичку в хвойному лісі?", NOW)
+    assert reply.text.startswith(answer + "\n\nДжерела:")
+
+
+async def test_a_place_whose_own_words_the_answer_tells_keeps_its_document(store, forest):
+    # Found in review: the roster's Їжак in one sentence with the calendar's words is still the roster's, so neither
+    # "Окремої поради … немає" nor the calendar alone as the source.
+    add_archive(store, forest, "Чергування в рукавичці На узліссі", "Їжак до сплячки носить листя. Поки він не заснув, "
+                                                                    "він дбає, щоб у рукавичці було чим утеплитися.")
+    add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Рукавички утеплюють у листопаді. "
+                                                  "Час подбати, щоб у домівці було тепло.")
+    add_archive(store, forest, "Як утеплити рукавичку в хвойному лісі",
+                "Порада для тих, чия рукавичка стоїть у хвойному лісі. Утеплюйте рукавичку в жовтні.")
+    answer = ("Рукавички утеплюють у листопаді, час подбати, щоб у домівці було тепло, а листя до сплячки носить Їжак.")
+    llm = FakeLLM({"found": True, "answer": answer, "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Коли утеплювати рукавичку на узліссі?", NOW)
+    assert reply.text.startswith(answer + "\n\nДжерела:") and '"Чергування в рукавичці На узліссі"' in reply.text
+
+
+async def test_an_animals_note_without_full_stops_is_still_the_places_advice(store, forest):
+    # Found in review: a one-line note reads as a heading, with no sentence of its own to compare; its words still tell
+    # that the first sentence is Кріт's, so the note stays a source and only the memo's sentence is labelled.
+    add_animal(store, "Порада від Крота", "Опеньки шукайте біля старого пня за рукавичкою", Scope("mitten", "На узліссі"),
+               name="Кріт")
+    add_archive(store, forest, "Їстівне й отруйне", EDIBLE_ARCHIVE)
+    add_archive(store, forest, "Грибний путівник хвойного лісу", CONIFER_MUSHROOMS)
+    note = "Опеньки шукайте біля старого пня за рукавичкою."
+    llm = FakeLLM({"found": True, "answer": f"{note} {GENERAL_MUSHROOMS}", "sources": [1, 2]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Де шукати гриби на узліссі?", NOW)
+    assert "Поради на цю тему різні в різних місцях: так" in llm.prompts[0][1]
+    assert reply.text.startswith(f"{note} {LABELLED_MUSHROOMS}\n\nДжерела:") and "Порада від Крота" in reply.text
+
+
 async def test_a_place_found_by_its_resident_gets_no_note_about_its_own_advice(store, forest):
     add_archive(store, forest, "Статут ОСМД У ліщині", "Мешканці. У рукавичці живуть Ведмідь, Сорока і Вивірка.")
     add_archive(store, forest, "Календар сезонів", "Цей календар для всіх мешканців лісу. Хто спить узимку, лягає в грудні. "
@@ -1486,6 +1821,13 @@ def test_prompt_makes_the_whole_forests_advice_on_the_topic_a_must():
     # Live, the whole forest's "when" stood unlabelled among the willow's "where" and read as the mitten's own advice.
     assert ('а пораду всього лісу завжди починай словами "Загальна порада для всього лісу — …" й не змішуй із '
             'порадою місця') in ANSWER_SYSTEM
+
+
+def test_prompt_forbids_links_between_facts_the_documents_do_not_make():
+    # Live on 3 November: «Збирайте жолуді після першого морозу; цей період припадає на середину вересня‑кінець
+    # жовтня» joined the mitten's frost and the deciduous guide's months into a claim neither document makes.
+    rule = ANSWER_SYSTEM.split("\n1. ")[1].split("\n")[0]
+    assert "жодних дат, умов, уточнень чи зв'язків між фактами, яких немає в тексті документів" in rule
 
 
 @pytest.mark.parametrize("question, part_doc, part_answer, quote, label", [
@@ -1629,6 +1971,17 @@ def test_general_is_the_whole_forests_label_only():
                  "Окремої поради немає, тож діє загальна порада для всього лісу: у листопаді."):
         assert clean_wording(text) == text
     assert '"загальна" — лише про весь ліс' in ANSWER_SYSTEM
+
+
+def test_whole_forests_label_reads_as_mishkas():
+    # Live: "… радить шукати", "… рекомендує не брати" for Mishka's «Загальна порада для всього лісу — шукати …».
+    assert clean_wording("Загальна порада для всього лісу радить шукати гриби після дощу.") == \
+        "Загальна порада для всього лісу — шукати гриби після дощу."
+    assert clean_wording("Загальна порада для всього лісу рекомендує не брати невідомі гриби.") == \
+        "Загальна порада для всього лісу — не брати невідомі гриби."
+    # Live: words repeated in brackets.
+    assert clean_text("У листопаді (у листопаді) утеплюють рукавичку.", 2) == "У листопаді утеплюють рукавичку."
+    assert clean_text("Утеплюють у листопаді (до сплячки).", 2) == "Утеплюють у листопаді (до сплячки)."
 
 
 async def test_wording_is_cleaned_in_the_reply(store, forest):
@@ -1934,5 +2287,45 @@ async def test_reference_answers_are_taken_as_they_are(store, forest, question, 
     llm = FakeLLM({"found": True, "answer": answer, "sources": sources})
     reply = await Answerer(store, forest, llm, TZ).ask(question, NOW)
     assert len(llm.prompts) == 1 and reply.text.startswith(answer + "\n\nДжерел")
+    # Their own sources only: the willow's prompt has "Їстівне й отруйне" too, and the answer retells nothing of it.
+    assert reply.text.count("\n- ") == (len(sources) if len(sources) > 1 else 0)
+
+
+async def test_whole_forests_advice_retold_without_its_document_gets_it_cited(store, forest):
+    # Live on 2 November (bot.check) the willow answer's "Загальна порада для всього лісу – гриби шукайте після дощу,
+    # коли земля волога, але не хлюпає." came with the three guides of the mitten and its parts as the sources.
+    add_willow_mushrooms(store, forest)
+    general = "Загальна порада для всього лісу — гриби шукайте після дощу, коли земля волога, але не хлюпає."
+    llm = FakeLLM({"found": True, "answer": MISHKA_WILLOW, "other": general, "sources": [1, 2, 3]})
+    reply = await Answerer(store, forest, llm, TZ).ask("Де шукати гриби біля верби?", NOW)
+    assert len(llm.prompts) == 1 and reply.text.startswith(f"{MISHKA_WILLOW}\n\n{general}\n\nДжерела:")
+    assert reply.text.endswith('\n- "Їстівне й отруйне" (Лісовий архів, місце: увесь ліс)')
+
+
+# The archive's whole-forest autumn guide (data/bot.db), in the willow's prompt live on 3 November.
+AUTUMN_GUIDE = ("Осінній путівник лісу\nОсінь — гарна пора для прогулянок лісом, але й вимоглива. Цей путівник для всіх "
+                "мешканців лісу, хто збирається восени по гриби чи просто в дорогу. Чотири поради, які варто взяти з "
+                "собою разом із кошиком.\nПерша порада — про гриби. Гриби шукай після дощу, коли земля ще волога, але "
+                "вже не хлюпає під лапами.\nДруга порада — про час. Збирай удосвіта, поки не прокинулись кабани.\n"
+                "Третя порада — про тривогу. Почув три короткі крики Сороки — кидай кошик і ховайся, це мисливці. Кошик "
+                "можна знайти потім, а себе — ні.\nЧетверта порада — про дорогу додому. Восени день коротшає, тож до "
+                "рукавички повертайся до заходу сонця.\nОсінній ліс гарний, коли йдеш ним без поспіху й без страху. "
+                "Виходь рано, повертайся вчасно, слухай ліс уважно, і хай твій кошик буде повний, а дорога додому — "
+                "спокійна.")
+
+
+async def test_two_words_an_answer_shares_with_a_document_it_does_not_cite_are_no_retelling(store, forest):
+    # Live on 3 November the willow answer cited its four documents; its "збирати" and "знайти" are the autumn guide's
+    # words too ("Збирай удосвіта", "Кошик можна знайти потім"), though nothing of the guide is retold.
+    add_willow_mushrooms(store, forest)
+    add_archive(store, forest, "Осінній путівник лісу", AUTUMN_GUIDE)
+    cited = ["Чим поживитись поруч із рукавичкою Під вербою", "Грибний путівник біля річки",
+             "Грибний путівник листяного лісу", "Їстівне й отруйне"]
+    llm = CitingLLM(LIVE_WILLOW, cited, picks=[{"ids": [5]}])  # the title pick brings the guide, as the archive's search
+    reply = await Answerer(store, forest, llm, TZ).ask("Де шукати гриби біля верби?", NOW)
+    # Its last sentence is "Їстівне й отруйне"'s, and the bot says so.
+    labelled = LIVE_WILLOW.replace("Усі гриби", "Загальна порада для всього лісу — усі гриби")
+    assert "Осінній путівник лісу" in llm.prompts[0][1] and reply.text.startswith(labelled + "\n\nДжерела:")
+    assert re.findall(r'^- "(.*?)"', reply.text, re.M) == cited
 
 
