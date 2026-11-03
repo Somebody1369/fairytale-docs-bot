@@ -44,6 +44,10 @@ class FakeLLM:
         self.pick_prompts: list[str] = []
         self.reasoning: list[str] = []
         self.deadlines: list[float | None] = []
+        self.rest: float | None = None  # what free_in() says: seconds every model still rests, or None
+
+    def free_in(self) -> float | None:
+        return self.rest
 
     async def json(self, system: str, user: str, max_tokens: int = 700, reasoning: str = "low",
                    fast: bool = False, deadline: float | None = None) -> dict:

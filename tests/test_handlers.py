@@ -1281,6 +1281,39 @@ async def test_model_busy_for_every_try_brings_an_apology(setup, no_pauses):
     assert len(llm.prompts) == 4 and llm.answers == [] and not dispatcher["app"].later[USER.id]
 
 
+async def test_a_limit_longer_than_the_tries_is_told_at_once_and_nothing_promised(setup):
+    # The daily limit of every model: Groq says 40 minutes, longer than the answer promised later could wait.
+    dispatcher, bot, telegram, llm, _ = setup
+    llm.answers.append(LLMUnavailable("all models are resting after their rate limits"))
+    llm.rest = 40 * 60 - 5
+    await dispatcher.feed_update(bot, message(text="скільки внесок під дубом?"))
+    assert telegram.sent[-1].text == texts.LIMIT_REACHED.format(minutes=40)
+    assert "не раніше ніж за 40 хв." in telegram.sent[-1].text
+    assert not dispatcher["app"].background and not dispatcher["app"].later[USER.id]
+
+
+async def test_a_limit_the_tries_outlast_is_waited_out(setup, monkeypatch):
+    # Every model rests 2 minutes, within the tries of the next 7: the answer is promised, as agreed with Mishka.
+    dispatcher, bot, telegram, llm, _ = setup
+    monkeypatch.setattr(handlers, "LATER_PAUSES", (300, 300))
+    llm.answers.append(LLMUnavailable("busy"))
+    llm.rest = 120
+    await dispatcher.feed_update(bot, message(text="скільки внесок під дубом?"))
+    assert telegram.sent[-1].text == texts.ANSWER_LATER and len(dispatcher["app"].later[USER.id]) == 1
+    await stop_waiting(dispatcher)
+
+
+async def test_tries_given_up_on_a_limit_say_when_to_ask_again(setup, no_pauses):
+    dispatcher, bot, telegram, llm, _ = setup
+    llm.answers += [LLMUnavailable("busy")] * 4
+    await dispatcher.feed_update(bot, message(text="скільки внесок під дубом?"))
+    assert telegram.sent[-1].text == texts.ANSWER_LATER
+    llm.rest = 9 * 60 + 30  # the limit outlasted the tries
+    await answered_later(dispatcher)
+    assert telegram.sent[-1].text == ('На Ваше питання "скільки внесок під дубом?":\n\n'
+                                      + texts.ANSWER_LATER_LIMIT.format(minutes=10))
+
+
 async def test_apology_while_a_document_waits_is_followed_by_the_document(setup, no_pauses):
     dispatcher, bot, telegram, llm, store = setup
     await send_unclear_document(dispatcher, bot, telegram, llm, store)

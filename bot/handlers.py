@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import logging
+import math
 import re
 import uuid
 from collections import defaultdict
@@ -967,10 +968,21 @@ def later_lead(question: str, mitten: str | None) -> str:
     return texts.ANSWER_LATER_LEAD.format(question=question)
 
 
+def limit_minutes(app: App) -> int | None:
+    """Whole minutes until Groq lets a model answer again while every one rests after its rate limit, else None."""
+    rest = app.llm.free_in()
+    return math.ceil(rest / 60) if rest is not None else None
+
+
 async def answer_later(message: Message, state: FSMContext, app: App, question: str, mitten: str | None,
                        epoch: int) -> None:
     """No model answered in time, as all rest after their rate limits: promise the answer and ask again
-    in the background."""
+    in the background. When every model rests for longer than those tries last (a daily limit), nothing is
+    promised: the animal is told at once when to ask again."""
+    minutes = limit_minutes(app)
+    if minutes is not None and minutes * 60 > sum(LATER_PAUSES):
+        await message.answer(texts.LIMIT_REACHED.format(minutes=minutes))
+        return
     waiting = app.later[message.chat.id]
     if len(waiting) >= LATER_PER_CHAT:
         await message.answer(texts.LLM_UNAVAILABLE)
@@ -1001,7 +1013,9 @@ async def ask_later(message: Message, state: FSMContext, app: App, question: str
         app.later.get(message.chat.id, {}).pop(asyncio.current_task(), None)
         if reply.kind == "unavailable":
             log.warning("No model was free for a question of chat %s in %s s", message.chat.id, sum(LATER_PAUSES))
-            await message.answer(lead + texts.ANSWER_LATER_FAILED)
+            minutes = limit_minutes(app)
+            await message.answer(lead + (texts.ANSWER_LATER_LIMIT.format(minutes=minutes) if minutes is not None
+                                         else texts.ANSWER_LATER_FAILED))
         else:
             await deliver(message, state, app, question, reply, epoch, lead=lead)
         await remind_document(message, state, app)

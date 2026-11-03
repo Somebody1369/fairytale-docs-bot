@@ -78,6 +78,22 @@ async def test_model_out_of_its_daily_limit_rests():
     assert used == ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "qwen/qwen3.8-27b"]
 
 
+async def test_free_in_says_how_long_every_model_still_rests():
+    llm = LLM("x", ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"])
+    calls = {"openai/gpt-oss-120b": "3000", "qwen/qwen3.8-27b": "1200"}
+
+    async def create(model, **options):
+        raise rate_limited("tokens per day", **{"retry-after": calls[model]})
+
+    llm.client = fake_client(create)
+    assert llm.free_in() is None  # nothing has rested yet
+    with pytest.raises(LLMUnavailable):
+        await llm.json("system", "user", deadline=time.monotonic() + 5)
+    assert 1190 < llm.free_in() <= 1200  # the first to free up, as Groq said
+    llm.resting["qwen/qwen3.8-27b"] = time.monotonic() - 1  # one model free again: no matter of limits
+    assert llm.free_in() is None
+
+
 def test_wait_comes_from_retry_after_or_the_token_reset():
     assert _retry_after(rate_limited("limit", **{"retry-after": "12"})) == 12
     assert _retry_after(rate_limited("limit", **{"x-ratelimit-reset-tokens": "7.5s"})) == 7.5

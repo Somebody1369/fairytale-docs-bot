@@ -99,6 +99,12 @@ class LLM:
             log.error("None of the Groq models %s is available for this key", self.models)
         log.info("Groq models in use: %s", ", ".join(self.models))
 
+    def free_in(self) -> float | None:
+        """Seconds until a model may be asked again while every one rests after its rate limit, as Groq said (at most
+        MAX_REST), else None: with a model left to ask, a reply that did not come was no matter of limits."""
+        rest = min((self.resting.get(model, 0) for model in self.models), default=0) - time.monotonic()
+        return rest if rest > 0 else None
+
     def order(self, fast: bool) -> list[str]:
         """Answers go down the configured list; simple choices start from the smallest model and leave out the
         first one, whose minute's tokens the answer right after them needs."""
