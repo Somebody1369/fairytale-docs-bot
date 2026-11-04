@@ -133,6 +133,11 @@ NOT_FOUND_REMINDER = """
 Зверни увагу: ти повернув "found": false, але в документах є речення на тему питання "{topic}":{quotes} Якщо вони відповідають на питання (місце з питання означає рукавичку, а не саме дерево, правило 10), відповідай за ними за всіма правилами, нічого не вигадуючи. Якщо ні, знову поверни "found": false."""
 NOT_FOUND_QUOTES = 700  # characters of quotes in that reminder, the most specific documents first
 
+PLACE_REMINDER = """
+
+Зверни увагу: ти повернув "needs_place": true, але не навів у "facts" жодної поради для окремої рукавички чи частини лісу на тему питання "{topic}".{quotes} Перепитувати рукавичку треба, лише коли такі поради є і для різних місць вони різні: тоді знову поверни "needs_place": true і наведи їх у "facts". Якщо ж відповідь однакова для всього лісу, відповідай за всіма правилами й поверни "needs_place": false, а якщо відповіді в документах немає, поверни "found": false."""
+PLACE_QUOTE = " У документі [{number}] для всього лісу на цю тему сказано: «{quote}»"
+
 SOURCES_REMINDER = """
 
 Зверни увагу: у "sources" немає номерів документів, з яких узято відповідь. Без них бот відповідь не покаже: постав у "sources" номери документів, з яких відповідаєш, найважливіший перший."""
@@ -164,6 +169,9 @@ FOR_EVERYONE = re.compile(r"\b(?:всіх|усіх)\s+мешканців\b|\b(?:
 # A document's own question answers the animal's when it asks the same: "Де шукати білі гриби?" and "А де
 # підберезники?" for "де шукати гриби", not "Коли йти по гриби?".
 QUESTION_WORDS = re.compile(r"\b(?:де|коли|скільки|чим|як|куди|хто|що)\b", re.I)
+# Words that only ask, or ask politely, and say nothing of the topic: "До якого числа…", "Підкажіть, будь ласка, …".
+ASKING_WORDS = re.compile(r"\b(?:як(?:ого|ому|ій|их|им|ими|ою|у)|котр\w*|будь|ласка|підкаж\w*|скаж\w*|розкаж\w*)\b",
+                          re.I)
 # "Гриби" asks about each kind ("А де підберезники?" answers "де шукати гриби"), one kind about itself only: "де
 # шукати підберезники" asks nothing about the white mushrooms, nor "де шукати опеньки" about the birch boletes.
 GENERAL_WORDS = frozenset({"гриби", "гриб", "грибів"})
@@ -761,10 +769,11 @@ class Answerer:
         size = self._excerpt_size(docs, room)
         excerpts = [self._excerpt(doc, question, mittens, parts, size) for doc in docs]
         prompt = head + separator.join(header + excerpt for header, excerpt in zip(headers, excerpts, strict=True))
-        asked_sources = asked_found = False
+        asked_sources = asked_found = asked_place = False
         kept: Draft | None = None  # the answer so far, kept while the model is asked once to put it right
-        # At most three calls: the answer, once more when it found nothing though its documents speak of the topic or
-        # when it forgot its sources, and once more to put it right.
+        # At most three calls: the answer, once more when it asked for the mitten with nothing to show for it, when it
+        # found nothing though its documents speak of the topic or when it forgot its sources, and once more to put it
+        # right.
         for _ in range(3):
             try:
                 result = await self.llm.json(system, prompt, max_tokens=budget, reasoning=reasoning, deadline=deadline)
@@ -780,6 +789,16 @@ class Answerer:
                 sources = docs  # one document given, so it is the source
             # A flag written as a string: "false" is no, as for "found".
             needs_place = bool(place_rule) and result.get("needs_place") in (True, "true")
+            facts = result.get("facts") if isinstance(result.get("facts"), list) else []
+            if needs_place and not asked_place and not kept and not self._place_shown(question, docs, facts):
+                # Live on 3 November gpt-oss-20b, answering while the strong model rested, asked which mitten with a
+                # bare {"needs_place": true} for "Що робити при пожежі?", "Чим лікувати застуду в зайченяти?" and "Чи
+                # вже час збирати гриби?": no document of a particular place before it speaks of fire, colds or picking
+                # mushrooms. It is asked once more, with what the whole forest's documents say; a second ask holds.
+                asked_place = True
+                topic = re.sub(r"\s+", " ", self.forest.strip_places(question)).strip(" ?.!,")
+                prompt += PLACE_REMINDER.format(topic=topic, quotes=self._forest_quotes(question, docs))
+                continue
             gave_up = needs_place or result.get("found") in (False, "false") or not answer
             if kept and (gave_up or not sources):
                 break  # asked to put it right, the model lost the answer: keep the first
@@ -802,7 +821,6 @@ class Answerer:
                 asked_sources = True  # the model now and then forgets the source numbers; ask once more
                 prompt += SOURCES_REMINDER  # the very same request would mostly bring the very same reply
                 continue
-            facts = result.get("facts") if isinstance(result.get("facts"), list) else []
             reminders, faults, general, points, unnamed = self._review(question, docs, mittens, named, answer, other,
                                                                        sources, facts, varies)
             draft = Draft(answer, other, sources, faults, unnamed, general, facts, points)
@@ -833,6 +851,8 @@ class Answerer:
             # allows only so many tokens a minute.
             prompt += "".join(reminders)
 
+        if kept is None:  # each of the three calls was asked again: for the mitten, for what it found, for sources
+            return Reply("not_found", texts.NOT_FOUND)
         answer, other, sources = kept.answer, kept.other, kept.sources
         # Mishka: always the source, for an animal's document who sent it and when. Live, the owl's answer cited the
         # statute alone and retold Їжак's note ("хто підходить до її дупла"): a document whose own words the text
@@ -1006,6 +1026,37 @@ class Answerer:
             quote = self._topic_sentences(doc, question)
             if quote and used + len(quote) <= NOT_FOUND_QUOTES:
                 quotes.append(f" [{number}] «{quote}»")
+                used += len(quote)
+        return "".join(quotes)
+
+    def _place_shown(self, question: str, docs: list[Document], facts: list) -> bool:
+        """Whether asking which mitten is borne out: the model's facts give a particular place's advice, or a document
+        for a mitten or a forest part among `docs` has every word of the question's topic, synonyms counting: the
+        mittens' dues for "скільки внесок?", the conifer forest's October for "коли утеплювати рукавичку?". Words that
+        only ask and words under four letters ("при", "час") say nothing of the topic. Every word, not most of them:
+        "Чим лікувати застуду в зайченяти?" has two of three in "Небезпеки поруч із рукавичкою У соснах" ("Зайчикові",
+        "застереження"). A word the documents spell otherwise ("взимку" for their "Узимку") may leave a mitten's own
+        document unrecognised, and then only costs asking once more."""
+        cited = {int(match.group(1)) for fact in facts if (match := FACT.match(str(fact)))}
+        if any(docs[number - 1].scope.kind != "forest" for number in cited if 0 < number <= len(docs)):
+            return True
+        topic = ASKING_WORDS.sub(" ", QUESTION_WORDS.sub(" ", self.forest.strip_places(question)))
+        words = [terms for terms in (expand(set(tokens(word))) for word in topic.split())
+                 if any(len(term) >= 4 for term in terms)]
+        for doc in docs:
+            said = set(tokens(f"{doc.title} {doc.text}"))
+            if doc.scope.kind != "forest" and all(terms & said for terms in words):
+                return True
+        return False
+
+    def _forest_quotes(self, question: str, docs: list[Document]) -> str:
+        """What the whole forest's documents say on the topic of the question, for a model that asked which mitten with
+        nothing to show for it: ' У документі [4] для всього лісу на цю тему сказано: «…»', up to NOT_FOUND_QUOTES."""
+        quotes, used = [], 0
+        for number, doc in enumerate(docs, 1):
+            quote = self._topic_sentences(doc, question) if doc.scope.kind == "forest" else ""
+            if quote and used + len(quote) <= NOT_FOUND_QUOTES:
+                quotes.append(PLACE_QUOTE.format(number=number, quote=quote))
                 used += len(quote)
         return "".join(quotes)
 

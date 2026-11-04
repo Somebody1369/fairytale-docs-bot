@@ -191,6 +191,48 @@ async def test_general_advice_is_not_given_when_places_differ(forest_docs, fores
     assert reply.kind == "need_place"
     prompt = llm.prompts[0][1]
     assert "Календар сезонів" in prompt and "Як утеплити рукавичку в хвойному лісі" in prompt
+    assert len(llm.prompts) == 1  # the conifer forest's own advice on the topic bears the ask out
+
+
+async def test_bare_ask_for_the_mitten_on_a_whole_forest_topic_is_put_again(forest_docs, forest):
+    # Live on 3 November gpt-oss-20b asked which mitten for the fire with a bare {"needs_place": true}, while the
+    # documents for particular places before it said nothing of fire.
+    llm = FakeLLM({"needs_place": True}, {"found": True, "answer": "Біжіть до річки.", "sources": [2]},
+                  picks=[{"ids": [1]}])
+    reply = await Answerer(forest_docs, forest, llm, TZ).ask("що робити при пожежі?", NOW)
+    assert reply.kind == "answer" and reply.text.startswith("Біжіть до річки.")
+    assert "Членські внески рукавички Під дубом" in llm.prompts[0][1]  # the mitten's dues, picked by title
+    second = llm.prompts[1][1]
+    assert 'ти повернув "needs_place": true' in second
+    assert "У документі [2] для всього лісу на цю тему сказано: «Довгий безперервний крик означає пожежу.»" in second
+
+
+async def test_second_ask_for_the_mitten_holds(forest_docs, forest):
+    llm = FakeLLM({"needs_place": True}, {"needs_place": True}, picks=[{"ids": [1]}])
+    reply = await Answerer(forest_docs, forest, llm, TZ).ask("що робити при пожежі?", NOW)
+    assert reply.kind == "need_place" and len(llm.prompts) == 2
+
+
+async def test_every_call_asked_again_ends_in_not_found(forest_docs, forest):
+    # For the mitten, for what the documents say on the topic, for the sources: three calls and no answer to keep.
+    llm = FakeLLM({"needs_place": True}, {"found": False}, {"found": True, "answer": "Біжіть до річки.", "sources": []},
+                  picks=[{"ids": [1]}])
+    reply = await Answerer(forest_docs, forest, llm, TZ).ask("що робити при пожежі?", NOW)
+    assert reply.kind == "not_found" and len(llm.prompts) == 3
+
+
+async def test_bare_ask_for_the_mitten_with_nothing_on_the_topic_ends_in_not_found(forest_docs, forest):
+    llm = FakeLLM({"needs_place": True}, {"found": False}, picks=[{"ids": [1]}])
+    reply = await Answerer(forest_docs, forest, llm, TZ).ask("чим лікувати застуду в зайченяти?", NOW)
+    assert reply.kind == "not_found" and len(llm.prompts) == 2
+    assert "для всього лісу на цю тему сказано" not in llm.prompts[1][1]
+
+
+async def test_ask_for_the_mitten_showing_a_places_advice_holds_at_once(forest_docs, forest):
+    # The dues say nothing of who takes them in winter, but the model shows a mitten's advice: no second ask.
+    llm = FakeLLM({"needs_place": True, "facts": ["[1, рукавичка] Внесок 4 жолуді з дорослого звіра на місяць."]})
+    reply = await Answerer(forest_docs, forest, llm, TZ).ask("хто приймає внески взимку?", NOW)
+    assert reply.kind == "need_place" and len(llm.prompts) == 1
 
 
 async def test_whole_forest_question_does_not_mention_place_rule(forest_docs, forest):

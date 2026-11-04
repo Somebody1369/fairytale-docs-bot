@@ -874,7 +874,8 @@ async def test_saved_document_does_not_leave_an_old_question_waiting_for_text(se
 
 async def test_buttons_under_an_older_question_answer_that_question(setup):
     dispatcher, bot, telegram, llm, _ = setup
-    llm.answers += [{"needs_place": True}, {"needs_place": True}]
+    # The mittens' dues name no day of the month: asking which mitten for it, the model shows their advice.
+    llm.answers += [{"needs_place": True}, {"needs_place": True, "facts": ["[1, рукавичка] Внесок 4 жолуді на місяць."]}]
     await dispatcher.feed_update(bot, message(text="скільки внесок?"))
     first = telegram.sent[-1]
     await dispatcher.feed_update(bot, message(text="до якого числа здавати внесок?"))
@@ -999,7 +1000,7 @@ async def test_typed_mitten_after_a_document_answers_the_waiting_question(setup)
     store.set_user_name(USER.id, "Їжак", datetime.now(timezone.utc))
     llm.answers.append({"found": True, "answer": "4 жолуді на місяць.", "sources": [1]})
     await dispatcher.feed_update(bot, message(text="Скільки внесок під дубом?"))
-    llm.answers.append({"needs_place": True})
+    llm.answers.append({"needs_place": True, "facts": ["[1, рукавичка] Внесок 4 жолуді на місяць."]})
     await dispatcher.feed_update(bot, message(text="До якого числа здавати внесок?"))
     await send_unclear_document(dispatcher, bot, telegram, llm, store)
     await dispatcher.feed_update(bot, press(telegram.sent[-1], "Увесь ліс"))
