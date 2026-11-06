@@ -129,7 +129,7 @@ def scope_from_caption(caption: str | None, forest: Forest) -> Scope | None:
     whole = any(re.search(pattern, low) for pattern in whole_patterns)
     if len(mittens) == 1 and not parts and not whole:
         return Scope("mitten", mittens[0])
-    # Two mittens, not counting where the sender lives: "я з Під вербою, це для Під дубом" is one place.
+    # Not counting the sender's mitten: "я з Під вербою, це для Під дубом" is no split, nor a place: the text decides.
     targets = [m for m in mittens
                if any(not SENDER_FROM.search(low[:found.start()]) for found in re.finditer(mitten_pattern(m), low))]
     if len(targets) >= 2 and not parts and not whole:
